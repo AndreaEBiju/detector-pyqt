@@ -1,0 +1,3 @@
+[submodule "detector-core"]
+	path = detector-core
+	url = https://github.com/AndreaEBiju/GEMSBlanking.git
