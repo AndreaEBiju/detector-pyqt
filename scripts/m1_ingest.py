@@ -41,17 +41,38 @@ def flat_h5_path_for(source: Path) -> Path:
 def ingest(source: Path, out: Path,
            dtype: str = "float32",
            chunk_seconds: float = 10.0,
-           batch_seconds: float = 60.0) -> dict:
-    """Convert a (n_ch, N) MATLAB-style HDF5 → (N, n_ch) flat HDF5.
+           batch_seconds: float = 60.0,
+           overview_points: int = 8000) -> dict:
+    """Convert a (n_ch, N) MATLAB-style HDF5 → (N, n_ch) flat HDF5
+    plus a pre-downsampled `/y_overview` for fast wide-viewport reads.
 
-    - `dtype="float32"` halves disk size vs the source float64 and is
-      indistinguishable visually at scope range.
-    - `chunk_seconds` controls the HDF5 chunk size along the time
-      axis. 10s chunks at fs=24414Hz = 244,140 rows per chunk, which
-      is in pyqtgraph's sweet spot for downsampling.
-    - `batch_seconds` controls how much we read from the source per
-      transpose-and-write cycle — bigger is faster but uses more RAM
-      during conversion (one batch lives in memory at a time).
+    The flat dataset `y` is what the signal viewer reads at narrow
+    viewports (single contiguous chunk per pan). At wide viewports —
+    where the user wants to see the whole recording or a multi-minute
+    slice — reading the full data is bandwidth-bound (M1.4 finding).
+    `y_overview` is a coarse min-max-pairs summary of the same signal
+    at ~`overview_points` resolution per channel, regardless of
+    recording length. Reads from it are sub-millisecond.
+
+    The overview uses min-max downsampling (each output row alternates
+    min/max within a bucket of source samples), so wide-zoom paint
+    preserves the extremes — important for catching motion-artifact
+    spikes that a naive subsample would skip.
+
+    Parameters
+    ----------
+    dtype             : float32 (default) — halves on-disk size vs
+                        the source float64. Visually equivalent at
+                        scope range.
+    chunk_seconds     : HDF5 chunk size along the time axis (10s ≈
+                        244k rows at fs=24414Hz; pyqtgraph's sweet
+                        spot for its peak downsampler).
+    batch_seconds     : how much to read from the source per
+                        transpose-write cycle. Caps peak RAM at
+                        ~batch_seconds × n_ch × 8 bytes.
+    overview_points   : approximate per-channel rows in /y_overview.
+                        8000 is plenty for a wide-zoom paint at any
+                        reasonable display width.
     """
     source = Path(source)
     out = Path(out)
@@ -96,16 +117,54 @@ def ingest(source: Path, out: Path,
         dst.attrs["chunk_seconds"] = float(chunk_seconds)
         dst.attrs["ingest_dtype"] = dtype
 
-        # Stream the conversion in batches to keep peak RAM bounded
-        # at ~ batch_seconds × n_ch × 8 bytes (= ~24 MB for default
-        # 60s × 5 channels float64).
+        # M2.0 overview accumulator. We compute it on the fly during
+        # the main flat-write pass — no second read pass over the
+        # source file required.
+        #
+        # Bucketing: divide n_samples into `overview_buckets`
+        # contiguous bins. For each bin we emit one (min, max) pair,
+        # so /y_overview ends up shape (2 * overview_buckets, n_ch).
+        # We size buckets to land near `overview_points / 2` so the
+        # final overview has ~overview_points rows.
+        overview_buckets = max(2, overview_points // 2)
+        bucket_size = max(1, n_samples // overview_buckets)
+        # n_samples may not divide evenly — recompute the actual
+        # bucket count from bucket_size so we don't lose the tail.
+        n_buckets = (n_samples + bucket_size - 1) // bucket_size
+        overview_rows = 2 * n_buckets
+        ov_dst = dst.create_dataset(
+            "y_overview",
+            shape=(overview_rows, n_ch),
+            dtype=dtype,
+        )
+        dst.attrs["overview_bucket_size"] = int(bucket_size)
+        dst.attrs["overview_n_buckets"] = int(n_buckets)
+
+        # Stream the conversion in batches. We align batches to bucket
+        # boundaries so each batch can contribute whole min/max pairs
+        # to /y_overview without inter-batch fixup.
+        batch_rows = max(batch_rows, bucket_size)
+
+        bucket_cursor = 0  # how many buckets we've written so far
         for i0 in range(0, n_samples, batch_rows):
             i1 = min(i0 + batch_rows, n_samples)
             if transposed:
                 batch = y_src[:, i0:i1].T  # (rows, n_ch) view
             else:
                 batch = y_src[i0:i1, :]
-            dst["y"][i0:i1, :] = batch.astype(dtype, copy=False)
+            batch_f = batch.astype(dtype, copy=False)
+            dst["y"][i0:i1, :] = batch_f
+
+            # Compute (min, max) per bucket within this batch.
+            b_rows = batch_f.shape[0]
+            batch_buckets = (b_rows + bucket_size - 1) // bucket_size
+            for bi in range(batch_buckets):
+                bs = bi * bucket_size
+                be = min(bs + bucket_size, b_rows)
+                window = batch_f[bs:be, :]
+                ov_dst[2 * (bucket_cursor + bi), :] = window.min(axis=0)
+                ov_dst[2 * (bucket_cursor + bi) + 1, :] = window.max(axis=0)
+            bucket_cursor += batch_buckets
 
     elapsed = time.perf_counter() - t0
     size_mb = out.stat().st_size / (1024 * 1024)
@@ -118,6 +177,8 @@ def ingest(source: Path, out: Path,
         "n_samples": n_samples,
         "n_channels": n_ch,
         "transposed_source": transposed,
+        "overview_rows": int(overview_rows),
+        "overview_bucket_size": int(bucket_size),
     }
 
 
@@ -152,6 +213,8 @@ def main() -> int:
     print(f"  samples            : {result['n_samples']:,}")
     print(f"  source layout      : {'(n_ch, N)' if result['transposed_source'] else '(N, n_ch)'}")
     print(f"  output size        : {result['size_mb']:.1f} MB")
+    print(f"  overview rows      : {result['overview_rows']:,} "
+          f"(bucket size {result['overview_bucket_size']:,} samples)")
     print(f"  conversion elapsed : {result['elapsed_sec']:.1f} s")
     return 0
 

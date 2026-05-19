@@ -193,6 +193,67 @@ def test_repr_includes_metadata(matlab_v73_recording):
     assert "Hz" in r
 
 
+@pytest.fixture
+def flat_h5_with_overview(tmp_path):
+    """A flat-HDF5 recording WITH a /y_overview dataset, mirroring
+    what scripts/m1_ingest.py writes. Verifies the M2.0 read path."""
+    path = tmp_path / "synth_with_overview.h5"
+    n_ch, n_samples, fs = 5, 240_000, 24414.0625
+    bucket_size = 1000
+    n_buckets = (n_samples + bucket_size - 1) // bucket_size
+    y = np.stack([
+        k * 1e3 + np.arange(n_samples, dtype=np.float64) / fs
+        for k in range(n_ch)
+    ], axis=1)
+    # Build the (2 * n_buckets, n_ch) min/max-pair overview by hand.
+    ov_rows = 2 * n_buckets
+    ov = np.zeros((ov_rows, n_ch), dtype=np.float32)
+    for b in range(n_buckets):
+        bs = b * bucket_size
+        be = min(bs + bucket_size, n_samples)
+        window = y[bs:be, :]
+        ov[2 * b, :] = window.min(axis=0)
+        ov[2 * b + 1, :] = window.max(axis=0)
+    with h5py.File(str(path), "w") as f:
+        f.create_dataset("y", data=y.astype(np.float32))
+        f.create_dataset("y_overview", data=ov)
+        f.create_dataset("fs", data=fs)
+        f.attrs["overview_bucket_size"] = bucket_size
+        f.attrs["overview_n_buckets"] = n_buckets
+    return path, n_ch, n_samples, fs, bucket_size
+
+
+def test_has_overview_detects_dataset(flat_h5_with_overview, flat_h5_recording):
+    path_with, *_ = flat_h5_with_overview
+    path_without, *_ = flat_h5_recording
+    assert LazyRecording(path_with).has_overview is True
+    assert LazyRecording(path_without).has_overview is False
+
+
+def test_get_overview_for_range_returns_min_max_pairs(flat_h5_with_overview):
+    path, n_ch, n_samples, fs, bucket_size = flat_h5_with_overview
+    rec = LazyRecording(path)
+    # Span buckets 5..10
+    t_start = 5 * bucket_size / fs
+    t_end = 10 * bucket_size / fs
+    t, data = rec.get_overview_for_range(t_start, t_end)
+    # 5 buckets × 2 rows = 10 rows
+    assert data.shape == (10, n_ch)
+    assert t.shape == (10,)
+    # Each pair of rows shares the same t (the bucket midpoint).
+    assert t[0] == t[1] and t[2] == t[3]
+    # Rows 0..n_ch should be min < max for an increasing-per-channel signal.
+    for ch in range(n_ch):
+        assert data[0, ch] < data[1, ch], f"ch {ch}: min should be < max"
+
+
+def test_get_overview_raises_when_absent(flat_h5_recording):
+    path, *_ = flat_h5_recording
+    rec = LazyRecording(path)
+    with pytest.raises(RuntimeError, match="no /y_overview"):
+        rec.get_overview_for_range(0.0, 1.0)
+
+
 def test_lazy_read_does_not_load_whole_file(matlab_v73_recording):
     """Reading a small window should touch only the requested range —
     we approximate this by checking the function returns quickly even
