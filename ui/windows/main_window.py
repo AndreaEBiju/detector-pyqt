@@ -256,11 +256,40 @@ class MainWindow(QMainWindow):
         self._settings[key] = value
         ui_settings.save_settings(self._settings)
 
+        # Tools menu — Training Management (M4) + Queue (M5).
+        tools_menu = mb.addMenu("&Tools")
+        self._action_training_window = QAction("Training management…", self)
+        self._action_training_window.setShortcut("Ctrl+T")
+        self._action_training_window.triggered.connect(self._open_training_window)
+        tools_menu.addAction(self._action_training_window)
+        self._action_show_queue = QAction("Recording queue", self)
+        self._action_show_queue.setShortcut("Ctrl+Q")
+        self._action_show_queue.setCheckable(True)
+        self._action_show_queue.toggled.connect(self._on_toggle_queue_panel)
+        tools_menu.addAction(self._action_show_queue)
+
         # Help menu
         help_menu = mb.addMenu("&Help")
         action_about = QAction("About", self)
         action_about.triggered.connect(self._on_about)
         help_menu.addAction(action_about)
+
+        # Cached child window reference so repeated open clicks reuse
+        # the same instance (and a running retrain doesn't drop).
+        self._training_window: Optional[QWidget] = None
+
+    def _open_training_window(self) -> None:
+        from ui.windows.training_window import TrainingWindow
+        if self._training_window is None:
+            self._training_window = TrainingWindow(self)
+            # If the user adds a recording or rolls back, refresh the
+            # main window's model-version dropdown.
+            self._training_window.manifest_or_versions_changed.connect(
+                self._refresh_version_combo
+            )
+        self._training_window.show()
+        self._training_window.raise_()
+        self._training_window.activateWindow()
 
     def _build_toolbar(self) -> None:
         tb = QToolBar("Main")
@@ -1173,6 +1202,169 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Save review failed", f"{exc}")
             return
         self.statusBar().showMessage(f"review JSON → {written}", 6_000)
+
+    # ------------------------------------------------------------------
+    # M5 — queue workflow
+    # ------------------------------------------------------------------
+
+    def _on_toggle_queue_panel(self, checked: bool) -> None:
+        if checked:
+            self._show_queue_panel()
+        else:
+            self._hide_queue_panel()
+
+    def _show_queue_panel(self) -> None:
+        if getattr(self, "_queue_dock", None) is not None:
+            self._queue_dock.show()
+            return
+        from ui.widgets.queue_panel import QueuePanel
+        self._queue_panel = QueuePanel()
+        self._queue_panel.open_recording.connect(self._on_queue_open_recording)
+        self._queue_panel.bulk_inference_requested.connect(self._on_bulk_inference)
+        self._queue_dock = QDockWidget("Recording queue", self)
+        self._queue_dock.setObjectName("queue_dock")
+        self._queue_dock.setFeatures(
+            QDockWidget.DockWidgetClosable
+            | QDockWidget.DockWidgetMovable
+            | QDockWidget.DockWidgetFloatable
+        )
+        self._queue_dock.setWidget(self._queue_panel)
+        self._queue_dock.visibilityChanged.connect(self._on_queue_dock_visibility)
+        self.addDockWidget(Qt.LeftDockWidgetArea, self._queue_dock)
+
+    def _hide_queue_panel(self) -> None:
+        if getattr(self, "_queue_dock", None) is None:
+            return
+        self.removeDockWidget(self._queue_dock)
+        self._queue_dock.deleteLater()
+        self._queue_dock = None
+        self._queue_panel = None
+
+    def _on_queue_dock_visibility(self, visible: bool) -> None:
+        if not visible and self._action_show_queue.isChecked():
+            self._action_show_queue.setChecked(False)
+
+    def _on_queue_open_recording(self, path: str) -> None:
+        """User clicked a queue row — load that recording into the
+        main viewer. Save-on-close will be wired to mark "done"."""
+        if not self._maybe_discard_unsaved():
+            return
+        self._open_path(Path(path))
+
+    def _on_bulk_inference(self) -> None:
+        """Sequentially run inference on all queue items with
+        status='pending'. Results land alongside each recording as
+        `<rid>_modelblank.h5` (via detector.predict.detect_bad's
+        normal output path). Progress dialog tracks per-file."""
+        if getattr(self, "_queue_panel", None) is None:
+            return
+        pending = [
+            it for it in self._queue_panel.queue.items
+            if it.status == "pending"
+        ]
+        if not pending:
+            return
+        # Build a sequential plan and walk through it via a small
+        # state machine (QTimer-driven so we yield to the event loop
+        # between recordings).
+        self._bulk_queue: list = list(pending)
+        self._bulk_total = len(pending)
+        self._bulk_done = 0
+        self._bulk_progress = QProgressDialog(
+            f"Bulk inference: {self._bulk_total} recordings",
+            "Cancel", 0, self._bulk_total, self,
+        )
+        self._bulk_progress.setWindowModality(Qt.WindowModal)
+        self._bulk_progress.setMinimumDuration(0)
+        self._bulk_progress.canceled.connect(self._on_bulk_inference_cancel)
+        self._bulk_cancelled = False
+        self._bulk_step()
+
+    def _bulk_step(self) -> None:
+        """Process the next queue item."""
+        if self._bulk_cancelled or not self._bulk_queue:
+            self._on_bulk_inference_done()
+            return
+        item = self._bulk_queue.pop(0)
+        path = Path(item.path)
+        self._bulk_progress.setLabelText(
+            f"[{self._bulk_done + 1}/{self._bulk_total}] {path.name}"
+        )
+        # We open the recording into the main viewer + auto-fire
+        # inference, then on finish we mark + step.
+        try:
+            self._open_path(path)
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "Bulk inference",
+                f"Skipping {path.name}: {exc}",
+            )
+            self._bulk_done += 1
+            self._bulk_progress.setValue(self._bulk_done)
+            QTimer.singleShot(0, self._bulk_step)
+            return
+
+        # Hook a one-shot listener for the inference finish.
+        if self._inference_worker is None:
+            # Auto-run is OFF? Force a manual run.
+            QTimer.singleShot(50, self._on_run_inference)
+        # Wait for finish via the worker's `finished` signal.
+        # We re-connect each step because the worker is replaced
+        # each run.
+        def _hook(_result):
+            try:
+                if self._recording is not None:
+                    # Save the predictions so they persist.
+                    self._on_save_clicked()
+                # Update queue status
+                if getattr(self, "_queue_panel", None) is not None:
+                    self._queue_panel.mark_status(item.path, "done")
+            finally:
+                self._bulk_done += 1
+                self._bulk_progress.setValue(self._bulk_done)
+                # The next step runs after the event loop yields so the
+                # progress dialog can repaint.
+                QTimer.singleShot(50, self._bulk_step)
+
+        # Wait a tick for the inference worker to spawn (it's set up
+        # inside _open_path's auto-run logic via QTimer.singleShot).
+        def _wait_for_worker():
+            if self._inference_worker is None:
+                # Auto-run disabled — call _on_run_inference directly.
+                self._on_run_inference()
+            if self._inference_worker is not None:
+                self._inference_worker.finished.connect(_hook)
+                # If error, treat as done-with-warning and continue.
+                self._inference_worker.error.connect(
+                    lambda msg: (self._bulk_skip_with_warning(item.path, msg))
+                )
+            else:
+                # Couldn't start; skip
+                self._bulk_done += 1
+                self._bulk_progress.setValue(self._bulk_done)
+                QTimer.singleShot(50, self._bulk_step)
+
+        QTimer.singleShot(100, _wait_for_worker)
+
+    def _bulk_skip_with_warning(self, path: str, msg: str) -> None:
+        QMessageBox.warning(self, "Bulk inference",
+                              f"{Path(path).name} failed: {msg}")
+        self._bulk_done += 1
+        self._bulk_progress.setValue(self._bulk_done)
+        QTimer.singleShot(50, self._bulk_step)
+
+    def _on_bulk_inference_cancel(self) -> None:
+        self._bulk_cancelled = True
+
+    def _on_bulk_inference_done(self) -> None:
+        if self._bulk_progress is not None:
+            self._bulk_progress.close()
+            self._bulk_progress = None
+        self.statusBar().showMessage(
+            f"bulk inference: processed {self._bulk_done}/{self._bulk_total} "
+            f"recording(s)",
+            10_000,
+        )
 
     def _on_about(self) -> None:
         QMessageBox.information(
