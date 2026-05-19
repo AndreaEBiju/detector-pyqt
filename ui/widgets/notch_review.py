@@ -128,16 +128,15 @@ class NotchReviewDialog(QDialog):
         settings = ui_settings.load_settings()
         default_q = float(settings.get("preprocessing_q_factor", 30.0))
         default_detrend = bool(settings.get("preprocessing_detrend", True))
-        default_harmonics = settings.get(
-            "preprocessing_candidate_harmonics", [60.0, 120.0]
-        )
 
         form_box = QGroupBox("Notch parameters")
         form = QFormLayout(form_box)
-        self._harmonics_edit = QLineEdit(
-            ", ".join(f"{float(h):g}" for h in default_harmonics[:2])
-            if default_harmonics else "60.0, 120.0"
-        )
+        # Default to filtering 60 / 120 / 180 Hz — the standard mains
+        # harmonics. Matches the gi-vagus-viewer pipeline's default
+        # `freqs_hz=(60.0, 120.0, 180.0)`. Mains hum is ubiquitous in
+        # lab recordings, so we filter prophylactically rather than
+        # waiting for a detection metric to confirm.
+        self._harmonics_edit = QLineEdit("60.0, 120.0, 180.0")
         self._harmonics_edit.editingFinished.connect(self._refresh_plot)
         form.addRow("Harmonics (Hz, comma-separated)", self._harmonics_edit)
         self._q_spin = QDoubleSpinBox()
@@ -150,8 +149,13 @@ class NotchReviewDialog(QDialog):
         self._detrend_check.setChecked(default_detrend)
         self._detrend_check.toggled.connect(self._refresh_plot)
         form.addRow(self._detrend_check)
+        # The button MEASURES per-candidate σ reductions and displays
+        # them — it does NOT overwrite the harmonics field. Mains
+        # hum is filtered prophylactically (defaults are pre-filled);
+        # this button is a sanity check, not a replacement for the
+        # user's manual selection.
         self._redetect_btn = QPushButton(
-            "Auto-detect harmonics (run on current channel)"
+            "↻ Measure noise-floor reductions (current channel)"
         )
         self._redetect_btn.clicked.connect(self._run_auto_detect)
         form.addRow(self._redetect_btn)
@@ -361,43 +365,106 @@ class NotchReviewDialog(QDialog):
         chunk = data[start:start + chunk_n, :]
         reds = notch_mod.detect_significant_harmonics(chunk, fs, params)
         self._noise_reductions = {float(k): float(v) for k, v in reds.items()}
-        selected = notch_mod.select_harmonics_to_filter(reds, params)
-        self._harmonics_edit.setText(
-            ", ".join(f"{float(h):.1f}" for h in selected)
-        )
+        # Intentionally DO NOT modify the harmonics field. The
+        # measurement is informational — the user's selection stays
+        # whatever they put in (defaulting to 60/120/180). The display
+        # in `_update_reduction_summary` shows the per-candidate
+        # reductions so the user can see which would contribute most.
         self._refresh_plot()
 
     def _update_reduction_summary(self) -> None:
-        if not self._noise_reductions:
-            self._summary_label.setText(
-                "(click Auto-detect to measure noise-floor reductions)"
-            )
+        """Build the summary panel with two pieces:
+
+        1. **Headline**: overall σ before vs after applying the
+           current notch chain (from the field) on the 60-s detection
+           chunk. This is the most useful single number — "did your
+           chosen notch chain reduce my noise floor?"
+        2. **Per-candidate breakdown**: σ reduction if each candidate
+           harmonic were applied IN ISOLATION. Populated by the
+           "Measure" button. Informational — helps the user decide
+           whether to add/remove specific frequencies.
+        """
+        # Need the loaded channel data to compute the overall metric.
+        if (
+            self._loaded_data is None or
+            self._loaded_fs is None
+        ):
+            if self._noise_reductions:
+                lines = ["(load a channel to see the overall σ change)"]
+            else:
+                lines = [
+                    "(load a channel and click Measure to see "
+                    "noise-floor reductions)"
+                ]
+            self._summary_label.setText("<br>".join(lines))
             return
-        active = set(self._parse_harmonics())
-        parts = []
-        for h in sorted(self._noise_reductions):
-            r = self._noise_reductions[h]
-            tag = "*" if h in active else " "
-            # `r` is the fractional drop in σ (Quiroga MAD) when an
-            # iirnotch is applied at this frequency alone. 50% =
-            # half the signal RMS was hum at that freq.
-            parts.append(f"{tag} {h:>6.1f} Hz: {r * 100:>5.1f}%")
+
+        fs = float(self._loaded_fs)
+        data = self._loaded_data
+        n = data.shape[0]
+        chunk_n = min(n, int(60.0 * fs))
+        start = max(0, (n - chunk_n) // 2)
+        chunk = data[start:start + chunk_n, :]
+
+        # Overall σ before vs after applying the CURRENT chain.
+        harmonics = self._parse_harmonics()
+        col = chunk[:, 0].astype(np.float64, copy=False)
+        if self._detrend_check.isChecked():
+            col = col - col.mean()
+        sigma_before = float(np.median(np.abs(col)) / 0.6745)
+        if harmonics and sigma_before > 0:
+            try:
+                filtered = notch_mod.apply_notch_filter(
+                    chunk, fs, harmonics,
+                    q_factor=float(self._q_spin.value()),
+                    detrend=self._detrend_check.isChecked(),
+                )
+                fcol = filtered[:, 0].astype(np.float64, copy=False)
+                sigma_after = float(np.median(np.abs(fcol)) / 0.6745)
+                drop_pct = (sigma_before - sigma_after) / sigma_before * 100
+                overall = (
+                    f"<b>Noise floor σ (Quiroga MAD on 60-s chunk):</b><br>"
+                    f"<pre style='margin: 4px;'>"
+                    f"  before: {sigma_before:>8.2f}<br>"
+                    f"  after:  {sigma_after:>8.2f}"
+                    f"   ({drop_pct:+.1f}%)</pre>"
+                )
+            except Exception as exc:
+                overall = (
+                    f"<span style='color:#ff6b6b'>"
+                    f"Couldn't apply chain: {exc}</span>"
+                )
+        else:
+            overall = (
+                f"<b>Noise floor σ (Quiroga MAD):</b> {sigma_before:.2f}"
+                "  (no harmonics in chain — set some to see reduction)"
+            )
+
+        # Per-candidate measurements, if the user clicked "Measure".
+        per_cand = ""
+        if self._noise_reductions:
+            active = set(harmonics)
+            parts = []
+            for h in sorted(self._noise_reductions):
+                r = self._noise_reductions[h]
+                tag = "*" if h in active else " "
+                parts.append(f"{tag} {h:>6.1f} Hz: {r * 100:>5.1f}%")
+            per_cand = (
+                "<br><b>Per-candidate σ reduction (if applied alone):</b>"
+                f"<pre style='margin: 4px;'>" + "<br>".join(parts) + "</pre>"
+            )
+
         ch_label = (
             self._channel_combo.currentData()["label"]
             if self._channel_combo.currentData() else "?"
         )
         legend = (
-            f"<span style='color:#aaa'>(* = currently in filter chain · "
-            f"channel: {ch_label}) · % = fraction of the recording's "
-            "robust noise floor (Quiroga MAD-based σ) the notch removes. "
-            "≈0% means the recording has no meaningful hum at that "
-            "frequency.</span>"
+            f"<span style='color:#aaa'>(channel: {ch_label}) · σ uses "
+            "the robust Quiroga MAD estimator (median(|x|)/0.6745), "
+            "matching the gi-vagus-viewer downstream pipeline. * = "
+            "currently in the user's notch chain.</span>"
         )
-        self._summary_label.setText(
-            "Noise-floor reductions on detection chunk:<br>"
-            f"<pre style='margin: 4px;'>" + "<br>".join(parts) + "</pre>"
-            + legend
-        )
+        self._summary_label.setText(overall + per_cand + "<br>" + legend)
 
     # ------------------------------------------------------------------
     # Event handlers
