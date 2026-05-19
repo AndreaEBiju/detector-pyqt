@@ -252,10 +252,6 @@ class MainWindow(QMainWindow):
         )
         edit_menu.addAction(self._action_skip_stim)
 
-    def _set_setting(self, key: str, value) -> None:
-        self._settings[key] = value
-        ui_settings.save_settings(self._settings)
-
         # Tools menu — Training Management (M4) + Queue (M5).
         tools_menu = mb.addMenu("&Tools")
         self._action_training_window = QAction("Training management…", self)
@@ -277,6 +273,10 @@ class MainWindow(QMainWindow):
         # Cached child window reference so repeated open clicks reuse
         # the same instance (and a running retrain doesn't drop).
         self._training_window: Optional[QWidget] = None
+
+    def _set_setting(self, key: str, value) -> None:
+        self._settings[key] = value
+        ui_settings.save_settings(self._settings)
 
     def _open_training_window(self) -> None:
         from ui.windows.training_window import TrainingWindow
