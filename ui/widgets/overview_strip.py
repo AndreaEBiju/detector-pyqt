@@ -142,6 +142,29 @@ class OverviewStrip(pg.PlotWidget):
             self._plot_item.addItem(region)
             self._bad_region_items.append(region)
 
+    def set_model_intervals(self, intervals: Optional[np.ndarray]) -> None:
+        """Replace the orange model-prediction overlays."""
+        if not hasattr(self, "_model_region_items"):
+            self._model_region_items: list[pg.LinearRegionItem] = []
+        for it in self._model_region_items:
+            self._plot_item.removeItem(it)
+        self._model_region_items = []
+        if intervals is None or len(intervals) == 0:
+            return
+        for s, e in np.asarray(intervals, dtype=np.int64):
+            s_sec = (int(s) - 1) / self.recording.fs
+            e_sec = (int(e) - 1) / self.recording.fs
+            region = pg.LinearRegionItem(
+                values=(s_sec, e_sec),
+                orientation="vertical",
+                movable=False,
+                brush=pg.mkBrush(255, 127, 14, 60),  # orange
+                pen=pg.mkPen(None),
+            )
+            region.setZValue(3)  # behind red overlays
+            self._plot_item.addItem(region)
+            self._model_region_items.append(region)
+
     def set_stim_boundary(self, stim_end_idx: Optional[int]) -> None:
         """Draw a dashed line at the stim/recovery boundary."""
         # Clear any existing

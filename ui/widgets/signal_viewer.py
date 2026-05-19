@@ -489,6 +489,43 @@ class MultiChannelViewer(pg.GraphicsLayoutWidget):
     def bad_intervals(self) -> np.ndarray:
         return self._bad_intervals
 
+    def set_model_intervals(self, intervals: Optional[np.ndarray]) -> None:
+        """Replace the displayed model-prediction overlays with
+        `intervals`. Orange translucent bands (#ff7f0e at ~18% opacity),
+        rendered BEHIND the red bad bands so user marks dominate
+        visually when they overlap.
+
+        `intervals=None` (or empty) clears the model overlay.
+        """
+        if not hasattr(self, "_model_region_items"):
+            # First call — initialise per-channel lists. (Avoids
+            # bloating __init__ with M3-only state.)
+            self._model_region_items: list[list[pg.LinearRegionItem]] = [
+                [] for _ in range(self.recording.n_channels)
+            ]
+        for ch, items in enumerate(self._model_region_items):
+            plot = self.plots[ch][0]
+            for it in items:
+                plot.removeItem(it)
+            self._model_region_items[ch] = []
+        if intervals is None or len(intervals) == 0:
+            return
+        intervals = np.asarray(intervals, dtype=np.int64)
+        for s, e in intervals:
+            s_sec = (int(s) - 1) / self.recording.fs
+            e_sec = (int(e) - 1) / self.recording.fs
+            for ch, (plot, _curve) in enumerate(self.plots):
+                region = pg.LinearRegionItem(
+                    values=(s_sec, e_sec),
+                    orientation="vertical",
+                    movable=False,
+                    brush=pg.mkBrush(255, 127, 14, 46),    # (#ff7f0e, alpha 46/255)
+                    pen=pg.mkPen(None),
+                )
+                region.setZValue(-15)                       # behind bad bands
+                plot.addItem(region)
+                self._model_region_items[ch].append(region)
+
     # ------------------------------------------------------------------
     # Pending-region rendering (during Shift+drag)
     # ------------------------------------------------------------------

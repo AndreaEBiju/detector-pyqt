@@ -37,22 +37,33 @@ if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
 import numpy as np
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QThread, QTimer
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
-    QDockWidget, QFileDialog, QInputDialog, QMainWindow, QMessageBox,
-    QStatusBar, QToolBar, QWidget,
+    QComboBox, QDockWidget, QFileDialog, QInputDialog, QLabel, QMainWindow,
+    QMessageBox, QProgressDialog, QPushButton, QStatusBar, QTabWidget,
+    QToolBar, QWidget,
 )
 
+from detector import paths as detector_paths
+from detector import review as detector_review
 from detector.recording_io import Recording, load_recording
 from detector.labeled_save import (
     save_native, save_matlab_compatible, save_period_split,
     save_segment_table,
 )
+from detector.predict import list_available_versions
 
+from ui.data import settings as ui_settings
 from ui.widgets.signal_viewer import LazyRecording, MultiChannelViewer
 from ui.widgets.region_table import RegionTable
 from ui.widgets.overview_strip import OverviewStrip
+from ui.widgets.predictions_panel import PredictionsPanel
+from ui.widgets.review_panel import ReviewPanel
+from ui.workers.inference_worker import (
+    InferenceWorker, current_promoted_version_short,
+    load_model_artifact_cached,
+)
 
 
 UNDO_DEPTH = 20
@@ -83,22 +94,55 @@ class MainWindow(QMainWindow):
         # Dirty bit so we can warn before closing without saving.
         self._dirty: bool = False
 
+        # M3 inference state.
+        self._model_intervals: Optional[np.ndarray] = None
+        self._model_per_window_probs: Optional[np.ndarray] = None
+        self._model_position_samples: Optional[np.ndarray] = None
+        self._model_features = None                # pandas DataFrame
+        self._model_version: Optional[str] = None
+        self._model_threshold_used: Optional[float] = None
+        self._inference_thread: Optional[QThread] = None
+        self._inference_worker: Optional[InferenceWorker] = None
+        self._inference_progress: Optional[QProgressDialog] = None
+        # Settings shape: {"model_version", "auto_run_on_open",
+        # "inference_skip_stim", "last_recording_dir"}.
+        self._settings = ui_settings.load_settings()
+
         # Widgets — placeholders until a recording opens.
         self._viewer: Optional[MultiChannelViewer] = None
         self._overview: Optional[OverviewStrip] = None
         self._region_table = RegionTable()
         self._region_table.interval_jumped.connect(self._on_jump_to_interval)
         self._region_table.interval_deleted.connect(self._on_delete_interval)
+        self._predictions_panel = PredictionsPanel()
+        self._predictions_panel.interval_accepted.connect(
+            self._on_accept_prediction
+        )
+        self._predictions_panel.interval_dismissed.connect(
+            self._on_dismiss_prediction
+        )
+        self._predictions_panel.interval_jumped.connect(
+            self._on_jump_to_prediction
+        )
+        self._predictions_panel.accept_all_requested.connect(
+            self._on_accept_all_predictions
+        )
+        # Review-panel dock comes and goes on demand.
+        self._review_panel: Optional[ReviewPanel] = None
+        self._review_dock: Optional[QDockWidget] = None
 
         self._build_menus()
         self._build_toolbar()
         self.setStatusBar(QStatusBar())
         self._update_status_bar()
 
-        # Right dock for the region table.
-        self._table_dock = QDockWidget("Marked intervals", self)
-        self._table_dock.setObjectName("region_table_dock")
-        self._table_dock.setWidget(self._region_table)
+        # Right dock for the tabbed Marked / Model panel.
+        self._right_tabs = QTabWidget()
+        self._right_tabs.addTab(self._region_table, "🟥 Marked (0)")
+        self._right_tabs.addTab(self._predictions_panel, "🟧 Model")
+        self._table_dock = QDockWidget("Intervals", self)
+        self._table_dock.setObjectName("intervals_dock")
+        self._table_dock.setWidget(self._right_tabs)
         self._table_dock.setFeatures(
             QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable
         )
@@ -188,6 +232,30 @@ class MainWindow(QMainWindow):
         self._action_set_boundary.setEnabled(False)
         edit_menu.addAction(self._action_set_boundary)
 
+        # Inference preferences (persisted via ui.data.settings)
+        edit_menu.addSeparator()
+        self._action_auto_run = QAction("Auto-run inference on open", self)
+        self._action_auto_run.setCheckable(True)
+        self._action_auto_run.setChecked(bool(self._settings.get("auto_run_on_open", True)))
+        self._action_auto_run.toggled.connect(
+            lambda checked: self._set_setting("auto_run_on_open", checked)
+        )
+        edit_menu.addAction(self._action_auto_run)
+
+        self._action_skip_stim = QAction(
+            "Skip stim region in inference (recovery only)", self,
+        )
+        self._action_skip_stim.setCheckable(True)
+        self._action_skip_stim.setChecked(bool(self._settings.get("inference_skip_stim", True)))
+        self._action_skip_stim.toggled.connect(
+            lambda checked: self._set_setting("inference_skip_stim", checked)
+        )
+        edit_menu.addAction(self._action_skip_stim)
+
+    def _set_setting(self, key: str, value) -> None:
+        self._settings[key] = value
+        ui_settings.save_settings(self._settings)
+
         # Help menu
         help_menu = mb.addMenu("&Help")
         action_about = QAction("About", self)
@@ -206,18 +274,78 @@ class MainWindow(QMainWindow):
         tb.addAction(self._action_fit_all)
         tb.addAction(self._action_zoom_in)
         tb.addAction(self._action_zoom_out)
+        tb.addSeparator()
+
+        # M3 inference controls
+        tb.addWidget(QLabel("Model:"))
+        self._version_combo = QComboBox()
+        self._version_combo.setMinimumWidth(120)
+        self._refresh_version_combo()
+        self._version_combo.currentTextChanged.connect(
+            self._on_version_changed
+        )
+        tb.addWidget(self._version_combo)
+
+        self._action_run_inference = QAction("▶ Run inference", self)
+        self._action_run_inference.setShortcut("Ctrl+R")
+        self._action_run_inference.triggered.connect(self._on_run_inference)
+        self._action_run_inference.setEnabled(False)
+        tb.addAction(self._action_run_inference)
+
+        self._action_clear_predictions = QAction("Clear predictions", self)
+        self._action_clear_predictions.triggered.connect(self._on_clear_predictions)
+        self._action_clear_predictions.setEnabled(False)
+        tb.addAction(self._action_clear_predictions)
+
+        self._action_review_mode = QAction("🔍 Review", self)
+        self._action_review_mode.setCheckable(True)
+        self._action_review_mode.toggled.connect(self._on_toggle_review_mode)
+        self._action_review_mode.setEnabled(False)
+        tb.addAction(self._action_review_mode)
+
+    def _refresh_version_combo(self) -> None:
+        """Repopulate the version dropdown with whatever's on disk."""
+        self._version_combo.blockSignals(True)
+        self._version_combo.clear()
+        versions = list_available_versions()
+        if not versions:
+            self._version_combo.addItem("(no models)", None)
+            self._version_combo.setEnabled(False)
+        else:
+            promoted = current_promoted_version_short()
+            preferred = self._settings.get("model_version") or promoted
+            for v in versions:
+                # Mark the promoted version in the dropdown.
+                label = f"{v} ★" if v == promoted else v
+                self._version_combo.addItem(label, v)
+            # Select the preferred version if present.
+            if preferred:
+                for i in range(self._version_combo.count()):
+                    if self._version_combo.itemData(i) == preferred:
+                        self._version_combo.setCurrentIndex(i)
+                        break
+            self._version_combo.setEnabled(True)
+        self._version_combo.blockSignals(False)
+
+    def _on_version_changed(self, text: str) -> None:
+        v = self._version_combo.currentData()
+        if v is None:
+            return
+        self._settings["model_version"] = v
+        ui_settings.save_settings(self._settings)
 
     # ------------------------------------------------------------------
     # File loading
     # ------------------------------------------------------------------
 
     def _on_open_clicked(self) -> None:
-        if self._maybe_discard_unsaved() == False:
+        if not self._maybe_discard_unsaved():
             return
+        start_dir = self._settings.get("last_recording_dir") or ""
         path_str, _ = QFileDialog.getOpenFileName(
             self,
             "Open recording",
-            "",
+            start_dir,
             "Recording files (*.mat *.h5);;All files (*)",
         )
         if not path_str:
@@ -292,12 +420,32 @@ class MainWindow(QMainWindow):
         self._redo_stack.clear()
         self._dirty = False
 
+        # Clear M3 inference state from any previous file.
+        self._on_clear_predictions()
+
         self._refresh_widgets()
         self._action_save.setEnabled(True)
         self._action_save_as.setEnabled(True)
         self._action_set_boundary.setEnabled(rec.rec_type == "stim_rec")
+        self._action_run_inference.setEnabled(
+            self._version_combo.currentData() is not None
+        )
         self._update_status_bar()
         self.setWindowTitle(f"Detector — PyQt   |   {path.name}")
+
+        # Remember the directory for the next Open dialog.
+        self._settings["last_recording_dir"] = str(path.parent)
+        ui_settings.save_settings(self._settings)
+
+        # M3: auto-run inference on open if the user has it enabled.
+        # Fires once per file open. The latch is the simple
+        # _auto_run_attempted_for path that records what we've already
+        # tried so a re-open of the SAME file doesn't loop.
+        if (
+            self._settings.get("auto_run_on_open", True)
+            and self._version_combo.currentData() is not None
+        ):
+            QTimer.singleShot(50, self._on_run_inference)
 
     # ------------------------------------------------------------------
     # Region mutations (with undo)
@@ -516,6 +664,16 @@ class MainWindow(QMainWindow):
         rec = self._recording
         intervals = self._bad_intervals
         sources = self._bad_sources
+        # Anything still in predictions at save time is the
+        # "model_unsure" set — predictions the user didn't accept or
+        # dismiss explicitly. Streamlit Phase 8 parity: include them
+        # in the .mat as `removedSegmentIdx_model_unsure` and in the
+        # segment table JSON as `segments_unsure`.
+        model_unsure = (
+            self._model_intervals if (self._model_intervals is not None
+                                      and self._model_intervals.size > 0)
+            else None
+        )
         try:
             r_native = save_native(
                 rec, intervals,
@@ -526,12 +684,16 @@ class MainWindow(QMainWindow):
                 rec, intervals, mat_path,
                 stim_end_idx=self._stim_end_idx,
                 bad_sources=sources,
+                model_unsure_intervals=model_unsure,
                 write_yout=True,
             )
             r_seg = save_segment_table(
                 rec, intervals, sources,
                 output_path=seg_path,
+                model_unsure_intervals=model_unsure,
                 stim_end_idx=self._stim_end_idx,
+                model_version=self._model_version,
+                threshold_used=self._model_threshold_used,
             )
             # Per-period split if a boundary is set.
             split_msg = ""
@@ -540,18 +702,25 @@ class MainWindow(QMainWindow):
                     rec, intervals, output_path_base=mat_path,
                     stim_end_idx=self._stim_end_idx,
                     bad_sources=sources,
+                    model_unsure_intervals=model_unsure,
                     write_yout=True,
                 )
                 split_msg = (
-                    f"\nsplit: stim={r_split['stim_n_intervals']} + "
+                    f"  ·  split: stim={r_split['stim_n_intervals']} + "
                     f"recovery={r_split['recovery_n_intervals']}"
                 )
+            unsure_msg = (
+                f"  ·  unsure={int(model_unsure.shape[0])}"
+                if model_unsure is not None else ""
+            )
             self._dirty = False
             self.statusBar().showMessage(
                 f"saved: clean.h5={r_native['n_clean_chunks']} chunks, "
-                f".mat={r_mat['n_intervals']} intervals, "
-                f"segments.json={r_seg['n_accepted']}{split_msg}",
-                10_000,
+                f".mat={r_mat['n_intervals']} intervals "
+                f"(user={r_mat['n_user']}, "
+                f"model_accepted={r_mat['n_model_accepted']}, "
+                f"existing={r_mat['n_existing']}){unsure_msg}{split_msg}",
+                12_000,
             )
         except Exception as exc:
             QMessageBox.critical(self, "Save failed", f"{exc}")
@@ -565,13 +734,21 @@ class MainWindow(QMainWindow):
         if self._viewer is not None:
             self._viewer.set_bad_intervals(self._bad_intervals)
             self._viewer.set_stim_boundary(self._stim_end_idx)
+            self._viewer.set_model_intervals(self._model_intervals)
         if self._overview is not None:
             self._overview.set_bad_intervals(self._bad_intervals)
             self._overview.set_stim_boundary(self._stim_end_idx)
+            self._overview.set_model_intervals(self._model_intervals)
         if self._recording is not None:
             self._region_table.set_intervals(
                 self._bad_intervals, self._bad_sources, self._recording.fs,
             )
+        # Tab labels reflect counts even without an inference run.
+        n_marked = int(self._bad_intervals.shape[0])
+        n_pred = (int(self._model_intervals.shape[0])
+                   if self._model_intervals is not None else 0)
+        self._right_tabs.setTabText(0, f"🟥 Marked ({n_marked})")
+        self._right_tabs.setTabText(1, f"🟧 Model ({n_pred})")
         self._update_status_bar()
 
     def _update_status_bar(self) -> None:
@@ -612,6 +789,390 @@ class MainWindow(QMainWindow):
             event.accept()
         else:
             event.ignore()
+
+    # ------------------------------------------------------------------
+    # M3 — inference
+    # ------------------------------------------------------------------
+
+    def _on_run_inference(self) -> None:
+        """Start a background inference job. UI disables the Run
+        Inference action and shows a QProgressDialog until the worker
+        emits finished or error.
+        """
+        if self._recording is None or self._lazy is None:
+            return
+        if self._inference_thread is not None and self._inference_thread.isRunning():
+            QMessageBox.information(
+                self, "Inference busy",
+                "Inference is already running. Wait for it to finish.",
+            )
+            return
+        version = self._version_combo.currentData()
+        if version is None:
+            QMessageBox.warning(
+                self, "No model",
+                "No model artifacts available. Configure the shared "
+                "model folder via `detector init` (CLI).",
+            )
+            return
+        try:
+            artifact = load_model_artifact_cached(version)
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Failed to load model",
+                f"Could not load {version}:\n{exc}",
+            )
+            return
+
+        # Determine input + stim-skip offset. The Recording dataclass
+        # holds the in-RAM signal so we slice cheaply.
+        skip_stim = bool(
+            self._settings.get("inference_skip_stim", True)
+            and self._stim_end_idx
+            and self._recording.rec_type == "stim_rec"
+        )
+        if skip_stim:
+            offset = int(self._stim_end_idx)
+            y_in = self._recording.y[offset:, :]
+        else:
+            offset = 0
+            y_in = self._recording.y
+
+        self._inference_thread = QThread()
+        self._inference_worker = InferenceWorker(
+            y_in, self._recording.fs, artifact,
+            stim_skip_offset=offset,
+            return_features=True,
+        )
+        self._inference_worker.moveToThread(self._inference_thread)
+        self._inference_thread.started.connect(self._inference_worker.run)
+        self._inference_worker.progress.connect(self._on_inference_progress)
+        self._inference_worker.finished.connect(self._on_inference_finished)
+        self._inference_worker.error.connect(self._on_inference_error)
+        # Clean up the thread when the worker finishes or errors.
+        self._inference_worker.finished.connect(self._inference_thread.quit)
+        self._inference_worker.error.connect(self._inference_thread.quit)
+        self._inference_thread.finished.connect(
+            self._inference_worker.deleteLater
+        )
+        self._inference_thread.finished.connect(
+            self._inference_thread.deleteLater
+        )
+
+        # Progress dialog
+        self._inference_progress = QProgressDialog(
+            "Running inference …", "Cancel", 0, 100, self,
+        )
+        self._inference_progress.setWindowModality(Qt.WindowModal)
+        self._inference_progress.setMinimumDuration(0)
+        # Cancel is best-effort — the worker doesn't poll a flag, so
+        # cancel just hides the dialog and stops listening. Inference
+        # finishes either way.
+        self._inference_progress.canceled.connect(
+            lambda: self._action_run_inference.setEnabled(True)
+        )
+        self._inference_progress.setValue(0)
+        self._action_run_inference.setEnabled(False)
+
+        self._inference_thread.start()
+        self.statusBar().showMessage(
+            f"running inference with model {version} "
+            f"(scope = {'recovery_only' if offset else 'full'}) …"
+        )
+
+    def _on_inference_progress(self, frac: float, msg: str) -> None:
+        if self._inference_progress is not None:
+            self._inference_progress.setValue(int(frac * 100))
+            self._inference_progress.setLabelText(f"{msg} ({frac:.0%})")
+
+    def _on_inference_finished(self, result: dict) -> None:
+        if self._inference_progress is not None:
+            self._inference_progress.setValue(100)
+            self._inference_progress.close()
+            self._inference_progress = None
+        self._action_run_inference.setEnabled(True)
+        # Store + integrate
+        self._model_intervals = result.get("intervals")
+        self._model_per_window_probs = result.get("per_window_prob")
+        self._model_position_samples = result.get("position_samples")
+        self._model_features = result.get("features")
+        self._model_version = result.get("model_version")
+        self._model_threshold_used = result.get("threshold_used")
+        self._action_clear_predictions.setEnabled(True)
+        self._action_review_mode.setEnabled(True)
+        self._refresh_predictions_panel()
+        self._refresh_widgets()
+        n = int(self._model_intervals.shape[0]) if self._model_intervals is not None else 0
+        scope_note = (" · scope = recovery-only"
+                       if result.get("scope_offset_sample") else "")
+        self.statusBar().showMessage(
+            f"inference done: {n} predictions · "
+            f"thr={result.get('threshold_used'):.3f}{scope_note}",
+            8_000,
+        )
+
+    def _on_inference_error(self, message: str) -> None:
+        if self._inference_progress is not None:
+            self._inference_progress.close()
+            self._inference_progress = None
+        self._action_run_inference.setEnabled(True)
+        QMessageBox.critical(self, "Inference failed", message)
+
+    def _on_clear_predictions(self) -> None:
+        self._model_intervals = None
+        self._model_per_window_probs = None
+        self._model_position_samples = None
+        self._model_features = None
+        self._model_threshold_used = None
+        self._action_clear_predictions.setEnabled(False)
+        self._action_review_mode.setEnabled(False)
+        if self._action_review_mode.isChecked():
+            self._action_review_mode.setChecked(False)
+        self._refresh_predictions_panel()
+        self._refresh_widgets()
+
+    def _refresh_predictions_panel(self) -> None:
+        """Sync the right-dock model tab + per-prediction probabilities."""
+        # Compute per-interval probability — the MAX per-window prob
+        # whose position_sample falls within the interval. (Streamlit
+        # Phase 8 used the same heuristic for display.)
+        per_int_probs: Optional[np.ndarray] = None
+        if (
+            self._model_intervals is not None
+            and self._model_per_window_probs is not None
+            and self._model_position_samples is not None
+        ):
+            probs = np.zeros(int(self._model_intervals.shape[0]),
+                              dtype=np.float32)
+            for i, (s, e) in enumerate(self._model_intervals):
+                mask = (
+                    (self._model_position_samples >= int(s))
+                    & (self._model_position_samples <= int(e))
+                )
+                if mask.any():
+                    probs[i] = float(self._model_per_window_probs[mask].max())
+            per_int_probs = probs
+        fs = self._recording.fs if self._recording else 1.0
+        self._predictions_panel.set_predictions(
+            self._model_intervals if self._model_intervals is not None else
+            np.zeros((0, 2), dtype=np.int64),
+            per_int_probs, fs,
+        )
+        # Update tab labels with counts
+        n_marked = int(self._bad_intervals.shape[0])
+        n_pred = (int(self._model_intervals.shape[0])
+                   if self._model_intervals is not None else 0)
+        self._right_tabs.setTabText(0, f"🟥 Marked ({n_marked})")
+        self._right_tabs.setTabText(1, f"🟧 Model ({n_pred})")
+
+    # ----- Prediction action handlers -----
+
+    def _on_accept_prediction(self, idx: int) -> None:
+        if self._model_intervals is None or idx < 0 or idx >= self._model_intervals.shape[0]:
+            return
+        s, e = self._model_intervals[idx]
+        fs = self._recording.fs
+        self._push_undo()
+        new = np.array([[int(s), int(e)]], dtype=np.int64)
+        combined = (np.concatenate([self._bad_intervals, new], axis=0)
+                    if self._bad_intervals.size else new)
+        order = np.argsort(combined[:, 0], kind="stable")
+        self._bad_intervals = combined[order]
+        sources_combined = list(self._bad_sources) + ["model_accepted"]
+        self._bad_sources = [sources_combined[int(i)] for i in order]
+        # Remove from predictions
+        self._model_intervals = np.delete(self._model_intervals, idx, axis=0)
+        self._dirty = True
+        self._refresh_predictions_panel()
+        self._refresh_widgets()
+
+    def _on_dismiss_prediction(self, idx: int) -> None:
+        if self._model_intervals is None or idx < 0 or idx >= self._model_intervals.shape[0]:
+            return
+        self._model_intervals = np.delete(self._model_intervals, idx, axis=0)
+        self._refresh_predictions_panel()
+        self._refresh_widgets()
+
+    def _on_jump_to_prediction(self, idx: int) -> None:
+        if self._model_intervals is None or idx < 0 or idx >= self._model_intervals.shape[0]:
+            return
+        s, e = self._model_intervals[idx]
+        fs = self._recording.fs
+        target = ((int(s) + int(e)) / 2 - 1) / fs
+        cur_s, cur_e = self._viewer.time_range
+        width = max(cur_e - cur_s, 1.0)
+        new_s = max(0.0, target - width / 2)
+        new_e = min(self._recording.duration_sec, new_s + width)
+        self._viewer.set_viewport(new_s, new_e)
+
+    def _on_accept_all_predictions(self) -> None:
+        if self._model_intervals is None or self._model_intervals.size == 0:
+            return
+        self._push_undo()
+        new = np.asarray(self._model_intervals, dtype=np.int64)
+        combined = (np.concatenate([self._bad_intervals, new], axis=0)
+                    if self._bad_intervals.size else new)
+        order = np.argsort(combined[:, 0], kind="stable")
+        self._bad_intervals = combined[order]
+        sources_combined = list(self._bad_sources) + ["model_accepted"] * int(new.shape[0])
+        self._bad_sources = [sources_combined[int(i)] for i in order]
+        self._model_intervals = np.zeros((0, 2), dtype=np.int64)
+        self._dirty = True
+        self._refresh_predictions_panel()
+        self._refresh_widgets()
+
+    # ----- Review-mode toggle -----
+
+    def _on_toggle_review_mode(self, checked: bool) -> None:
+        if not checked:
+            self._close_review_panel()
+            return
+        if (
+            self._model_intervals is None
+            or self._model_features is None
+            or self._lazy is None
+            or self._recording is None
+        ):
+            self._action_review_mode.setChecked(False)
+            return
+        # Build disagreements list using detector.review.
+        try:
+            artifact = load_model_artifact_cached(self._model_version)
+            n_short = int(round(0.100 * self._recording.fs))
+            half = n_short // 2
+            positions = self._model_features["position_sample"].to_numpy(np.int64)
+            labels = np.zeros(len(self._model_features), dtype=np.uint8)
+            for s, e in self._bad_intervals:
+                in_hum = (
+                    (positions >= int(s) + half)
+                    & (positions <= int(e) - half)
+                )
+                labels[in_hum] = 1
+            disagreements = detector_review.extract_disagreements(
+                recording_id=self._recording.recording_id,
+                df_features=self._model_features,
+                probs=self._model_per_window_probs,
+                labels=labels,
+                threshold=float(artifact.threshold),
+                fs=self._recording.fs,
+                n_total_samples=self._recording.n_samples,
+                top_k=20,
+                context_seconds=2.0,
+            )
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Review setup failed", f"{exc}",
+            )
+            self._action_review_mode.setChecked(False)
+            return
+
+        if not disagreements:
+            QMessageBox.information(
+                self, "No disagreements",
+                "No predicted-bad windows fall outside your marked "
+                "intervals. Nothing to review.",
+            )
+            self._action_review_mode.setChecked(False)
+            return
+
+        self._review_panel = ReviewPanel(
+            self._lazy, artifact, disagreements, self._model_features,
+            parent=self,
+        )
+        self._review_panel.mark_wider_requested.connect(
+            self._on_review_mark_wider
+        )
+        self._review_panel.save_requested.connect(self._on_save_review_json)
+        self._review_panel.exit_requested.connect(
+            lambda: self._action_review_mode.setChecked(False)
+        )
+        self._review_dock = QDockWidget("Disagreement review", self)
+        self._review_dock.setObjectName("review_dock")
+        self._review_dock.setWidget(self._review_panel)
+        self._review_dock.setFeatures(
+            QDockWidget.DockWidgetClosable
+            | QDockWidget.DockWidgetMovable
+            | QDockWidget.DockWidgetFloatable
+        )
+        self._review_dock.visibilityChanged.connect(
+            self._on_review_dock_visibility
+        )
+        # Place on the right; tabify with the intervals dock so the
+        # user can flip between them.
+        self.addDockWidget(Qt.RightDockWidgetArea, self._review_dock)
+        self.tabifyDockWidget(self._table_dock, self._review_dock)
+        self._review_dock.raise_()
+
+    def _close_review_panel(self) -> None:
+        if self._review_dock is not None:
+            self.removeDockWidget(self._review_dock)
+            self._review_dock.deleteLater()
+            self._review_dock = None
+            self._review_panel = None
+
+    def _on_review_dock_visibility(self, visible: bool) -> None:
+        # If the user closes the dock via its X, keep the toolbar
+        # checkbox in sync.
+        if not visible and self._action_review_mode.isChecked():
+            self._action_review_mode.setChecked(False)
+
+    def _on_review_mark_wider(
+        self, start_sec: float, end_sec: float, position_sample: int,
+    ) -> None:
+        """User drag-marked a wider region in the review panel — apply
+        the same three-step handling Streamlit had: append as user
+        interval, drop the matching model prediction, advance."""
+        self._on_user_marked_region_with_source(start_sec, end_sec, "user")
+        # Remove model prediction containing position_sample
+        if self._model_intervals is not None and len(self._model_intervals):
+            mi = np.asarray(self._model_intervals, dtype=np.int64)
+            keep = ~((mi[:, 0] <= position_sample) & (mi[:, 1] >= position_sample))
+            self._model_intervals = (
+                mi[keep] if keep.any() else np.zeros((0, 2), dtype=np.int64)
+            )
+            self._refresh_predictions_panel()
+        if self._review_panel is not None:
+            self._review_panel.remove_current_after_mark()
+        self._refresh_widgets()
+
+    def _on_user_marked_region_with_source(
+        self, start_sec: float, end_sec: float, source: str,
+    ) -> None:
+        if self._recording is None:
+            return
+        fs = self._recording.fs
+        n_samples = self._recording.n_samples
+        s = max(1, int(np.floor(start_sec * fs)) + 1)
+        e = min(int(n_samples), int(np.ceil(end_sec * fs)) + 1)
+        if e <= s:
+            return
+        self._push_undo()
+        new = np.array([[s, e]], dtype=np.int64)
+        combined = (np.concatenate([self._bad_intervals, new], axis=0)
+                    if self._bad_intervals.size else new)
+        order = np.argsort(combined[:, 0], kind="stable")
+        self._bad_intervals = combined[order]
+        sources_combined = list(self._bad_sources) + [source]
+        self._bad_sources = [sources_combined[int(i)] for i in order]
+        self._dirty = True
+
+    def _on_save_review_json(self) -> None:
+        if self._review_panel is None or self._recording is None:
+            return
+        out_path = (
+            detector_paths.get_reviews_dir()
+            / f"{self._recording.recording_id}_review.json"
+        )
+        try:
+            written = self._review_panel.write_review_json(
+                out_path,
+                model_version=self._model_version or "(unknown)",
+                threshold_used=self._model_threshold_used or 0.5,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Save review failed", f"{exc}")
+            return
+        self.statusBar().showMessage(f"review JSON → {written}", 6_000)
 
     def _on_about(self) -> None:
         QMessageBox.information(
