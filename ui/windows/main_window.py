@@ -264,9 +264,22 @@ class MainWindow(QMainWindow):
         self._action_show_queue.toggled.connect(self._on_toggle_queue_panel)
         tools_menu.addAction(self._action_show_queue)
 
-        # Help menu
+        # Help menu. On macOS, Qt's `TextHeuristicRole` (default) auto-
+        # moves actions named "About" / "Preferences" / "Quit" into
+        # the Application Menu. If the only entry in Help is About,
+        # the menu ends up empty AND hidden by macOS — exactly the
+        # bug that made the Help menu invisible in the M4 commit.
+        # Force NoRole so About stays put, and add a second entry
+        # (Keyboard shortcuts) so the menu has substance.
         help_menu = mb.addMenu("&Help")
-        action_about = QAction("About", self)
+        action_shortcuts = QAction("Keyboard shortcuts", self)
+        action_shortcuts.setMenuRole(QAction.MenuRole.NoRole)
+        action_shortcuts.setShortcut(QKeySequence("F1"))
+        action_shortcuts.triggered.connect(self._on_show_shortcuts)
+        help_menu.addAction(action_shortcuts)
+        help_menu.addSeparator()
+        action_about = QAction("About Detector — PyQt", self)
+        action_about.setMenuRole(QAction.MenuRole.NoRole)
         action_about.triggered.connect(self._on_about)
         help_menu.addAction(action_about)
 
@@ -1370,8 +1383,54 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self, "About",
             "Detector — PyQt UI\n\n"
-            "Phase M2 (browser + manual labeling).\n"
+            "Phases M0–M5 complete: lazy multichannel viewer, manual "
+            "labeling, inference + disagreement review, training "
+            "management, and recording queue.\n\n"
             "Plotly-free, GPU-friendly via pyqtgraph.\n\n"
-            "Shift+drag to mark a bad region.\n"
-            "Drag the overview region or click to navigate.\n"
+            "Shift+drag to mark a bad region. Use the right-panel "
+            "tabs to switch between user marks and model predictions.",
         )
+
+    def _on_show_shortcuts(self) -> None:
+        """Modal listing every keyboard shortcut wired up in the app
+        — useful both as user documentation and as a self-check that
+        nothing got disconnected during the migration."""
+        rows = [
+            ("File",   "Ctrl+O",        "Open recording"),
+            ("File",   "Ctrl+S",        "Save"),
+            ("File",   "Ctrl+Shift+S",  "Save as…"),
+            ("File",   "Ctrl+Q",        "Quit"),
+            ("Edit",   "Ctrl+Z",        "Undo"),
+            ("Edit",   "Ctrl+Shift+Z",  "Redo"),
+            ("View",   "R",             "Reset zoom (0–60s)"),
+            ("View",   "F",             "Fit all"),
+            ("View",   "Z",             "Zoom in (×0.5)"),
+            ("View",   "X",             "Zoom out (×2)"),
+            ("View",   "←",             "Previous interval"),
+            ("View",   "→",             "Next interval"),
+            ("M3",     "Ctrl+R",        "Run inference"),
+            ("M3",     "1 / 2 / 3",     "Score true / borderline / FP "
+                                          "(in review panel)"),
+            ("M4",     "Ctrl+T",        "Training management"),
+            ("M5",     "Ctrl+Q",        "Toggle recording queue panel"),
+            ("Viewer", "Shift+drag",    "Mark a bad region"),
+            ("Help",   "F1",            "This dialog"),
+        ]
+        # Render as a monospace block so columns line up nicely.
+        widths = (max(len(r[0]) for r in rows) + 1,
+                  max(len(r[1]) for r in rows) + 2,
+                  max(len(r[2]) for r in rows))
+        lines = []
+        for menu, sc, desc in rows:
+            lines.append(f"{menu:<{widths[0]}}  "
+                          f"{sc:<{widths[1]}}  {desc}")
+        text = "\n".join(lines)
+        # Use QMessageBox.about() variant so the user can dismiss easily,
+        # but we set the text manually so the formatting renders cleanly.
+        box = QMessageBox(self)
+        box.setWindowTitle("Keyboard shortcuts")
+        box.setIcon(QMessageBox.Information)
+        box.setText("<b>Keyboard shortcuts</b>")
+        box.setInformativeText(f"<pre>{text}</pre>")
+        box.setStandardButtons(QMessageBox.Ok)
+        box.exec()
