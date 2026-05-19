@@ -468,7 +468,14 @@ class MainWindow(QMainWindow):
         self._refresh_widgets()
         self._action_save.setEnabled(True)
         self._action_save_as.setEnabled(True)
-        self._action_set_boundary.setEnabled(rec.rec_type == "stim_rec")
+        # Boundary-setting is enabled for ANY loaded recording. The
+        # filename-based rec_type ("stim_rec" vs "baseline" vs
+        # "unknown") is a hint, not a constraint — the user might
+        # want to mark a boundary on a file whose name doesn't match
+        # the _stim_rec_ convention. save_period_split() validates
+        # the boundary value at save time, so a bad value gets a
+        # clear error rather than a silently dropped split.
+        self._action_set_boundary.setEnabled(True)
         self._action_run_inference.setEnabled(
             self._version_combo.currentData() is not None
         )
@@ -737,20 +744,35 @@ class MainWindow(QMainWindow):
                 model_version=self._model_version,
                 threshold_used=self._model_threshold_used,
             )
-            # Per-period split if a boundary is set.
+            # Per-period split whenever a boundary is set, regardless
+            # of filename-derived rec_type. The user may have a
+            # generic .mat file (no _stim_rec_ in the name) but still
+            # want the signal split at a manually-entered boundary.
+            # save_period_split validates 1 <= stim_end_idx < N at
+            # the backend, so an out-of-range value surfaces a clear
+            # ValueError via the QMessageBox below.
             split_msg = ""
-            if self._stim_end_idx is not None and rec.rec_type == "stim_rec":
-                r_split = save_period_split(
-                    rec, intervals, output_path_base=mat_path,
-                    stim_end_idx=self._stim_end_idx,
-                    bad_sources=sources,
-                    model_unsure_intervals=model_unsure,
-                    write_yout=True,
-                )
-                split_msg = (
-                    f"  ·  split: stim={r_split['stim_n_intervals']} + "
-                    f"recovery={r_split['recovery_n_intervals']}"
-                )
+            if self._stim_end_idx is not None:
+                try:
+                    r_split = save_period_split(
+                        rec, intervals, output_path_base=mat_path,
+                        stim_end_idx=self._stim_end_idx,
+                        bad_sources=sources,
+                        model_unsure_intervals=model_unsure,
+                        write_yout=True,
+                    )
+                    split_msg = (
+                        f"  ·  split: stim={r_split['stim_n_intervals']} + "
+                        f"recovery={r_split['recovery_n_intervals']}"
+                    )
+                except ValueError as exc:
+                    QMessageBox.warning(
+                        self, "Period split skipped",
+                        f"Could not split at sample {self._stim_end_idx}: "
+                        f"{exc}\n\nThe full _blankmotion.mat was still "
+                        "saved; only the per-period split files were "
+                        "skipped.",
+                    )
             unsure_msg = (
                 f"  ·  unsure={int(model_unsure.shape[0])}"
                 if model_unsure is not None else ""
