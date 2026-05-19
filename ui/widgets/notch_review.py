@@ -37,6 +37,9 @@ if _detector_core.exists() and str(_detector_core) not in sys.path:
     sys.path.insert(0, str(_detector_core))
 
 from detector.preprocessing import notch as notch_mod                # noqa: E402
+from detector.preprocessing.profiles import (                          # noqa: E402
+    CURRENT_NOTCH_METRIC_VERSION,
+)
 from detector.preprocessing.tdt_io import load_stream                 # noqa: E402
 
 from ui.data import settings as ui_settings                           # noqa: E402
@@ -356,7 +359,7 @@ class NotchReviewDialog(QDialog):
     def _update_reduction_summary(self) -> None:
         if not self._reductions:
             self._summary_label.setText(
-                "(click Auto-detect to populate reductions)"
+                "(click Auto-detect to populate per-harmonic reductions)"
             )
             return
         active = set(self._parse_harmonics())
@@ -364,6 +367,8 @@ class NotchReviewDialog(QDialog):
         for h in sorted(self._reductions):
             r = self._reductions[h]
             tag = "*" if h in active else " "
+            # 0.0% means "no real peak above the local PSD baseline";
+            # 99.x% means "peak collapsed by ~all of its prominence".
             parts.append(f"{tag} {h:>6.1f} Hz: {r * 100:>5.1f}%")
         ch_label = (
             self._channel_combo.currentData()["label"]
@@ -371,10 +376,11 @@ class NotchReviewDialog(QDialog):
         )
         legend = (
             f"<span style='color:#aaa'>(* = currently in filter chain · "
-            f"channel: {ch_label})</span>"
+            f"channel: {ch_label}) · 0% means no peak above "
+            "background — no real hum to remove</span>"
         )
         self._summary_label.setText(
-            "Reductions on detection chunk:<br>"
+            "Peak-prominence reductions on detection chunk:<br>"
             f"<pre style='margin: 4px;'>" + "<br>".join(parts) + "</pre>"
             + legend
         )
@@ -418,6 +424,11 @@ class NotchReviewDialog(QDialog):
             "reductions_per_harmonic": {
                 str(k): float(v) for k, v in self._reductions.items()
             },
+            # Stamp the metric version so a future re-load can tell
+            # this dict was produced under the peak-prominence metric
+            # (semver "2.0"). The Profile.load migration drops stale
+            # reductions from pre-2.0 saves.
+            "notch_metric_version": CURRENT_NOTCH_METRIC_VERSION,
             "reduction_threshold": float(settings.get(
                 "preprocessing_reduction_threshold", 0.5,
             )),
