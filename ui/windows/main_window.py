@@ -178,6 +178,16 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self._action_save_as)
 
         file_menu.addSeparator()
+        # Preprocessing workflow entry point. Opens the
+        # PreprocessWindow modally; the user picks TDT folders,
+        # configures the batch, reviews channels + notch, and runs
+        # the pipeline. Outputs go alongside the source TDT folders,
+        # which the user can then open via this same File menu.
+        self._action_preprocess = QAction("&Preprocess TDT data…", self)
+        self._action_preprocess.triggered.connect(self._on_preprocess_clicked)
+        file_menu.addAction(self._action_preprocess)
+
+        file_menu.addSeparator()
         action_quit = QAction("&Quit", self)
         action_quit.setShortcut(QKeySequence.Quit)
         action_quit.triggered.connect(self.close)
@@ -286,10 +296,36 @@ class MainWindow(QMainWindow):
         # Cached child window reference so repeated open clicks reuse
         # the same instance (and a running retrain doesn't drop).
         self._training_window: Optional[QWidget] = None
+        # Cached preprocess window — re-used across menu clicks so a
+        # mid-run batch isn't dropped on accidental dismissal.
+        self._preprocess_window: Optional[QWidget] = None
 
     def _set_setting(self, key: str, value) -> None:
         self._settings[key] = value
         ui_settings.save_settings(self._settings)
+
+    def _on_preprocess_clicked(self) -> None:
+        """Open (or re-show) the preprocess window.
+
+        Re-uses a single PreprocessWindow instance so a long batch
+        survives an accidental close-and-reopen of the menu item.
+        The window keeps its own thread; this main window just
+        spawns and forgets it.
+        """
+        from ui.windows.preprocess_window import PreprocessWindow
+        if self._preprocess_window is None:
+            start_dir = self._settings.get("last_recording_dir") or ""
+            self._preprocess_window = PreprocessWindow(
+                self, start_dir=start_dir,
+            )
+            # When the window is closed, drop the reference so the
+            # next open builds a fresh state.
+            self._preprocess_window.destroyed.connect(
+                lambda *_: setattr(self, "_preprocess_window", None)
+            )
+        self._preprocess_window.show()
+        self._preprocess_window.raise_()
+        self._preprocess_window.activateWindow()
 
     def _open_training_window(self) -> None:
         from ui.windows.training_window import TrainingWindow
