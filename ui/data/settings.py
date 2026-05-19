@@ -42,16 +42,14 @@ DEFAULTS: dict[str, Any] = {
     # window's Preprocessing tab updates the JSON; the next NEW
     # animal's review picks them up. Existing per-animal profiles
     # are unaffected (they store their own values).
+    # Defaults for the notch review dialog (matches gi-vagus-viewer):
+    # mains hum is filtered prophylactically at 60/120/180 Hz with
+    # Q=30 + detrend. There's no per-harmonic auto-detection — the
+    # user adjusts the harmonics field manually if their setup needs
+    # different frequencies (e.g. 50/100/150 for European mains).
     "preprocessing_q_factor": 30.0,
-    # Minimum fractional reduction in the recording's Quiroga MAD-
-    # based noise floor (σ) required to include a candidate harmonic
-    # in the notch chain. 0.05 = 5% — the notch must drop overall σ
-    # by at least this much to be worth running. Same noise
-    # estimator the gi-vagus-viewer downstream pipeline uses.
-    "preprocessing_reduction_threshold": 0.05,
-    "preprocessing_max_harmonics": 4,
     "preprocessing_detrend": True,
-    "preprocessing_candidate_harmonics": [60.0, 120.0, 180.0, 240.0, 300.0],
+    "preprocessing_default_freqs_hz": [60.0, 120.0, 180.0],
 }
 
 

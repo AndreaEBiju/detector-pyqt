@@ -67,23 +67,21 @@ def test_settings_has_preprocessing_defaults(isolated_home):
     from ui.data import settings as S
     out = S.load_settings()
     assert out["preprocessing_q_factor"] == 30.0
-    assert out["preprocessing_reduction_threshold"] == 0.05
-    assert out["preprocessing_max_harmonics"] == 4
     assert out["preprocessing_detrend"] is True
-    assert isinstance(out["preprocessing_candidate_harmonics"], list)
-    assert 60.0 in out["preprocessing_candidate_harmonics"]
+    assert out["preprocessing_default_freqs_hz"] == [60.0, 120.0, 180.0]
 
 
 def test_settings_round_trip_preprocessing(isolated_home):
     """User edits in the Training-window's Preprocessing tab persist."""
     from ui.data import settings as S
     S.update_setting("preprocessing_q_factor", 25.0)
+    # European mains setup
     S.update_setting(
-        "preprocessing_candidate_harmonics", [50.0, 100.0, 150.0]
+        "preprocessing_default_freqs_hz", [50.0, 100.0, 150.0]
     )
     out = S.load_settings()
     assert out["preprocessing_q_factor"] == 25.0
-    assert out["preprocessing_candidate_harmonics"] == [50.0, 100.0, 150.0]
+    assert out["preprocessing_default_freqs_hz"] == [50.0, 100.0, 150.0]
 
 
 # ----------------------------------------------------------------------
@@ -225,15 +223,10 @@ def test_channel_assignment_emits_correct_dict(qapp, isolated_home):
 
 def test_notch_review_settings_includes_apply_scope(qapp, isolated_home,
                                                       tmp_path):
-    """notch_settings() carries the apply-to scope + reduction
-    threshold + max harmonics from settings, and includes the
-    Quiroga-σ-reduction per-harmonic dict."""
+    """notch_settings() carries the apply-to scope, the user's
+    chosen harmonics, q_factor / detrend / metric version."""
     from ui.widgets.notch_review import NotchReviewDialog
     from ui.data import settings as S
-
-    # User changes their default σ-reduction threshold:
-    S.update_setting("preprocessing_reduction_threshold", 0.10)
-    S.update_setting("preprocessing_max_harmonics", 3)
 
     nrd = NotchReviewDialog(
         animal_id="subjT",
@@ -243,14 +236,19 @@ def test_notch_review_settings_includes_apply_scope(qapp, isolated_home,
                     "role": "nerve", "label": "VN1"}],
     )
     try:
-        # Default = apply_all
+        # Default = apply_all + harmonics field pre-populated with
+        # 60/120/180 (the gi-vagus-viewer default).
         assert nrd._apply_all_radio.isChecked()
+        assert "60" in nrd._harmonics_edit.text()
+        assert "180" in nrd._harmonics_edit.text()
         out = nrd.notch_settings()
         assert out["apply_scope"] == "all_channels"
-        assert out["reduction_threshold"] == 0.10
-        assert out["max_harmonics_filtered"] == 3
-        # The current-metric (v4.0) key replaces older detection fields.
-        assert "noise_reductions_per_harmonic" in out
+        assert out["frequencies_filtered"] == [60.0, 120.0, 180.0]
+        assert out["q_factor"] == 30.0
+        assert out["detrend"] is True
+        # Notch metric version is stamped so future loads know which
+        # algorithm produced this dict.
+        assert out["notch_metric_version"]
         # Switch radio → reflected
         nrd._apply_selected_radio.setChecked(True)
         assert nrd.notch_settings()["apply_scope"] == "selected_channel_preview"

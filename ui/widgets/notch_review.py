@@ -70,13 +70,6 @@ class NotchReviewDialog(QDialog):
         self._loaded_data: Optional[np.ndarray] = None
         self._loaded_fs: Optional[float] = None
         self._loaded_channel_signal_idx: Optional[int] = None
-        # Per-harmonic fractional reduction of the recording's
-        # Quiroga MAD-based noise floor (σ) when an iirnotch is
-        # applied at that frequency in isolation. Populated by
-        # `_run_auto_detect`. Empty dict means the user hasn't run
-        # Auto-detect yet.
-        self._noise_reductions: dict[float, float] = {}
-
         outer = QVBoxLayout(self)
 
         # Top toolbar: channel + window
@@ -151,12 +144,19 @@ class NotchReviewDialog(QDialog):
 
         form_box = QGroupBox("Notch parameters")
         form = QFormLayout(form_box)
-        # Default to filtering 60 / 120 / 180 Hz — the standard mains
-        # harmonics. Matches the gi-vagus-viewer pipeline's default
-        # `freqs_hz=(60.0, 120.0, 180.0)`. Mains hum is ubiquitous in
-        # lab recordings, so we filter prophylactically rather than
-        # waiting for a detection metric to confirm.
-        self._harmonics_edit = QLineEdit("60.0, 120.0, 180.0")
+        # Default to filtering the user's configured mains harmonics
+        # (Training window's Preprocessing tab → "Default mains
+        # harmonics"). Out-of-the-box that's 60/120/180 — matching
+        # gi-vagus-viewer's `freqs_hz=(60.0, 120.0, 180.0)`. Mains
+        # hum is ubiquitous in lab recordings, so we filter
+        # prophylactically rather than auto-detecting.
+        default_freqs = settings.get(
+            "preprocessing_default_freqs_hz", [60.0, 120.0, 180.0]
+        )
+        self._harmonics_edit = QLineEdit(
+            ", ".join(f"{float(h):g}" for h in default_freqs)
+            if default_freqs else "60.0, 120.0, 180.0"
+        )
         self._harmonics_edit.editingFinished.connect(self._refresh_plot)
         form.addRow("Harmonics (Hz, comma-separated)", self._harmonics_edit)
         self._q_spin = QDoubleSpinBox()
@@ -169,17 +169,6 @@ class NotchReviewDialog(QDialog):
         self._detrend_check.setChecked(default_detrend)
         self._detrend_check.toggled.connect(self._refresh_plot)
         form.addRow(self._detrend_check)
-        # The button MEASURES per-candidate σ reductions and displays
-        # them — it does NOT overwrite the harmonics field. Mains
-        # hum is filtered prophylactically (defaults are pre-filled);
-        # this button is a sanity check, not a replacement for the
-        # user's manual selection.
-        self._redetect_btn = QPushButton(
-            "↻ Measure noise-floor reductions (current channel)"
-        )
-        self._redetect_btn.clicked.connect(self._run_auto_detect)
-        form.addRow(self._redetect_btn)
-
         # Apply-to scope (plan P10.7): the filter always applies to
         # every channel of the saved output; this radio just controls
         # whether the plot's right-side preview filters ALL selected
@@ -228,7 +217,10 @@ class NotchReviewDialog(QDialog):
         if existing_notch:
             freqs = existing_notch.get("frequencies_filtered") or []
             if not freqs:
-                freqs = [60.0, 120.0, 180.0]
+                # Stale empty profile — fall back to user-configured
+                # defaults (or hard-coded 60/120/180) so the field is
+                # never blank on dialog open.
+                freqs = list(default_freqs) or [60.0, 120.0, 180.0]
             self._harmonics_edit.setText(
                 ", ".join(f"{float(h):.1f}" for h in freqs)
             )
@@ -236,17 +228,6 @@ class NotchReviewDialog(QDialog):
             self._detrend_check.setChecked(
                 bool(existing_notch.get("detrend", True))
             )
-            # Noise-floor reductions (fraction) from a profile saved
-            # under the current metric. Profile.load on older profiles
-            # strips this field so the dict stays empty until the user
-            # runs Auto-detect with the new metric.
-            self._noise_reductions = {
-                float(k): float(v)
-                for k, v in (existing_notch.get(
-                    "noise_reductions_per_harmonic"
-                ) or {}).items()
-            }
-
         # Initial render — load data + paint
         self._on_channel_changed()
 
@@ -374,75 +355,23 @@ class NotchReviewDialog(QDialog):
             return []
 
     # ------------------------------------------------------------------
-    # Auto-detection
+    # Summary panel
     # ------------------------------------------------------------------
 
-    def _run_auto_detect(self) -> None:
-        if not self._ensure_data_loaded():
-            return
-        # Pick candidate harmonics + threshold + cap from settings so
-        # the Training window's Preprocessing tab is the single source
-        # of truth for defaults.
-        settings = ui_settings.load_settings()
-        params = notch_mod.NotchParams(
-            q_factor=float(self._q_spin.value()),
-            detrend=self._detrend_check.isChecked(),
-            candidate_harmonics=list(
-                settings.get(
-                    "preprocessing_candidate_harmonics",
-                    [60.0, 120.0, 180.0, 240.0, 300.0],
-                )
-            ),
-            reduction_threshold=float(
-                settings.get("preprocessing_reduction_threshold", 0.05)
-            ),
-            max_harmonics_filtered=int(
-                settings.get("preprocessing_max_harmonics", 4)
-            ),
-        )
-        # Use a longer chunk for detection (60s) so the MAD estimator
-        # has enough samples to be stable. Take from the middle of
-        # the recording to avoid edge transients.
-        fs = float(self._loaded_fs)
-        data = self._loaded_data
-        n = data.shape[0]
-        chunk_n = min(n, int(60.0 * fs))
-        start = max(0, (n - chunk_n) // 2)
-        chunk = data[start:start + chunk_n, :]
-        reds = notch_mod.detect_significant_harmonics(chunk, fs, params)
-        self._noise_reductions = {float(k): float(v) for k, v in reds.items()}
-        # Intentionally DO NOT modify the harmonics field. The
-        # measurement is informational — the user's selection stays
-        # whatever they put in (defaulting to 60/120/180). The display
-        # in `_update_reduction_summary` shows the per-candidate
-        # reductions so the user can see which would contribute most.
-        self._refresh_plot()
-
     def _update_reduction_summary(self) -> None:
-        """Build the summary panel with two pieces:
-
-        1. **Headline**: overall σ before vs after applying the
-           current notch chain (from the field) on the 60-s detection
-           chunk. This is the most useful single number — "did your
-           chosen notch chain reduce my noise floor?"
-        2. **Per-candidate breakdown**: σ reduction if each candidate
-           harmonic were applied IN ISOLATION. Populated by the
-           "Measure" button. Informational — helps the user decide
-           whether to add/remove specific frequencies.
+        """Show the single headline metric: noise floor σ before vs
+        after applying the current notch chain on a 60-s reference
+        chunk. Matches the gi-vagus-viewer approach — no per-harmonic
+        breakdown (every prior version's per-candidate metric had a
+        failure mode and confused more than it informed).
         """
-        # Need the loaded channel data to compute the overall metric.
         if (
             self._loaded_data is None or
             self._loaded_fs is None
         ):
-            if self._noise_reductions:
-                lines = ["(load a channel to see the overall σ change)"]
-            else:
-                lines = [
-                    "(load a channel and click Measure to see "
-                    "noise-floor reductions)"
-                ]
-            self._summary_label.setText("<br>".join(lines))
+            self._summary_label.setText(
+                "(load a channel to see the noise-floor σ change)"
+            )
             return
 
         fs = float(self._loaded_fs)
@@ -452,12 +381,24 @@ class NotchReviewDialog(QDialog):
         start = max(0, (n - chunk_n) // 2)
         chunk = data[start:start + chunk_n, :]
 
-        # Overall σ before vs after applying the CURRENT chain.
         harmonics = self._parse_harmonics()
         col = chunk[:, 0].astype(np.float64, copy=False)
         if self._detrend_check.isChecked():
             col = col - col.mean()
-        sigma_before = float(np.median(np.abs(col)) / 0.6745)
+        try:
+            sigma_before = float(
+                notch_mod.estimate_noise_floor(col)
+            )
+        except Exception as exc:
+            self._summary_label.setText(
+                f"<span style='color:#ff6b6b'>σ estimate failed: {exc}</span>"
+            )
+            return
+
+        ch_label = (
+            self._channel_combo.currentData()["label"]
+            if self._channel_combo.currentData() else "?"
+        )
         if harmonics and sigma_before > 0:
             try:
                 filtered = notch_mod.apply_notch_filter(
@@ -466,51 +407,35 @@ class NotchReviewDialog(QDialog):
                     detrend=self._detrend_check.isChecked(),
                 )
                 fcol = filtered[:, 0].astype(np.float64, copy=False)
-                sigma_after = float(np.median(np.abs(fcol)) / 0.6745)
+                sigma_after = float(notch_mod.estimate_noise_floor(fcol))
                 drop_pct = (sigma_before - sigma_after) / sigma_before * 100
-                overall = (
-                    f"<b>Noise floor σ (Quiroga MAD on 60-s chunk):</b><br>"
+                headline = (
+                    f"<b>Noise floor σ (Quiroga MAD on 60-s chunk · "
+                    f"channel: {ch_label}):</b>"
                     f"<pre style='margin: 4px;'>"
-                    f"  before: {sigma_before:>8.2f}<br>"
-                    f"  after:  {sigma_after:>8.2f}"
-                    f"   ({drop_pct:+.1f}%)</pre>"
+                    f"  before: {sigma_before:>9.3f}<br>"
+                    f"  after:  {sigma_after:>9.3f}   "
+                    f"({drop_pct:+.1f}%)</pre>"
                 )
             except Exception as exc:
-                overall = (
+                headline = (
                     f"<span style='color:#ff6b6b'>"
                     f"Couldn't apply chain: {exc}</span>"
                 )
         else:
-            overall = (
-                f"<b>Noise floor σ (Quiroga MAD):</b> {sigma_before:.2f}"
-                "  (no harmonics in chain — set some to see reduction)"
+            headline = (
+                f"<b>Noise floor σ (Quiroga MAD · channel: {ch_label}):</b> "
+                f"{sigma_before:.3f}  "
+                "(no harmonics in chain — set some to see the reduction)"
             )
 
-        # Per-candidate measurements, if the user clicked "Measure".
-        per_cand = ""
-        if self._noise_reductions:
-            active = set(harmonics)
-            parts = []
-            for h in sorted(self._noise_reductions):
-                r = self._noise_reductions[h]
-                tag = "*" if h in active else " "
-                parts.append(f"{tag} {h:>6.1f} Hz: {r * 100:>5.1f}%")
-            per_cand = (
-                "<br><b>Per-candidate σ reduction (if applied alone):</b>"
-                f"<pre style='margin: 4px;'>" + "<br>".join(parts) + "</pre>"
-            )
-
-        ch_label = (
-            self._channel_combo.currentData()["label"]
-            if self._channel_combo.currentData() else "?"
-        )
         legend = (
-            f"<span style='color:#aaa'>(channel: {ch_label}) · σ uses "
-            "the robust Quiroga MAD estimator (median(|x|)/0.6745), "
-            "matching the gi-vagus-viewer downstream pipeline. * = "
-            "currently in the user's notch chain.</span>"
+            "<span style='color:#aaa'>σ uses the robust Quiroga MAD "
+            "estimator (median(|x|)/0.6745) — the same noise floor "
+            "the gi-vagus-viewer downstream pipeline uses for "
+            "spike-detection thresholds.</span>"
         )
-        self._summary_label.setText(overall + per_cand + "<br>" + legend)
+        self._summary_label.setText(headline + "<br>" + legend)
 
     # ------------------------------------------------------------------
     # Event handlers
@@ -542,31 +467,17 @@ class NotchReviewDialog(QDialog):
         the actual batch save always applies the filter chain to
         every saved channel.
         """
-        settings = ui_settings.load_settings()
         harmonics = self._parse_harmonics()
         return {
             "q_factor": float(self._q_spin.value()),
             "detrend": self._detrend_check.isChecked(),
             "frequencies_filtered": harmonics,
-            # Per-harmonic fractional drop in the Quiroga MAD-based
-            # noise floor when an iirnotch is applied at that
-            # frequency in isolation. Same noise estimator the
-            # gi-vagus-viewer downstream pipeline uses.
-            "noise_reductions_per_harmonic": {
-                str(k): float(v)
-                for k, v in self._noise_reductions.items()
-            },
             # Stamp the metric version so a future re-load can tell
-            # this dict was produced under the σ-reduction metric
-            # (semver "4.0"). The Profile.load migration drops stale
-            # detection numbers from older saves.
+            # this dict was produced under the fixed-harmonics
+            # gi-vagus-viewer-style algorithm (semver "5.0"). The
+            # Profile.load migration drops stale detection numbers
+            # from older saves.
             "notch_metric_version": CURRENT_NOTCH_METRIC_VERSION,
-            "reduction_threshold": float(settings.get(
-                "preprocessing_reduction_threshold", 0.05,
-            )),
-            "max_harmonics_filtered": int(settings.get(
-                "preprocessing_max_harmonics", 4,
-            )),
             "apply_scope": (
                 "all_channels" if self._apply_all_radio.isChecked()
                 else "selected_channel_preview"

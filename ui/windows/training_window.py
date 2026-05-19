@@ -610,48 +610,6 @@ class TrainingWindow(QMainWindow):
         )
         notch_form.addRow("Q factor", self._pp_q_factor)
 
-        # Reduction threshold: minimum fractional drop in the
-        # recording's robust noise floor (Quiroga MAD-based σ) for
-        # a candidate harmonic to be included in the notch chain.
-        # 5% is a sane default for real recordings — strong mains
-        # hum usually accounts for 10-50% of total σ.
-        self._pp_threshold = QDoubleSpinBox()
-        self._pp_threshold.setRange(0.0, 1.0)
-        self._pp_threshold.setDecimals(2)
-        self._pp_threshold.setSingleStep(0.01)
-        self._pp_threshold.setValue(
-            float(settings.get("preprocessing_reduction_threshold", 0.05))
-        )
-        self._pp_threshold.setToolTip(
-            "Minimum fractional reduction of the recording's noise "
-            "floor (σ) for a candidate harmonic to be auto-selected.\n"
-            "  0.05 = 5% drop in σ → modest hum, worth filtering\n"
-            "  0.20 = 20% drop → significant hum\n"
-            "  0.50 = 50% drop → very strong hum dominating σ\n"
-            "Uses the Quiroga MAD-based σ estimator (median(|x|)/0.6745) "
-            "which is robust to spikes and other sparse outliers."
-        )
-        self._pp_threshold.valueChanged.connect(
-            lambda v: ui_settings.update_setting(
-                "preprocessing_reduction_threshold", float(v),
-            )
-        )
-        notch_form.addRow(
-            "Min σ reduction", self._pp_threshold,
-        )
-
-        self._pp_max_harm = QSpinBox()
-        self._pp_max_harm.setRange(0, 10)
-        self._pp_max_harm.setValue(
-            int(settings.get("preprocessing_max_harmonics", 4))
-        )
-        self._pp_max_harm.valueChanged.connect(
-            lambda v: ui_settings.update_setting(
-                "preprocessing_max_harmonics", int(v),
-            )
-        )
-        notch_form.addRow("Max harmonics filtered", self._pp_max_harm)
-
         self._pp_detrend = QCheckBox(
             "Detrend (subtract per-channel mean before filtering)"
         )
@@ -665,19 +623,26 @@ class TrainingWindow(QMainWindow):
         )
         notch_form.addRow(self._pp_detrend)
 
-        # Candidate harmonics is a comma-separated text field — easier
-        # than a multi-spinbox table for what's usually 5 numbers.
-        cand_default = ", ".join(
+        # Default notch frequencies — pre-fill the notch-review
+        # dialog's Harmonics field on dialog open for new animals.
+        # 60/120/180 matches the gi-vagus-viewer pipeline default;
+        # European users should switch to 50/100/150.
+        default_freqs = ", ".join(
             f"{float(h):g}" for h in
-            settings.get("preprocessing_candidate_harmonics",
-                          [60.0, 120.0, 180.0, 240.0, 300.0])
+            settings.get("preprocessing_default_freqs_hz",
+                          [60.0, 120.0, 180.0])
         )
-        self._pp_candidates = QLineEdit(cand_default)
-        self._pp_candidates.editingFinished.connect(
-            self._on_candidate_harmonics_edited
+        self._pp_default_freqs = QLineEdit(default_freqs)
+        self._pp_default_freqs.editingFinished.connect(
+            self._on_default_freqs_edited
+        )
+        self._pp_default_freqs.setToolTip(
+            "Comma-separated mains harmonics applied by default. The "
+            "notch review dialog can be edited per animal; this is "
+            "just the starting point for new reviews."
         )
         notch_form.addRow(
-            "Candidate harmonics (Hz)", self._pp_candidates,
+            "Default mains harmonics (Hz)", self._pp_default_freqs,
         )
         layout.addWidget(notch_group)
 
@@ -710,8 +675,8 @@ class TrainingWindow(QMainWindow):
         self._refresh_profiles_summary()
         return w
 
-    def _on_candidate_harmonics_edited(self) -> None:
-        text = self._pp_candidates.text().strip()
+    def _on_default_freqs_edited(self) -> None:
+        text = self._pp_default_freqs.text().strip()
         try:
             vals = [
                 float(t.strip())
@@ -720,22 +685,22 @@ class TrainingWindow(QMainWindow):
             ]
         except ValueError:
             QMessageBox.warning(
-                self, "Bad candidate harmonics",
+                self, "Bad default frequencies",
                 "Couldn't parse — keep it as a comma-separated list "
-                "of numbers, e.g. \"60, 120, 180, 240, 300\".",
+                "of numbers, e.g. \"60, 120, 180\".",
             )
             # Revert to the persisted value
             current = ui_settings.load_settings().get(
-                "preprocessing_candidate_harmonics", [60.0, 120.0]
+                "preprocessing_default_freqs_hz", [60.0, 120.0, 180.0]
             )
-            self._pp_candidates.setText(
+            self._pp_default_freqs.setText(
                 ", ".join(f"{float(h):g}" for h in current)
             )
             return
         if not vals:
             return
         ui_settings.update_setting(
-            "preprocessing_candidate_harmonics", vals,
+            "preprocessing_default_freqs_hz", vals,
         )
 
     def _refresh_profiles_summary(self) -> None:
