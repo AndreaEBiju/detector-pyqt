@@ -11,6 +11,10 @@ Keys persisted:
   stim_rec recordings with a boundary set).
 - `last_recording_dir` — last path the Open dialog was pointed at.
   Reduces clicks when working through a folder.
+- `preprocessing_*` — defaults that pre-fill the per-batch
+  preprocessing review UI. They never override an existing animal
+  profile (profiles store their own resolved values); they only
+  apply when a brand-new animal is reviewed.
 """
 
 from __future__ import annotations
@@ -33,6 +37,16 @@ DEFAULTS: dict[str, Any] = {
     "auto_run_on_open": True,
     "inference_skip_stim": True,
     "last_recording_dir": "",
+    # Preprocessing defaults — mirror NotchParams in
+    # detector.preprocessing.notch. Editing these in the Training
+    # window's Preprocessing tab updates the JSON; the next NEW
+    # animal's review picks them up. Existing per-animal profiles
+    # are unaffected (they store their own values).
+    "preprocessing_q_factor": 30.0,
+    "preprocessing_reduction_threshold": 0.5,
+    "preprocessing_max_harmonics": 4,
+    "preprocessing_detrend": True,
+    "preprocessing_candidate_harmonics": [60.0, 120.0, 180.0, 240.0, 300.0],
 }
 
 

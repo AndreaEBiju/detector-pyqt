@@ -23,6 +23,8 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
+import pyqtgraph as pg
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGroupBox,
@@ -35,7 +37,17 @@ _detector_core = _repo_root / "detector-core"
 if _detector_core.exists() and str(_detector_core) not in sys.path:
     sys.path.insert(0, str(_detector_core))
 
-from detector.preprocessing.tdt_io import StreamInfo                # noqa: E402
+from detector.preprocessing.tdt_io import StreamInfo, load_stream  # noqa: E402
+
+
+# How much of the recording to read for the sparkline previews. 5 s
+# is enough to spot dead channels (constant zero) or persistent
+# mains pickup, without forcing the user to wait on a multi-channel
+# pull of a 20-minute block.
+SPARKLINE_SECONDS = 5.0
+# How many points to display per sparkline; we downsample after
+# loading so each mini-plot stays sub-ms to repaint.
+SPARKLINE_TARGET_POINTS = 400
 
 
 # Plan-default stream names — guessed if the actual stream list
@@ -79,13 +91,24 @@ class ChannelAssignmentDialog(QDialog):
         animal_id: str,
         streams: dict[str, StreamInfo],
         existing_assignment: Optional[dict] = None,
+        tdt_folder: Optional[Path] = None,
         parent: Optional[QWidget] = None,
     ):
         super().__init__(parent)
         self.setWindowTitle(f"Channel assignment — {animal_id}")
-        self.resize(820, 620)
+        self.resize(960, 680)
         self._streams = streams
         self._animal_id = animal_id
+        # Optional — needed for sparkline loading. If None, the
+        # "Load sparkline previews" button is hidden because we
+        # can't read data.
+        self._tdt_folder: Optional[Path] = (
+            Path(tdt_folder) if tdt_folder else None
+        )
+        # Sparkline cache: {raw_stream_name: (data (N, n_ch), fs)}
+        self._sparkline_cache: dict[
+            str, tuple[np.ndarray, float],
+        ] = {}
 
         outer = QVBoxLayout(self)
 
@@ -141,17 +164,48 @@ class ChannelAssignmentDialog(QDialog):
         else:
             self._apply_defaults()
 
+        # Sparkline-load toolbar: button + status label. Hidden if
+        # no tdt_folder was provided (can't read data without it).
+        sparkline_row = QHBoxLayout()
+        self._sparkline_btn = QPushButton(
+            f"↻ Load {int(SPARKLINE_SECONDS)}s sparkline previews"
+        )
+        self._sparkline_btn.setToolTip(
+            "Reads the first few seconds of every channel in the "
+            "current raw stream so you can spot dead channels at a "
+            "glance. One-time cost per stream selection."
+        )
+        self._sparkline_btn.clicked.connect(self._load_sparklines)
+        sparkline_row.addWidget(self._sparkline_btn)
+        self._sparkline_status = QLabel("")
+        self._sparkline_status.setStyleSheet("color: #aaa;")
+        sparkline_row.addWidget(self._sparkline_status)
+        sparkline_row.addStretch(1)
+        if self._tdt_folder is None:
+            self._sparkline_btn.setEnabled(False)
+            self._sparkline_btn.setToolTip(
+                "Sparklines need a tdt_folder; constructor wasn't "
+                "given one."
+            )
+        outer.addLayout(sparkline_row)
+
         # Channel table (rebuilt when the raw-stream choice changes).
-        self._channels_table = QTableWidget(0, 4)
+        # Columns: Include, TDT channel, Role, Label, Sparkline (first
+        # ~5 s preview, lazy-loaded by the button above).
+        self._channels_table = QTableWidget(0, 5)
         self._channels_table.setHorizontalHeaderLabels(
-            ("Include", "TDT channel", "Role", "Label")
+            ("Include", "TDT channel", "Role", "Label", "Preview (≈5 s)")
         )
         self._channels_table.verticalHeader().setVisible(False)
+        # Sparkline rows are taller — set the default row height so
+        # the mini-plots have enough vertical room.
+        self._channels_table.verticalHeader().setDefaultSectionSize(48)
         hdr = self._channels_table.horizontalHeader()
         hdr.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         hdr.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         hdr.setSectionResizeMode(2, QHeaderView.Stretch)
         hdr.setSectionResizeMode(3, QHeaderView.Stretch)
+        hdr.setSectionResizeMode(4, QHeaderView.Stretch)
         outer.addWidget(self._channels_table, stretch=1)
 
         # Validation summary
@@ -248,9 +302,100 @@ class ChannelAssignmentDialog(QDialog):
             else:
                 label_edit.setText(f"Ch{i + 1}")
             self._channels_table.setCellWidget(i, 3, label_edit)
+            # Sparkline placeholder — populated by `_load_sparklines`
+            # when the user clicks the button.
+            spark = pg.PlotWidget()
+            spark.setBackground("#0e1117")
+            spark.hideAxis("left")
+            spark.hideAxis("bottom")
+            spark.showGrid(x=False, y=False)
+            spark.setMouseEnabled(x=False, y=False)
+            spark.setMenuEnabled(False)
+            spark.setFixedHeight(40)
+            self._channels_table.setCellWidget(i, 4, spark)
+        # If we already have a cached batch of sparkline data for the
+        # current stream, paint it now (e.g. user toggled streams and
+        # came back).
+        if raw_name in self._sparkline_cache:
+            self._paint_sparklines_from_cache(raw_name)
+        else:
+            self._sparkline_status.setText(
+                f"(click \"Load previews\" to render — {n_ch} channels × "
+                f"{int(SPARKLINE_SECONDS)} s)"
+            )
         self._update_summary()
         # React to checkbox toggle to refresh the summary.
         self._channels_table.itemChanged.connect(self._update_summary)
+
+    # ------------------------------------------------------------------
+    # Sparkline previews
+    # ------------------------------------------------------------------
+
+    def _load_sparklines(self) -> None:
+        """Read the first ~5 s of the current raw stream (all channels
+        at once — single `load_stream` call) and paint each row's
+        mini-plot. Cached by stream name so toggling streams doesn't
+        re-pay the cost."""
+        if self._tdt_folder is None:
+            return
+        raw_name = self._raw_combo.currentData()
+        if not raw_name or raw_name not in self._streams:
+            return
+        if raw_name in self._sparkline_cache:
+            self._paint_sparklines_from_cache(raw_name)
+            return
+        self._sparkline_status.setText("Loading…")
+        self._sparkline_btn.setEnabled(False)
+        try:
+            # All channels in one call — much faster than N separate
+            # loads. tdt indexes 1-based, load_stream maps from our
+            # 0-based indices.
+            n_ch = self._streams[raw_name].n_channels
+            data_full, fs = load_stream(
+                self._tdt_folder, raw_name,
+                channel_indices=list(range(n_ch)),
+            )
+            # Truncate to SPARKLINE_SECONDS of data.
+            n_keep = min(data_full.shape[0], int(SPARKLINE_SECONDS * fs))
+            data = data_full[:n_keep, :]
+            self._sparkline_cache[raw_name] = (data, float(fs))
+            self._paint_sparklines_from_cache(raw_name)
+        except Exception as exc:
+            self._sparkline_status.setText(
+                f"<span style='color:#ff6b6b'>Failed: {exc}</span>"
+            )
+        finally:
+            self._sparkline_btn.setEnabled(True)
+
+    def _paint_sparklines_from_cache(self, raw_name: str) -> None:
+        if raw_name not in self._sparkline_cache:
+            return
+        data, fs = self._sparkline_cache[raw_name]
+        n_samples, n_ch = data.shape
+        # Downsample to SPARKLINE_TARGET_POINTS via stride. Simple
+        # decimation is fine for visual sanity check — we're not
+        # measuring signal properties from these.
+        stride = max(1, n_samples // SPARKLINE_TARGET_POINTS)
+        # Common x-axis (in seconds).
+        x = (np.arange(0, n_samples, stride) / fs).astype(np.float32)
+        # Pick a row count cap in case the table was resized.
+        rows = min(n_ch, self._channels_table.rowCount())
+        for i in range(rows):
+            spark = self._channels_table.cellWidget(i, 4)
+            if spark is None:
+                continue
+            y = data[::stride, i].astype(np.float32)
+            spark.clear()
+            spark.plot(x, y, pen=pg.mkPen(color="#4ea3ff", width=0.8))
+            # Mark dead channels (near-constant) with a red tint to
+            # help the user spot them quickly.
+            spread = float(y.max() - y.min())
+            if spread < 1e-6:
+                spark.setBackground("#2a0e0e")
+        self._sparkline_status.setText(
+            f"Showing {SPARKLINE_SECONDS:.0f} s previews "
+            f"(fs ≈ {fs:.0f} Hz · {n_ch} channels)"
+        )
 
     # ------------------------------------------------------------------
     # Validation

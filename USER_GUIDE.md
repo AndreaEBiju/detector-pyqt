@@ -302,6 +302,32 @@ showing old vs new metrics if `regression_report.json` exists.
 If you close the training window mid-retrain, the subprocess keeps
 going. Re-open the window and it'll auto-attach.
 
+### Preprocessing tab
+
+Defaults that pre-fill new animal reviews in the Preprocess window
+(see section 8). They do **not** override saved per-animal profiles
+— each animal's stored profile is authoritative for that animal.
+
+- **Q factor** (default 30) — sharpness of the notch filter. Higher
+  Q = narrower notch.
+- **Reduction threshold** (default 0.5) — a candidate harmonic is
+  kept only if iirnotch + filtfilt actually reduces its band-power
+  by at least this fraction. Avoids including useless notches.
+- **Max harmonics filtered** (default 4) — cap on how many harmonics
+  the cascade includes, ranked by their measured reduction.
+- **Detrend** (default on) — subtract the per-channel mean before
+  filtering. Recommended; harmless on already-detrended recordings.
+- **Candidate harmonics** (default `60, 120, 180, 240, 300`) —
+  comma-separated frequencies the auto-detection considers. Add
+  50/100/150 for European mains.
+
+The **animal profiles** section lists every saved profile (the
+last-updated date, channel count, applied notches per animal). The
+**Reset ALL animal profiles** button deletes every file in
+`~/.detector/preprocessing_profiles/` after a confirmation. Use it
+when your electrode setup or noise profile has changed enough that
+you'd rather re-review than override one animal at a time.
+
 ### Settings tab
 
 Auto-retrain prompt: when enabled, adding the Nth recording since
@@ -310,7 +336,136 @@ tabs to Retrain.
 
 ---
 
-## 8. Recording queue (batch workflow)
+## 8. Preprocessing TDT data
+
+The Preprocess window converts raw TDT block folders into the
+`_sig.mat` / `_vib.mat` / `_stim.mat` / `_notched.mat` files the
+rest of the pipeline (labeler, splitter, model) reads. Replaces the
+MATLAB preprocessing script some workflows still use.
+
+### When to use it
+
+You have one or more **TDT block folders** (each contains
+`.tev / .tsq / .tin` files from Synapse / OpenEx) and want to land
+in the labeler with everything denoised and channel-mapped.
+
+### How to open it
+
+Two routes:
+
+- `File → Preprocess TDT data…` — the explicit entry.
+- `File → Open` → pick a TDT folder (not a `.mat`). The window
+  pops up pre-populated with that folder. (If the folder *already*
+  contains a `_notched.mat`, Open loads it directly instead — the
+  preprocess flow only fires for folders that haven't been
+  preprocessed yet.)
+
+### The 7-step flow
+
+The window walks through these steps with **Back / Next** buttons.
+You can re-enter any prior step except while a batch is running.
+
+1. **Select folders.** Click `➕ Pick folders…`. Qt's macOS dialog
+   only allows single-folder selection, so you add them one at a
+   time — for batches up to ~25 folders this is one extra click per
+   folder, in exchange for a native picker. Use `Clear` to start
+   over.
+
+2. **Configure batch.** A row per folder: pick the condition
+   (baseline / stim / recovery / stim_rec), edit the output
+   filename prefix (defaults to the folder name), enter the
+   **animal ID**. The **Profile?** column shows ✓ if a saved
+   profile already exists for that animal — that means we'll reuse
+   the channel + notch settings and the per-animal review is just
+   a confirmation click.
+
+3. **Channels consistent?** A yes/no question:
+   - **Yes** — same electrodes used across every recording in the
+     batch. The channel-assignment dialog opens **once** (for the
+     first animal) and applies to all profiles built in this batch.
+   - **No** — each animal gets its own channel-assignment review.
+
+4. **Per-animal review.** For each animal in the batch order:
+   - **Channel assignment** dialog opens (unless the animal has a
+     saved profile + you're in "channels consistent" mode):
+     - Pick which TDT stream is the raw signal (default: `Raww`).
+     - Pick aux streams: stim (`BiPl`), vibration (`adc1`), stim
+       envelope (`ADC2`).
+     - Per-channel table: include / role (nerve / stomach / other
+       / exclude) / label (`VN1`, `Ant1`, …).
+     - **Load 5-s sparkline previews** button reads the first few
+       seconds of every channel so you can spot dead ones at a
+       glance. Constant-zero channels get a red background tint.
+     - The summary line shows "X nerve · Y stomach" — yellow if it
+       doesn't match the detector's expected 2 + 3, and a
+       confirmation dialog warns before Accept.
+   - **Notch review** dialog opens:
+     - pyqtgraph plot: grey raw + blue notched on a 10-s window of
+       the selected channel.
+     - **Auto-detect harmonics** runs `detect_significant_harmonics`
+       on the middle 60 s and populates the field with the
+       candidates whose power reduction passed the threshold.
+     - You can edit the harmonics field directly (comma-separated),
+       change the Q factor / detrend flag, and the filtered trace
+       updates live.
+     - **Apply to** radio: by default the filter applies to all
+       saved channels; "selected channel only" is a preview mode if
+       you want to inspect one channel before committing.
+     - Reduction summary shows the per-harmonic % reduction.
+   - Profiles save immediately when you Accept the notch step, so
+     a mid-batch cancel still leaves the next batch with usable
+     defaults.
+
+5. **Confirm.** Per-row preview of what's about to happen:
+   `[process]` / `[overwrite existing]` / `[re-process as 'x_v2']`
+   / `[skip — already processed]`. If a row's output filename
+   prefix already exists in the destination folder, a small modal
+   asks you: **Skip** / **Re-process (overwrite)** / **Re-process
+   with suffix `_v2`**.
+
+6. **Processing.** Live progress bar + per-file status list. Click
+   **Cancel after current file** to stop after the current TDT
+   folder finishes (there's no mid-file cancel — the worker can't
+   safely interrupt iirnotch).
+
+7. **Report.** Per-row OK / skipped / error summary with the
+   produced output paths, validation warnings ("nerve count was 1,
+   expected 2"), and an **Open output folder…** button that opens
+   one of the produced folders in Finder.
+
+When the batch finishes, the labeler auto-prompts to open the
+newest produced `_notched.mat`, so you usually end up straight in
+the labeler ready to mark intervals.
+
+### Per-animal profile reuse
+
+Profiles persist at `~/.detector/preprocessing_profiles/<animal_id>.json`.
+Adding the same animal to a new batch later picks the saved
+channel + notch settings as defaults — the review steps still run
+but everything is pre-filled. Manage / inspect / wipe profiles
+from the Training window's **Preprocessing** tab.
+
+### Output files
+
+For a row with `output_condition_name = "subj01_bl_1"`, you'll get
+the following in the source TDT folder:
+
+- `subj01_bl_1_sig.mat` — raw signal, channel-subsetted (not
+  notched). MATLAB variable `signal` shape `(n_ch, N)`, with `fs`
+  and `times`.
+- `subj01_bl_1_vib.mat` — vibration stream (`vib`, `fs_vib`,
+  `times_vib`).
+- `subj01_bl_1_stim.mat` — stim stream (`stim`, `fs`, `times`).
+- `subj01_bl_1_notched.mat` — notched signal (`y`, `fs`, `times`).
+  This is what you open in the labeler.
+- `subj01_bl_1_meta.json` — sidecar with channel roles, animal ID,
+  condition, notch params + per-harmonic reductions, source TDT
+  folder path. Validation warnings (role counts, missing fields)
+  surface in the Report screen.
+
+---
+
+## 9. Recording queue (batch workflow)
 
 `Tools → Recording queue` (`Ctrl+Q`) toggles a queue dock on the
 left. Use this when working through many recordings:
@@ -330,7 +485,7 @@ reason), Reset to pending, Remove from queue.
 
 ---
 
-## 9. Keyboard shortcuts
+## 10. Keyboard shortcuts
 
 `Help → Keyboard shortcuts` (`F1`) shows the full table inside the
 app. Highlights:
@@ -349,7 +504,7 @@ app. Highlights:
 
 ---
 
-## 10. Troubleshooting
+## 11. Troubleshooting
 
 ### Some menus look empty / missing
 
@@ -396,7 +551,7 @@ You're not in a context where Python can see the
 
 ---
 
-## 11. Where the data lives
+## 12. Where the data lives
 
 ```
 ~/.detector/                           per-user state

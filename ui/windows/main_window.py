@@ -311,6 +311,9 @@ class MainWindow(QMainWindow):
         survives an accidental close-and-reopen of the menu item.
         The window keeps its own thread; this main window just
         spawns and forgets it.
+
+        Listens for `batch_completed` so the newest produced
+        `_notched.mat` auto-loads into the labeler (P13).
         """
         from ui.windows.preprocess_window import PreprocessWindow
         if self._preprocess_window is None:
@@ -322,6 +325,9 @@ class MainWindow(QMainWindow):
             # next open builds a fresh state.
             self._preprocess_window.destroyed.connect(
                 lambda *_: setattr(self, "_preprocess_window", None)
+            )
+            self._preprocess_window.batch_completed.connect(
+                self._on_preprocess_finished
             )
         self._preprocess_window.show()
         self._preprocess_window.raise_()
@@ -417,26 +423,157 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_open_clicked(self) -> None:
+        """Smart Open: file OR folder.
+
+        - File ending in .mat/.h5 → load directly (legacy behavior).
+        - Folder that looks like a TDT block (`.tsq` inside) → if it
+          already has `<...>_notched.mat`, load that; otherwise open
+          the Preprocess window pre-populated with this folder.
+        - Anything else → tell the user.
+
+        Qt's native macOS open dialog can't select both files and
+        folders in a single shot, so we use the non-native dialog
+        with `DontUseNativeDialog`. The non-native dialog is uglier
+        but lets us toggle `FileMode.AnyFile` and accept any
+        selection.
+        """
         if not self._maybe_discard_unsaved():
             return
         start_dir = self._settings.get("last_recording_dir") or ""
-        path_str, _ = QFileDialog.getOpenFileName(
-            self,
-            "Open recording",
-            start_dir,
-            "Recording files (*.mat *.h5);;All files (*)",
-        )
-        if not path_str:
+        # Build the dialog manually so we can accept folders too.
+        dlg = QFileDialog(self, "Open recording or TDT folder", start_dir)
+        dlg.setFileMode(QFileDialog.AnyFile)
+        dlg.setOption(QFileDialog.DontUseNativeDialog, True)
+        # `*` keeps folders visible (folder filter doesn't apply to
+        # AnyFile on every platform).
+        dlg.setNameFilters([
+            "Recording files (*.mat *.h5)",
+            "All files (*)",
+        ])
+        if dlg.exec() != QFileDialog.Accepted:
             return
-        self._open_path(Path(path_str))
+        selected = dlg.selectedFiles()
+        if not selected:
+            return
+        self._open_path(Path(selected[0]))
+
+    def _handle_tdt_folder_open(self, folder: Path) -> None:
+        """The user picked a folder from the Open dialog. If it looks
+        like a TDT block, route them appropriately:
+
+        - Pipeline outputs already in the folder
+          (`*_notched.mat`) → load the newest one directly.
+        - Looks like a TDT block (`.tsq` inside) but no outputs →
+          open the Preprocess window with this folder pre-populated.
+        - Doesn't look like a TDT block → tell the user.
+
+        Heuristic for "looks like a TDT block": presence of any
+        `.tsq` file. This is the same check the backend uses in
+        `tdt_io.list_streams`.
+        """
+        # 1. Already-processed outputs win — load directly.
+        notched_candidates = sorted(folder.glob("*_notched.mat"))
+        if notched_candidates:
+            # Newest by mtime (so the most recently preprocessed run
+            # wins if the user re-ran with a suffix).
+            newest = max(notched_candidates, key=lambda p: p.stat().st_mtime)
+            self._open_path(newest)
+            return
+
+        # 2. Looks like a TDT block? Open Preprocess pre-populated.
+        if any(folder.glob("*.tsq")):
+            resp = QMessageBox.question(
+                self, "Preprocess this TDT folder?",
+                f"<b>{folder.name}</b> looks like a TDT block but "
+                "has no pipeline outputs yet.\n\n"
+                "Open the preprocessing workflow with this folder "
+                "pre-populated?",
+            )
+            if resp != QMessageBox.Yes:
+                return
+            self._open_preprocess_with_folder(folder)
+            return
+
+        # 3. Neither — bail loudly.
+        QMessageBox.warning(
+            self, "Not a recognized folder",
+            f"<b>{folder.name}</b> isn't a .mat/.h5 recording and "
+            "doesn't look like a TDT block (no .tsq file inside).\n\n"
+            "Either pick a recording file directly, or pick a TDT "
+            "block folder.",
+        )
+
+    def _open_preprocess_with_folder(self, folder: Path) -> None:
+        """Open (or reuse) the Preprocess window and seed it with
+        `folder` already in the batch list. Called from the
+        smart-Open code path."""
+        from ui.windows.preprocess_window import PreprocessWindow
+        if self._preprocess_window is None:
+            self._preprocess_window = PreprocessWindow(
+                self, start_dir=str(folder.parent),
+            )
+            self._preprocess_window.destroyed.connect(
+                lambda *_: setattr(self, "_preprocess_window", None)
+            )
+            # P13: when the batch finishes, load the newest produced
+            # notched output into the main window so the user lands
+            # straight in the labeler.
+            self._preprocess_window.batch_completed.connect(
+                self._on_preprocess_finished
+            )
+        # Seed the folder so the user doesn't have to click "Add".
+        if hasattr(self._preprocess_window, "seed_folder"):
+            self._preprocess_window.seed_folder(folder)
+        self._preprocess_window.show()
+        self._preprocess_window.raise_()
+        self._preprocess_window.activateWindow()
+
+    def _on_preprocess_finished(self, results: list) -> None:
+        """Called when a Preprocess batch completes.
+
+        Pick the newest `_notched.mat` from the successful results
+        and load it into the main window. Multiple successful items
+        → load the newest by mtime (typical case is the user processed
+        baseline + stim_rec for the same animal and wants to see the
+        most recent).
+        """
+        notched_paths: list[Path] = []
+        for r in results or []:
+            if r.get("status") != "ok":
+                continue
+            outputs = r.get("output_paths") or {}
+            p = outputs.get("notched")
+            if p is not None and Path(p).exists():
+                notched_paths.append(Path(p))
+        if not notched_paths:
+            return
+        newest = max(notched_paths, key=lambda p: p.stat().st_mtime)
+        # Don't barge — ask before replacing whatever the user is
+        # currently editing.
+        if self._recording is not None:
+            resp = QMessageBox.question(
+                self, "Open preprocessed output?",
+                f"Preprocessing finished. Open <b>{newest.name}</b> "
+                "in the labeler?",
+            )
+            if resp != QMessageBox.Yes:
+                return
+        self._open_path(newest)
 
     def _open_path(self, path: Path) -> None:
         """Open `path`. We load TWICE because the two readers serve
         different needs (see __init__).
+
+        Folder selections are routed through `_handle_tdt_folder_open`
+        which decides between loading existing outputs vs opening the
+        Preprocess window.
         """
         if not path.exists():
             QMessageBox.warning(self, "Open failed",
                                   f"File not found:\n{path}")
+            return
+        if path.is_dir():
+            self._handle_tdt_folder_open(path)
             return
         try:
             # 1. Lazy reader for the viewer

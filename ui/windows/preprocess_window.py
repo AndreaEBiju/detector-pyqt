@@ -441,6 +441,25 @@ class PreprocessWindow(QMainWindow):
         self._folders_list.clear()
         self._refresh_nav_state()
 
+    def seed_folder(self, folder: Path) -> None:
+        """Pre-populate the batch with a folder.
+
+        Called by MainWindow when the user opens a TDT folder via
+        the smart Open dialog — we drop it straight into the
+        accumulator list (and bring focus to Step 1) so the user
+        sees "yes, your folder is here, click Next" instead of
+        having to re-pick it.
+        """
+        folder = Path(folder)
+        if folder in self._folders:
+            self._stack.setCurrentIndex(STEP_SELECT_FOLDERS)
+            return
+        self._folders.append(folder)
+        item = QListWidgetItem(f"{folder.name}    ·    {folder.parent}")
+        item.setToolTip(str(folder))
+        self._folders_list.addItem(item)
+        self._go_to_step(STEP_SELECT_FOLDERS)
+
     # ==================================================================
     # Step 4 — Per-animal review
     # ==================================================================
@@ -551,6 +570,7 @@ class PreprocessWindow(QMainWindow):
                 animal_id=target,
                 streams=streams,
                 existing_assignment=existing,
+                tdt_folder=sample_folder,
                 parent=self,
             )
             if ca_dlg.exec() != QDialog.Accepted:

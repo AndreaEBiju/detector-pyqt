@@ -28,7 +28,7 @@ from PySide6.QtGui import QDoubleValidator
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
     QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-    QMessageBox, QPushButton, QSpinBox, QVBoxLayout, QWidget,
+    QMessageBox, QPushButton, QRadioButton, QSpinBox, QVBoxLayout, QWidget,
 )
 
 _repo_root = Path(__file__).resolve().parent.parent.parent
@@ -38,6 +38,8 @@ if _detector_core.exists() and str(_detector_core) not in sys.path:
 
 from detector.preprocessing import notch as notch_mod                # noqa: E402
 from detector.preprocessing.tdt_io import load_stream                 # noqa: E402
+
+from ui.data import settings as ui_settings                           # noqa: E402
 
 
 class NotchReviewDialog(QDialog):
@@ -112,20 +114,32 @@ class NotchReviewDialog(QDialog):
         )
         outer.addWidget(self._plot_widget, stretch=1)
 
-        # Notch params form
+        # Notch params form. Defaults come from the Training window's
+        # Preprocessing tab (ui_settings) unless an existing per-animal
+        # profile passes its own values via `existing_notch`.
+        settings = ui_settings.load_settings()
+        default_q = float(settings.get("preprocessing_q_factor", 30.0))
+        default_detrend = bool(settings.get("preprocessing_detrend", True))
+        default_harmonics = settings.get(
+            "preprocessing_candidate_harmonics", [60.0, 120.0]
+        )
+
         form_box = QGroupBox("Notch parameters")
         form = QFormLayout(form_box)
-        self._harmonics_edit = QLineEdit("60.0, 120.0")
+        self._harmonics_edit = QLineEdit(
+            ", ".join(f"{float(h):g}" for h in default_harmonics[:2])
+            if default_harmonics else "60.0, 120.0"
+        )
         self._harmonics_edit.editingFinished.connect(self._refresh_plot)
         form.addRow("Harmonics (Hz, comma-separated)", self._harmonics_edit)
         self._q_spin = QDoubleSpinBox()
         self._q_spin.setRange(1.0, 200.0)
-        self._q_spin.setValue(30.0)
+        self._q_spin.setValue(default_q)
         self._q_spin.setDecimals(1)
         self._q_spin.valueChanged.connect(self._refresh_plot)
         form.addRow("Q factor", self._q_spin)
         self._detrend_check = QCheckBox("Detrend (subtract per-channel mean)")
-        self._detrend_check.setChecked(True)
+        self._detrend_check.setChecked(default_detrend)
         self._detrend_check.toggled.connect(self._refresh_plot)
         form.addRow(self._detrend_check)
         self._redetect_btn = QPushButton(
@@ -133,6 +147,26 @@ class NotchReviewDialog(QDialog):
         )
         self._redetect_btn.clicked.connect(self._run_auto_detect)
         form.addRow(self._redetect_btn)
+
+        # Apply-to scope (plan P10.7): the filter always applies to
+        # every channel of the saved output; this radio just controls
+        # whether the plot's right-side preview filters ALL selected
+        # channels (so the user can scroll through the channel combo
+        # and spot-check each) or only the currently-shown channel
+        # (cheaper to recompute on big windows). Stored on the dialog
+        # so `notch_settings()` reports the choice for the profile.
+        apply_box = QGroupBox("Apply notch filter to")
+        apply_v = QVBoxLayout(apply_box)
+        self._apply_all_radio = QRadioButton(
+            "All channels in this animal's recordings (recommended)"
+        )
+        self._apply_all_radio.setChecked(True)
+        self._apply_selected_radio = QRadioButton(
+            "Selected channel only (preview / spot-check before committing)"
+        )
+        apply_v.addWidget(self._apply_all_radio)
+        apply_v.addWidget(self._apply_selected_radio)
+        form.addRow(apply_box)
         outer.addWidget(form_box)
 
         # Reduction summary
@@ -185,6 +219,12 @@ class NotchReviewDialog(QDialog):
         """
         ch = self._channel_combo.currentData()
         if ch is None:
+            return False
+        # If the folder doesn't actually exist (e.g. dialog
+        # constructed for a smoke test, or the path moved between
+        # runs), bail silently so we don't pop a blocking modal
+        # during dialog construction.
+        if not Path(self._tdt_folder).exists():
             return False
         signal_idx = ch["signal_index"]
         if (
@@ -276,9 +316,25 @@ class NotchReviewDialog(QDialog):
     def _run_auto_detect(self) -> None:
         if not self._ensure_data_loaded():
             return
+        # Pick candidate harmonics + threshold + cap from settings so
+        # the Training window's Preprocessing tab is the single source
+        # of truth for defaults.
+        settings = ui_settings.load_settings()
         params = notch_mod.NotchParams(
             q_factor=float(self._q_spin.value()),
             detrend=self._detrend_check.isChecked(),
+            candidate_harmonics=list(
+                settings.get(
+                    "preprocessing_candidate_harmonics",
+                    [60.0, 120.0, 180.0, 240.0, 300.0],
+                )
+            ),
+            reduction_threshold=float(
+                settings.get("preprocessing_reduction_threshold", 0.5)
+            ),
+            max_harmonics_filtered=int(
+                settings.get("preprocessing_max_harmonics", 4)
+            ),
         )
         # Use a longer chunk for detection (60s) for better PSD
         # resolution. Take from the middle of the recording to avoid
@@ -344,7 +400,16 @@ class NotchReviewDialog(QDialog):
     # ------------------------------------------------------------------
 
     def notch_settings(self) -> dict:
-        """Return the dict to feed `Profile.from_review_session`."""
+        """Return the dict to feed `Profile.from_review_session`.
+
+        Reduction threshold + max harmonics use the user's
+        Training-window defaults at the time of the review. The
+        `apply_scope` field records whether the review previewed
+        on all channels or just the selected one — informational;
+        the actual batch save always applies the filter chain to
+        every saved channel.
+        """
+        settings = ui_settings.load_settings()
         harmonics = self._parse_harmonics()
         return {
             "q_factor": float(self._q_spin.value()),
@@ -353,6 +418,14 @@ class NotchReviewDialog(QDialog):
             "reductions_per_harmonic": {
                 str(k): float(v) for k, v in self._reductions.items()
             },
-            "reduction_threshold": 0.5,
-            "max_harmonics_filtered": 4,
+            "reduction_threshold": float(settings.get(
+                "preprocessing_reduction_threshold", 0.5,
+            )),
+            "max_harmonics_filtered": int(settings.get(
+                "preprocessing_max_harmonics", 4,
+            )),
+            "apply_scope": (
+                "all_channels" if self._apply_all_radio.isChecked()
+                else "selected_channel_preview"
+            ),
         }

@@ -46,6 +46,7 @@ if str(_repo_root) not in sys.path:
 from detector import paths as detector_paths
 from detector import retrain as RT
 from detector.manifest import Manifest, ManifestError
+from detector.preprocessing import profiles as detector_profiles
 
 from ui.data import settings as ui_settings
 from ui.workers.retrain_worker import (
@@ -74,10 +75,12 @@ class TrainingWindow(QMainWindow):
         self._tab_manifest = self._build_manifest_tab()
         self._tab_versions = self._build_versions_tab()
         self._tab_retrain = self._build_retrain_tab()
+        self._tab_preprocessing = self._build_preprocessing_tab()
         self._tab_settings = self._build_settings_tab()
         self._tabs.addTab(self._tab_manifest, "Manifest")
         self._tabs.addTab(self._tab_versions, "Versions")
         self._tabs.addTab(self._tab_retrain, "Retrain")
+        self._tabs.addTab(self._tab_preprocessing, "Preprocessing")
         self._tabs.addTab(self._tab_settings, "Settings")
         self.setCentralWidget(self._tabs)
 
@@ -565,6 +568,222 @@ class TrainingWindow(QMainWindow):
                 RegressionReportDialog(latest, report, self).exec()
         except Exception:
             pass
+
+    # ==================================================================
+    # Preprocessing tab
+    # ==================================================================
+
+    def _build_preprocessing_tab(self) -> QWidget:
+        """Defaults that pre-fill the Preprocess window's per-batch
+        review UI. Editing here writes to `pyqt_settings.json`; the
+        next NEW animal review picks them up (existing per-animal
+        profiles are untouched — they're authoritative for their
+        own animals).
+        """
+        w = QWidget()
+        layout = QVBoxLayout(w)
+
+        layout.addWidget(QLabel(
+            "<b>Defaults for new animal reviews.</b>  "
+            "These pre-fill the notch-review + channel-assignment "
+            "dialogs the first time an animal is processed. They "
+            "do <b>not</b> change saved profiles — each animal's "
+            "stored profile is authoritative for that animal."
+        ))
+
+        settings = ui_settings.load_settings()
+
+        # --- Notch defaults ------------------------------------------------
+        notch_group = QGroupBox("Notch filter defaults")
+        notch_form = QFormLayout(notch_group)
+
+        self._pp_q_factor = QDoubleSpinBox()
+        self._pp_q_factor.setRange(1.0, 200.0)
+        self._pp_q_factor.setDecimals(1)
+        self._pp_q_factor.setValue(
+            float(settings.get("preprocessing_q_factor", 30.0))
+        )
+        self._pp_q_factor.valueChanged.connect(
+            lambda v: ui_settings.update_setting(
+                "preprocessing_q_factor", float(v),
+            )
+        )
+        notch_form.addRow("Q factor", self._pp_q_factor)
+
+        self._pp_threshold = QDoubleSpinBox()
+        self._pp_threshold.setRange(0.0, 1.0)
+        self._pp_threshold.setDecimals(2)
+        self._pp_threshold.setSingleStep(0.05)
+        self._pp_threshold.setValue(
+            float(settings.get("preprocessing_reduction_threshold", 0.5))
+        )
+        self._pp_threshold.valueChanged.connect(
+            lambda v: ui_settings.update_setting(
+                "preprocessing_reduction_threshold", float(v),
+            )
+        )
+        notch_form.addRow(
+            "Reduction threshold (0–1)", self._pp_threshold,
+        )
+
+        self._pp_max_harm = QSpinBox()
+        self._pp_max_harm.setRange(0, 10)
+        self._pp_max_harm.setValue(
+            int(settings.get("preprocessing_max_harmonics", 4))
+        )
+        self._pp_max_harm.valueChanged.connect(
+            lambda v: ui_settings.update_setting(
+                "preprocessing_max_harmonics", int(v),
+            )
+        )
+        notch_form.addRow("Max harmonics filtered", self._pp_max_harm)
+
+        self._pp_detrend = QCheckBox(
+            "Detrend (subtract per-channel mean before filtering)"
+        )
+        self._pp_detrend.setChecked(
+            bool(settings.get("preprocessing_detrend", True))
+        )
+        self._pp_detrend.toggled.connect(
+            lambda v: ui_settings.update_setting(
+                "preprocessing_detrend", bool(v),
+            )
+        )
+        notch_form.addRow(self._pp_detrend)
+
+        # Candidate harmonics is a comma-separated text field — easier
+        # than a multi-spinbox table for what's usually 5 numbers.
+        cand_default = ", ".join(
+            f"{float(h):g}" for h in
+            settings.get("preprocessing_candidate_harmonics",
+                          [60.0, 120.0, 180.0, 240.0, 300.0])
+        )
+        self._pp_candidates = QLineEdit(cand_default)
+        self._pp_candidates.editingFinished.connect(
+            self._on_candidate_harmonics_edited
+        )
+        notch_form.addRow(
+            "Candidate harmonics (Hz)", self._pp_candidates,
+        )
+        layout.addWidget(notch_group)
+
+        # --- Animal profiles management -----------------------------------
+        profiles_group = QGroupBox("Animal profiles")
+        profiles_layout = QVBoxLayout(profiles_group)
+        self._pp_profiles_label = QLabel("")
+        self._pp_profiles_label.setStyleSheet("font-family: monospace;")
+        profiles_layout.addWidget(self._pp_profiles_label)
+        btn_row = QHBoxLayout()
+        self._pp_refresh_profiles_btn = QPushButton("↻ Refresh list")
+        self._pp_refresh_profiles_btn.clicked.connect(
+            self._refresh_profiles_summary
+        )
+        btn_row.addWidget(self._pp_refresh_profiles_btn)
+        self._pp_reset_profiles_btn = QPushButton(
+            "Reset ALL animal profiles…"
+        )
+        self._pp_reset_profiles_btn.clicked.connect(
+            self._on_reset_all_profiles
+        )
+        self._pp_reset_profiles_btn.setStyleSheet("color: #c44;")
+        btn_row.addWidget(self._pp_reset_profiles_btn)
+        btn_row.addStretch(1)
+        profiles_layout.addLayout(btn_row)
+        layout.addWidget(profiles_group)
+
+        layout.addStretch(1)
+
+        self._refresh_profiles_summary()
+        return w
+
+    def _on_candidate_harmonics_edited(self) -> None:
+        text = self._pp_candidates.text().strip()
+        try:
+            vals = [
+                float(t.strip())
+                for t in text.split(",")
+                if t.strip()
+            ]
+        except ValueError:
+            QMessageBox.warning(
+                self, "Bad candidate harmonics",
+                "Couldn't parse — keep it as a comma-separated list "
+                "of numbers, e.g. \"60, 120, 180, 240, 300\".",
+            )
+            # Revert to the persisted value
+            current = ui_settings.load_settings().get(
+                "preprocessing_candidate_harmonics", [60.0, 120.0]
+            )
+            self._pp_candidates.setText(
+                ", ".join(f"{float(h):g}" for h in current)
+            )
+            return
+        if not vals:
+            return
+        ui_settings.update_setting(
+            "preprocessing_candidate_harmonics", vals,
+        )
+
+    def _refresh_profiles_summary(self) -> None:
+        try:
+            ids = detector_profiles.list_profiles()
+        except Exception:
+            ids = []
+        if not ids:
+            self._pp_profiles_label.setText(
+                "(no saved animal profiles)"
+            )
+            return
+        lines = []
+        for animal_id in sorted(ids):
+            p = detector_profiles.Profile.load(animal_id)
+            if p is None:
+                continue
+            n_ch = len(p.channel_assignment.get("channels", []))
+            harms = p.notch.get("frequencies_filtered", [])
+            harm_txt = (
+                ", ".join(f"{float(h):g}" for h in harms) or "(none)"
+            )
+            lines.append(
+                f"  • {animal_id}  —  {n_ch} ch · "
+                f"notches: {harm_txt}  ({p.updated_at[:10]})"
+            )
+        self._pp_profiles_label.setText("\n".join(lines))
+
+    def _on_reset_all_profiles(self) -> None:
+        try:
+            ids = detector_profiles.list_profiles()
+        except Exception:
+            ids = []
+        if not ids:
+            QMessageBox.information(
+                self, "Nothing to reset",
+                "There are no saved animal profiles.",
+            )
+            return
+        resp = QMessageBox.question(
+            self, "Reset all animal profiles?",
+            f"This permanently deletes {len(ids)} profile(s):\n\n"
+            + "\n".join(f"  • {a}" for a in sorted(ids))
+            + "\n\nThe next batch for any of these animals will need "
+            "a fresh review. Continue?",
+        )
+        if resp != QMessageBox.Yes:
+            return
+        deleted = 0
+        for animal_id in ids:
+            p = detector_profiles.Profile.path_for(animal_id)
+            try:
+                if p.exists():
+                    p.unlink()
+                    deleted += 1
+            except Exception:
+                pass
+        QMessageBox.information(
+            self, "Profiles cleared",
+            f"Deleted {deleted} profile file(s).",
+        )
+        self._refresh_profiles_summary()
 
     # ==================================================================
     # Settings tab
