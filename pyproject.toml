@@ -17,15 +17,20 @@ dependencies = [
     # GUI stack
     "PySide6>=6.6",
     "pyqtgraph>=0.13",
-    # Detector backend deps (imported via the detector-core/ submodule)
-    "numpy>=1.26",
+    # Detector backend deps (imported via the detector-core/ submodule).
+    # numpy is pinned <2 because: (a) the Streamlit UI's pyproject pins
+    # 1.26.4, (b) several anaconda-bundled packages (contourpy,
+    # pywavelets) don't yet support numpy 2.x, and (c) shap's transitive
+    # numba upgrade will silently pull in numpy 2 otherwise.
+    "numpy>=1.26,<2",
     "pandas>=2.0",
     "scipy>=1.11",
     "scikit-learn>=1.3",
     "h5py>=3.10",
     "lightgbm>=4.0",
-    # Optional but referenced by detector.review (SHAP explanations)
-    "shap>=0.44",
+    # Optional but referenced by detector.review (SHAP explanations).
+    # Cap to a version that still works with numba 0.59 / numpy 1.26.
+    "shap>=0.44,<0.50",
 ]
 
 [project.optional-dependencies]
