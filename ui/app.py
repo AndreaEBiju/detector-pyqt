@@ -19,15 +19,17 @@ import argparse
 import sys
 from pathlib import Path
 
-# Make `from detector import …` work whether we're running from a
-# checked-out repo (submodule under ./detector-core/) or an installed
-# wheel (where pyproject.toml's pythonpath has already done the job).
+# Make `from detector import …` and `from ui.widgets import …` work
+# whether we're running from a checked-out repo (submodule under
+# ./detector-core/) or an installed wheel. Insert unconditionally at
+# position 0 — a non-trivial anaconda env may already have other
+# paths (e.g. an unrelated /…/src dir with its own `ui` package)
+# that would otherwise shadow ours.
 _repo_root = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_repo_root))
 _detector_core = _repo_root / "detector-core"
-if _detector_core.exists() and str(_detector_core) not in sys.path:
+if _detector_core.exists():
     sys.path.insert(0, str(_detector_core))
-if str(_repo_root) not in sys.path:
-    sys.path.insert(0, str(_repo_root))
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (

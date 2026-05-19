@@ -35,12 +35,13 @@ import numpy as np
 
 # Ensure imports resolve whether this is run as `python scripts/...`
 # (from the repo root) or `python -m scripts.m1_benchmark` (from a
-# venv install).
+# venv install). Insert at position 0 unconditionally — a non-trivial
+# anaconda env may have other paths (e.g. an unrelated /…/src dir
+# with its own `ui` package) that would otherwise shadow ours.
 _repo_root = Path(__file__).resolve().parent.parent
-if str(_repo_root) not in sys.path:
-    sys.path.insert(0, str(_repo_root))
+sys.path.insert(0, str(_repo_root))
 _detector_core = _repo_root / "detector-core"
-if _detector_core.exists() and str(_detector_core) not in sys.path:
+if _detector_core.exists():
     sys.path.insert(0, str(_detector_core))
 
 
