@@ -610,35 +610,34 @@ class TrainingWindow(QMainWindow):
         )
         notch_form.addRow("Q factor", self._pp_q_factor)
 
-        # Peak-prominence threshold in dB above local PSD baseline.
-        # Replaces the old "Reduction threshold (0-1)" spinbox — under
-        # the previous metric ~100% reduction was reported for every
-        # peak that cleared the noise gate, so the threshold's value
-        # didn't actually correlate with peak strength.
+        # Reduction threshold: minimum fractional drop in the
+        # recording's robust noise floor (Quiroga MAD-based σ) for
+        # a candidate harmonic to be included in the notch chain.
+        # 5% is a sane default for real recordings — strong mains
+        # hum usually accounts for 10-50% of total σ.
         self._pp_threshold = QDoubleSpinBox()
-        self._pp_threshold.setRange(0.0, 30.0)
-        self._pp_threshold.setDecimals(1)
-        self._pp_threshold.setSingleStep(0.5)
+        self._pp_threshold.setRange(0.0, 1.0)
+        self._pp_threshold.setDecimals(2)
+        self._pp_threshold.setSingleStep(0.01)
         self._pp_threshold.setValue(
-            float(settings.get("preprocessing_peak_db_threshold", 3.0))
+            float(settings.get("preprocessing_reduction_threshold", 0.05))
         )
-        self._pp_threshold.setSuffix(" dB")
         self._pp_threshold.setToolTip(
-            "Minimum peak prominence (in dB above the local PSD "
-            "baseline) for a candidate harmonic to be included in "
-            "the notch chain.\n"
-            "  +3 dB ≈ peak is 2× the noise floor (modest hum)\n"
-            "  +10 dB ≈ peak is 10× the floor (clear hum)\n"
-            "Peaks that don't clear the median + 5×MAD noise gate "
-            "are reported as '—' regardless of this knob."
+            "Minimum fractional reduction of the recording's noise "
+            "floor (σ) for a candidate harmonic to be auto-selected.\n"
+            "  0.05 = 5% drop in σ → modest hum, worth filtering\n"
+            "  0.20 = 20% drop → significant hum\n"
+            "  0.50 = 50% drop → very strong hum dominating σ\n"
+            "Uses the Quiroga MAD-based σ estimator (median(|x|)/0.6745) "
+            "which is robust to spikes and other sparse outliers."
         )
         self._pp_threshold.valueChanged.connect(
             lambda v: ui_settings.update_setting(
-                "preprocessing_peak_db_threshold", float(v),
+                "preprocessing_reduction_threshold", float(v),
             )
         )
         notch_form.addRow(
-            "Min peak strength", self._pp_threshold,
+            "Min σ reduction", self._pp_threshold,
         )
 
         self._pp_max_harm = QSpinBox()

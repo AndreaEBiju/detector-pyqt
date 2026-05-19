@@ -43,12 +43,12 @@ DEFAULTS: dict[str, Any] = {
     # animal's review picks them up. Existing per-animal profiles
     # are unaffected (they store their own values).
     "preprocessing_q_factor": 30.0,
-    # Min peak prominence (dB above local PSD baseline) to include a
-    # candidate harmonic in the notch chain. 3 dB ≈ peak is 2× the
-    # baseline floor — modest but clear hum. Replaces the legacy
-    # `preprocessing_reduction_threshold` key (which couldn't
-    # distinguish real peaks from broadband under the old metric).
-    "preprocessing_peak_db_threshold": 3.0,
+    # Minimum fractional reduction in the recording's Quiroga MAD-
+    # based noise floor (σ) required to include a candidate harmonic
+    # in the notch chain. 0.05 = 5% — the notch must drop overall σ
+    # by at least this much to be worth running. Same noise
+    # estimator the gi-vagus-viewer downstream pipeline uses.
+    "preprocessing_reduction_threshold": 0.05,
     "preprocessing_max_harmonics": 4,
     "preprocessing_detrend": True,
     "preprocessing_candidate_harmonics": [60.0, 120.0, 180.0, 240.0, 300.0],

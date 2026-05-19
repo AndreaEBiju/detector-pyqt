@@ -67,7 +67,7 @@ def test_settings_has_preprocessing_defaults(isolated_home):
     from ui.data import settings as S
     out = S.load_settings()
     assert out["preprocessing_q_factor"] == 30.0
-    assert out["preprocessing_peak_db_threshold"] == 3.0
+    assert out["preprocessing_reduction_threshold"] == 0.05
     assert out["preprocessing_max_harmonics"] == 4
     assert out["preprocessing_detrend"] is True
     assert isinstance(out["preprocessing_candidate_harmonics"], list)
@@ -225,13 +225,14 @@ def test_channel_assignment_emits_correct_dict(qapp, isolated_home):
 
 def test_notch_review_settings_includes_apply_scope(qapp, isolated_home,
                                                       tmp_path):
-    """notch_settings() carries the apply-to scope + peak-dB
-    threshold + max harmonics from settings."""
+    """notch_settings() carries the apply-to scope + reduction
+    threshold + max harmonics from settings, and includes the
+    Quiroga-σ-reduction per-harmonic dict."""
     from ui.widgets.notch_review import NotchReviewDialog
     from ui.data import settings as S
 
-    # User changes their default peak-dB threshold:
-    S.update_setting("preprocessing_peak_db_threshold", 6.0)
+    # User changes their default σ-reduction threshold:
+    S.update_setting("preprocessing_reduction_threshold", 0.10)
     S.update_setting("preprocessing_max_harmonics", 3)
 
     nrd = NotchReviewDialog(
@@ -246,10 +247,10 @@ def test_notch_review_settings_includes_apply_scope(qapp, isolated_home,
         assert nrd._apply_all_radio.isChecked()
         out = nrd.notch_settings()
         assert out["apply_scope"] == "all_channels"
-        assert out["peak_db_threshold"] == 6.0
+        assert out["reduction_threshold"] == 0.10
         assert out["max_harmonics_filtered"] == 3
-        # The new key replaces the old `reductions_per_harmonic` dict.
-        assert "peak_strengths_db_per_harmonic" in out
+        # The current-metric (v4.0) key replaces older detection fields.
+        assert "noise_reductions_per_harmonic" in out
         # Switch radio → reflected
         nrd._apply_selected_radio.setChecked(True)
         assert nrd.notch_settings()["apply_scope"] == "selected_channel_preview"
