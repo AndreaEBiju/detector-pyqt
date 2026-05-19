@@ -70,7 +70,11 @@ class NotchReviewDialog(QDialog):
         self._loaded_data: Optional[np.ndarray] = None
         self._loaded_fs: Optional[float] = None
         self._loaded_channel_signal_idx: Optional[int] = None
-        self._reductions: dict[float, float] = {}
+        # Per-harmonic peak prominence in dB above local PSD baseline,
+        # populated by `_run_auto_detect`. 0.0 means "no real peak"
+        # (didn't clear the median + N × MAD gate). Empty dict means
+        # the user hasn't run Auto-detect yet.
+        self._peak_strengths_db: dict[float, float] = {}
 
         outer = QVBoxLayout(self)
 
@@ -199,9 +203,15 @@ class NotchReviewDialog(QDialog):
             self._detrend_check.setChecked(
                 bool(existing_notch.get("detrend", True))
             )
-            self._reductions = {
+            # Peak strengths (in dB) from a profile saved under the
+            # current metric. Profile.load on older profiles strips
+            # this field so the dict stays empty until the user runs
+            # Auto-detect with the new metric.
+            self._peak_strengths_db = {
                 float(k): float(v)
-                for k, v in (existing_notch.get("reductions_per_harmonic") or {}).items()
+                for k, v in (existing_notch.get(
+                    "peak_strengths_db_per_harmonic"
+                ) or {}).items()
             }
 
         # Initial render — load data + paint
@@ -332,8 +342,8 @@ class NotchReviewDialog(QDialog):
                     [60.0, 120.0, 180.0, 240.0, 300.0],
                 )
             ),
-            reduction_threshold=float(
-                settings.get("preprocessing_reduction_threshold", 0.5)
+            peak_db_threshold=float(
+                settings.get("preprocessing_peak_db_threshold", 3.0)
             ),
             max_harmonics_filtered=int(
                 settings.get("preprocessing_max_harmonics", 4)
@@ -348,39 +358,53 @@ class NotchReviewDialog(QDialog):
         chunk_n = min(n, int(60.0 * fs))
         start = max(0, (n - chunk_n) // 2)
         chunk = data[start:start + chunk_n, :]
-        reds = notch_mod.detect_significant_harmonics(chunk, fs, params)
-        self._reductions = reds
-        selected = notch_mod.select_harmonics_to_filter(reds, params)
+        detections = notch_mod.detect_significant_harmonics(chunk, fs, params)
+        # Extract peak_db (the main display value); reduction stays
+        # in the dict but we don't show it explicitly.
+        self._peak_strengths_db = {
+            float(hz): float(info["peak_db"])
+            for hz, info in detections.items()
+        }
+        selected = notch_mod.select_harmonics_to_filter(detections, params)
         self._harmonics_edit.setText(
             ", ".join(f"{float(h):.1f}" for h in selected)
         )
         self._refresh_plot()
 
     def _update_reduction_summary(self) -> None:
-        if not self._reductions:
+        if not self._peak_strengths_db:
             self._summary_label.setText(
-                "(click Auto-detect to populate per-harmonic reductions)"
+                "(click Auto-detect to measure peak strengths)"
             )
             return
         active = set(self._parse_harmonics())
         parts = []
-        for h in sorted(self._reductions):
-            r = self._reductions[h]
+        for h in sorted(self._peak_strengths_db):
+            db = self._peak_strengths_db[h]
             tag = "*" if h in active else " "
-            # 0.0% means "no real peak above the local PSD baseline";
-            # 99.x% means "peak collapsed by ~all of its prominence".
-            parts.append(f"{tag} {h:>6.1f} Hz: {r * 100:>5.1f}%")
+            # 0 dB means the peak didn't clear the noise gate
+            # (median + N × MAD). Higher dB = stronger peak relative
+            # to the local baseline: +10 dB ≈ 10× the floor.
+            if db <= 0.0:
+                parts.append(
+                    f"{tag} {h:>6.1f} Hz:    — (no peak above noise)"
+                )
+            else:
+                parts.append(
+                    f"{tag} {h:>6.1f} Hz: {db:>5.1f} dB above baseline"
+                )
         ch_label = (
             self._channel_combo.currentData()["label"]
             if self._channel_combo.currentData() else "?"
         )
         legend = (
             f"<span style='color:#aaa'>(* = currently in filter chain · "
-            f"channel: {ch_label}) · 0% means no peak above "
-            "background — no real hum to remove</span>"
+            f"channel: {ch_label}) · dB = how tall the peak is vs. the "
+            "median PSD of nearby off-peak frequencies. Below the "
+            "noise gate → '—'.</span>"
         )
         self._summary_label.setText(
-            "Peak-prominence reductions on detection chunk:<br>"
+            "Peak strength on detection chunk:<br>"
             f"<pre style='margin: 4px;'>" + "<br>".join(parts) + "</pre>"
             + legend
         )
@@ -408,7 +432,7 @@ class NotchReviewDialog(QDialog):
     def notch_settings(self) -> dict:
         """Return the dict to feed `Profile.from_review_session`.
 
-        Reduction threshold + max harmonics use the user's
+        Peak-dB threshold + max harmonics use the user's
         Training-window defaults at the time of the review. The
         `apply_scope` field records whether the review previewed
         on all channels or just the selected one — informational;
@@ -421,16 +445,20 @@ class NotchReviewDialog(QDialog):
             "q_factor": float(self._q_spin.value()),
             "detrend": self._detrend_check.isChecked(),
             "frequencies_filtered": harmonics,
-            "reductions_per_harmonic": {
-                str(k): float(v) for k, v in self._reductions.items()
+            # Per-harmonic peak prominence in dB above the local PSD
+            # baseline. The selection threshold is also a dB value
+            # (Training window's "Min peak strength (dB)" knob).
+            "peak_strengths_db_per_harmonic": {
+                str(k): float(v)
+                for k, v in self._peak_strengths_db.items()
             },
             # Stamp the metric version so a future re-load can tell
-            # this dict was produced under the peak-prominence metric
-            # (semver "2.0"). The Profile.load migration drops stale
-            # reductions from pre-2.0 saves.
+            # this dict was produced under the dB-prominence metric
+            # (semver "3.0"). The Profile.load migration drops stale
+            # detection numbers from older saves.
             "notch_metric_version": CURRENT_NOTCH_METRIC_VERSION,
-            "reduction_threshold": float(settings.get(
-                "preprocessing_reduction_threshold", 0.5,
+            "peak_db_threshold": float(settings.get(
+                "preprocessing_peak_db_threshold", 3.0,
             )),
             "max_harmonics_filtered": int(settings.get(
                 "preprocessing_max_harmonics", 4,
