@@ -180,11 +180,23 @@ class MultiChannelViewer(pg.GraphicsLayoutWidget):
         names = channel_names or CHANNEL_NAMES_DEFAULT
         colors = channel_colors or CHANNEL_COLORS_DEFAULT
 
+        # Guard for the set_viewport → setXRange → sigRangeChanged →
+        # set_viewport infinite loop. Flipped True during programmatic
+        # range changes so the user-pan handler skips them.
+        self._suppress_range_signal = False
+
         self.plots: list[tuple[pg.PlotItem, pg.PlotDataItem]] = []
         for ch in range(recording.n_channels):
             p = self.addPlot(row=ch, col=0)
             p.setMouseEnabled(x=True, y=False)
             p.showGrid(x=True, y=False, alpha=0.15)
+            # Clamp pan/zoom to the recording's time bounds so the user
+            # can't drag past the start or end.
+            p.setLimits(
+                xMin=0.0, xMax=recording.duration_sec,
+                minXRange=1.0 / recording.fs,           # at least 1 sample wide
+                maxXRange=recording.duration_sec,
+            )
             label = names[ch] if ch < len(names) else f"Ch{ch + 1}"
             p.setLabel("left", label)
             # Hide x tick labels on all but the bottom row to save space.
@@ -198,6 +210,13 @@ class MultiChannelViewer(pg.GraphicsLayoutWidget):
                 p.setXLink(self.plots[0][0])
             self.plots.append((p, curve))
         self.plots[-1][0].setLabel("bottom", "Time (s)")
+
+        # Subscribe the master plot's range-changed signal so mouse
+        # pan / scroll-wheel zoom / pinch-to-zoom trigger a re-fetch
+        # from the LazyRecording. Without this, user gestures move
+        # the ViewBox visually but the displayed curve stays bound
+        # to the initial 60s of data.
+        self.plots[0][0].sigRangeChanged.connect(self._on_view_range_changed)
 
         # Initial time range: first 60 seconds, or the whole recording
         # if shorter. NB: we use the name `_time_range` rather than
@@ -215,18 +234,58 @@ class MultiChannelViewer(pg.GraphicsLayoutWidget):
         return self._time_range
 
     def set_viewport(self, t_start: float, t_end: float) -> None:
-        """Move the viewport to `[t_start, t_end)` and refresh the
-        plots. No-op if `t_end <= t_start` or the requested range is
-        empty.
+        """Move the viewport to `[t_start, t_end)` programmatically and
+        refresh the plots. No-op if `t_end <= t_start` or the range
+        slices to an empty window.
+
+        Used by the toolbar (Reset / Fit all) and by the benchmark.
+        Mouse-driven pan/zoom from the user comes through
+        `_on_view_range_changed` instead — both call `_refresh_data`.
         """
         if t_end <= t_start:
             return
+        self._refresh_data(t_start, t_end)
+        # Suppress the sigRangeChanged echo so we don't recurse.
+        self._suppress_range_signal = True
+        try:
+            self.plots[0][0].setXRange(t_start, t_end, padding=0)
+        finally:
+            self._suppress_range_signal = False
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+
+    def _on_view_range_changed(self, view_box, ranges) -> None:
+        """pyqtgraph sigRangeChanged handler. `ranges` is
+        `[[xmin, xmax], [ymin, ymax]]`. We refresh the curve data for
+        the new x-window so panning/zooming with the mouse keeps
+        showing real data (not the initial buffer).
+        """
+        if self._suppress_range_signal:
+            return
+        x_min, x_max = ranges[0]
+        x_min = max(0.0, float(x_min))
+        x_max = min(self.recording.duration_sec, float(x_max))
+        if x_max <= x_min:
+            return
+        # Skip negligible changes — avoids re-fetching on micro-drag
+        # jitter from a trackpad.
+        cur_s, cur_e = self._time_range
+        if abs(x_min - cur_s) < 1e-3 and abs(x_max - cur_e) < 1e-3:
+            return
+        self._refresh_data(x_min, x_max)
+
+    def _refresh_data(self, t_start: float, t_end: float) -> None:
+        """Pull samples for `[t_start, t_end)` and push them into the
+        per-channel curves. Updates `_time_range`. Does NOT touch the
+        view-box range — the caller decides whether to also call
+        `setXRange()` (programmatic) or not (the user already moved
+        the view via mouse and we're just catching up the data).
+        """
         data = self.recording.get_range(t_start, t_end)
         if data.shape[0] == 0:
             return
-        # The slice may be shorter than requested if t_end exceeds the
-        # recording's duration — derive the actual time axis from the
-        # returned sample count rather than assuming it matches.
         n = data.shape[0]
         t = np.linspace(
             t_start, t_start + n / self.recording.fs, n, endpoint=False,
@@ -237,7 +296,4 @@ class MultiChannelViewer(pg.GraphicsLayoutWidget):
                 autoDownsample=True,
                 downsampleMethod="peak",
             )
-        # Lock the x-range so pyqtgraph doesn't auto-fit past our
-        # viewport on the next paint cycle.
-        self.plots[0][0].setXRange(t_start, t_end, padding=0)
         self._time_range = (t_start, t_end)
