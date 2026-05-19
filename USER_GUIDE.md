@@ -105,7 +105,13 @@ Optional dock panels you can toggle:
 
 ### Open a recording
 
-`File → Open` (`Ctrl+O`) — pick a `.mat` or `.h5` recording.
+`File → Open recording…` (`Ctrl+O`) — pick a `.mat` or `.h5`
+recording file.
+
+For a raw TDT block folder, use `File → Open TDT folder…`
+(`Ctrl+Shift+O`) instead — it loads existing pipeline outputs if
+present or opens the Preprocess window seeded with that folder.
+See section 8 for the full preprocessing flow.
 
 For best performance, ingest your `.mat` files to flat HDF5 once:
 
@@ -353,12 +359,18 @@ in the labeler with everything denoised and channel-mapped.
 
 Two routes:
 
-- `File → Preprocess TDT data…` — the explicit entry.
-- `File → Open` → pick a TDT folder (not a `.mat`). The window
-  pops up pre-populated with that folder. (If the folder *already*
-  contains a `_notched.mat`, Open loads it directly instead — the
-  preprocess flow only fires for folders that haven't been
-  preprocessed yet.)
+- `File → Preprocess TDT data…` — the explicit entry. Opens the
+  window empty; you pick folders in step 1.
+- `File → Open TDT folder…` (`Ctrl+Shift+O`) — opens a folder
+  picker. If the picked folder already contains a `_notched.mat`,
+  the labeler opens it directly (skips preprocessing). Otherwise
+  the Preprocess window pops up pre-populated with that folder
+  so you can run it through the pipeline.
+
+Note: `File → Open recording…` (`Ctrl+O`) is for `.mat`/`.h5`
+files only. Qt's native macOS file dialog treats folder clicks as
+"descend into," so picking a folder requires the separate `Open
+TDT folder…` entry.
 
 ### The 7-step flow
 
@@ -492,7 +504,7 @@ app. Highlights:
 
 | Where | Shortcut | Action |
 |---|---|---|
-| File menu | `Ctrl+O` / `Ctrl+S` / `Ctrl+Shift+S` | Open / Save / Save as |
+| File menu | `Ctrl+O` / `Ctrl+Shift+O` / `Ctrl+S` / `Ctrl+Shift+S` | Open recording / Open TDT folder / Save / Save as |
 | Edit menu | `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo |
 | View menu | `R` / `F` / `Z` / `X` | Reset zoom / fit all / zoom in / out |
 | View menu | `←` / `→` | Step to prev / next interval |

@@ -165,6 +165,20 @@ class MainWindow(QMainWindow):
         self._action_open.triggered.connect(self._on_open_clicked)
         file_menu.addAction(self._action_open)
 
+        # Folder-picker sibling to Open recording. Qt has no single
+        # native dialog that lets the user pick EITHER a file OR a
+        # folder, so we expose folder selection separately. Routes
+        # through _handle_tdt_folder_open: load outputs if already
+        # preprocessed, else seed the Preprocess window.
+        self._action_open_tdt_folder = QAction("Open &TDT folder…", self)
+        self._action_open_tdt_folder.setShortcut(
+            QKeySequence("Ctrl+Shift+O")
+        )
+        self._action_open_tdt_folder.triggered.connect(
+            self._on_open_tdt_folder_clicked
+        )
+        file_menu.addAction(self._action_open_tdt_folder)
+
         self._action_save = QAction("&Save", self)
         self._action_save.setShortcut(QKeySequence.Save)
         self._action_save.triggered.connect(self._on_save_clicked)
@@ -423,39 +437,47 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_open_clicked(self) -> None:
-        """Smart Open: file OR folder.
+        """Open a recording file (.mat / .h5).
 
-        - File ending in .mat/.h5 → load directly (legacy behavior).
-        - Folder that looks like a TDT block (`.tsq` inside) → if it
-          already has `<...>_notched.mat`, load that; otherwise open
-          the Preprocess window pre-populated with this folder.
-        - Anything else → tell the user.
-
-        Qt's native macOS open dialog can't select both files and
-        folders in a single shot, so we use the non-native dialog
-        with `DontUseNativeDialog`. The non-native dialog is uglier
-        but lets us toggle `FileMode.AnyFile` and accept any
-        selection.
+        Uses the native file dialog — it matches the user's OS look &
+        feel and the Files-vs-Drive-folder navigation works as
+        expected. TDT folders use a separate menu entry
+        (`_on_open_tdt_folder_clicked`) since Qt doesn't have a
+        usable "either file or folder" dialog on macOS — `AnyFile`
+        treats folder clicks as descend-into rather than select-this.
         """
         if not self._maybe_discard_unsaved():
             return
         start_dir = self._settings.get("last_recording_dir") or ""
-        # Build the dialog manually so we can accept folders too.
-        dlg = QFileDialog(self, "Open recording or TDT folder", start_dir)
-        dlg.setFileMode(QFileDialog.AnyFile)
-        dlg.setOption(QFileDialog.DontUseNativeDialog, True)
-        # `*` keeps folders visible (folder filter doesn't apply to
-        # AnyFile on every platform).
-        dlg.setNameFilters([
-            "Recording files (*.mat *.h5)",
-            "All files (*)",
-        ])
-        if dlg.exec() != QFileDialog.Accepted:
+        path_str, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open recording",
+            start_dir,
+            "Recording files (*.mat *.h5);;All files (*)",
+        )
+        if not path_str:
             return
-        selected = dlg.selectedFiles()
-        if not selected:
+        self._open_path(Path(path_str))
+
+    def _on_open_tdt_folder_clicked(self) -> None:
+        """Open a TDT block folder.
+
+        Uses the native folder-picker (`getExistingDirectory`). The
+        selected folder is routed through `_handle_tdt_folder_open`
+        which (a) loads the newest `_notched.mat` if outputs exist
+        in the folder, or (b) opens the Preprocess window with the
+        folder seeded if it looks like a TDT block but hasn't been
+        processed yet.
+        """
+        if not self._maybe_discard_unsaved():
             return
-        self._open_path(Path(selected[0]))
+        start_dir = self._settings.get("last_recording_dir") or ""
+        path_str = QFileDialog.getExistingDirectory(
+            self, "Open TDT folder", start_dir,
+        )
+        if not path_str:
+            return
+        self._handle_tdt_folder_open(Path(path_str))
 
     def _handle_tdt_folder_open(self, folder: Path) -> None:
         """The user picked a folder from the Open dialog. If it looks
