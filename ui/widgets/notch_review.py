@@ -108,19 +108,39 @@ class NotchReviewDialog(QDialog):
         top.addStretch(1)
         outer.addLayout(top)
 
-        # Plot
-        self._plot_widget = pg.PlotWidget()
-        self._plot_widget.setBackground("#0e1117")
-        self._plot_widget.setLabel("bottom", "Time (s)")
-        self._plot_widget.setLabel("left", "Amplitude")
-        self._plot_widget.showGrid(x=True, y=True, alpha=0.15)
-        self._raw_curve = self._plot_widget.plot(
-            pen=pg.mkPen(color="#999", width=0.7), name="raw"
+        # Plot — two stacked subplots with linked X-axes so the user
+        # can compare RAW vs NOTCHED at the same scale. A single
+        # overlaid plot was confusing: when the filter knocks out the
+        # mains line, the blue trace hides under the grey one in the
+        # parts where the signals match (most of the recording), and
+        # the user can't tell where the difference is. Stacking makes
+        # the before/after explicit.
+        plots_container = pg.GraphicsLayoutWidget()
+        plots_container.setBackground("#0e1117")
+        self._plot_raw = plots_container.addPlot(row=0, col=0)
+        self._plot_raw.setTitle("Raw", color="#bbb", size="10pt")
+        self._plot_raw.setLabel("left", "Amplitude")
+        self._plot_raw.showGrid(x=True, y=True, alpha=0.15)
+        self._raw_curve = self._plot_raw.plot(
+            pen=pg.mkPen(color="#bbb", width=0.7), name="raw"
         )
-        self._filtered_curve = self._plot_widget.plot(
-            pen=pg.mkPen(color="#4ea3ff", width=1.0), name="notched"
+
+        self._plot_filtered = plots_container.addPlot(row=1, col=0)
+        self._plot_filtered.setTitle(
+            "After notch", color="#4ea3ff", size="10pt",
         )
-        outer.addWidget(self._plot_widget, stretch=1)
+        self._plot_filtered.setLabel("bottom", "Time (s)")
+        self._plot_filtered.setLabel("left", "Amplitude")
+        self._plot_filtered.showGrid(x=True, y=True, alpha=0.15)
+        self._filtered_curve = self._plot_filtered.plot(
+            pen=pg.mkPen(color="#4ea3ff", width=0.7), name="notched"
+        )
+        # Link X-axes so panning/zooming syncs across both subplots.
+        # Y-axes stay independent — the user can occasionally see the
+        # filtered trace at a different Y scale if the raw has DC
+        # offset, but for detrended signals they match.
+        self._plot_filtered.setXLink(self._plot_raw)
+        outer.addWidget(plots_container, stretch=1)
 
         # Notch params form. Defaults come from the Training window's
         # Preprocessing tab (ui_settings) unless an existing per-animal
@@ -198,9 +218,17 @@ class NotchReviewDialog(QDialog):
         self._buttons.rejected.connect(self._on_skip)
         outer.addWidget(self._buttons)
 
-        # Apply existing-profile notch params if given
+        # Apply existing-profile notch params if given. Important:
+        # if the saved `frequencies_filtered` is EMPTY (e.g. a stale
+        # profile saved under the old Auto-detect-with-threshold
+        # behavior that rejected every candidate), fall back to the
+        # 60/120/180 default rather than leaving the field empty —
+        # an empty field disables the filter chain entirely, which
+        # is never what the user wants on dialog open.
         if existing_notch:
-            freqs = existing_notch.get("frequencies_filtered", [60.0, 120.0])
+            freqs = existing_notch.get("frequencies_filtered") or []
+            if not freqs:
+                freqs = [60.0, 120.0, 180.0]
             self._harmonics_edit.setText(
                 ", ".join(f"{float(h):.1f}" for h in freqs)
             )
@@ -292,9 +320,12 @@ class NotchReviewDialog(QDialog):
             return
         window = data[i0:i1, :]
         t = np.arange(i0, i1) / fs
-        # Raw trace
+        # Raw trace (top subplot, always visible)
         self._raw_curve.setData(t, window[:, 0])
-        # Filtered trace
+        # Filtered trace (bottom subplot). When no harmonics are set,
+        # show the raw signal in the bottom plot too so the user sees
+        # both panels populated (and notices: "they match, no filter
+        # active") rather than a blank panel.
         harmonics = self._parse_harmonics()
         if harmonics:
             try:
@@ -304,17 +335,32 @@ class NotchReviewDialog(QDialog):
                     detrend=self._detrend_check.isChecked(),
                 )
                 self._filtered_curve.setData(t, filtered[:, 0])
+                self._plot_filtered.setTitle(
+                    f"After notch  ·  {', '.join(f'{h:g}' for h in harmonics)} Hz",
+                    color="#4ea3ff", size="10pt",
+                )
             except Exception as exc:
-                # Bad parameters (e.g. > Nyquist) — clear the filtered
-                # trace and let the user fix the input.
-                self._filtered_curve.clear()
+                # Bad parameters (e.g. > Nyquist) — show the raw in
+                # the bottom panel and surface the error in the
+                # summary so the user sees what went wrong.
+                self._filtered_curve.setData(t, window[:, 0])
+                self._plot_filtered.setTitle(
+                    "After notch  ·  (filter error)",
+                    color="#ff6b6b", size="10pt",
+                )
                 self._summary_label.setText(
                     f"<span style='color:#ff6b6b'>Filter error: {exc}</span>"
                 )
                 return
         else:
-            # No harmonics → just clear the filtered overlay.
-            self._filtered_curve.clear()
+            # No harmonics → show the raw trace in the bottom panel
+            # too, with a title indicating no filter is applied. This
+            # is more discoverable than a blank panel.
+            self._filtered_curve.setData(t, window[:, 0])
+            self._plot_filtered.setTitle(
+                "After notch  ·  (no harmonics set — same as raw)",
+                color="#888", size="10pt",
+            )
         # Update reduction summary if we have detection results.
         self._update_reduction_summary()
 
