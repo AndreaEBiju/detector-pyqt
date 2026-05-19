@@ -199,15 +199,20 @@ class MultiChannelViewer(pg.GraphicsLayoutWidget):
             self.plots.append((p, curve))
         self.plots[-1][0].setLabel("bottom", "Time (s)")
 
-        # Initial viewport: first 60 seconds, or the whole recording
-        # if shorter.
+        # Initial time range: first 60 seconds, or the whole recording
+        # if shorter. NB: we use the name `_time_range` rather than
+        # `_viewport` because `viewport()` is an inherited
+        # QGraphicsView method (returns the underlying QWidget) and
+        # the parent's __init__ calls it before ours has finished —
+        # shadowing it with a property breaks pyqtgraph.
         init_end = min(60.0, recording.duration_sec)
-        self._viewport: tuple[float, float] = (0.0, init_end)
-        self.set_viewport(*self._viewport)
+        self._time_range: tuple[float, float] = (0.0, init_end)
+        self.set_viewport(*self._time_range)
 
     @property
-    def viewport(self) -> tuple[float, float]:
-        return self._viewport
+    def time_range(self) -> tuple[float, float]:
+        """Currently displayed `(t_start, t_end)` in seconds."""
+        return self._time_range
 
     def set_viewport(self, t_start: float, t_end: float) -> None:
         """Move the viewport to `[t_start, t_end)` and refresh the
@@ -235,4 +240,4 @@ class MultiChannelViewer(pg.GraphicsLayoutWidget):
         # Lock the x-range so pyqtgraph doesn't auto-fit past our
         # viewport on the next paint cycle.
         self.plots[0][0].setXRange(t_start, t_end, padding=0)
-        self._viewport = (t_start, t_end)
+        self._time_range = (t_start, t_end)
