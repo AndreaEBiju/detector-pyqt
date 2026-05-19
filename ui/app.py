@@ -21,15 +21,18 @@ from pathlib import Path
 
 # Make `from detector import …` and `from ui.widgets import …` work
 # whether we're running from a checked-out repo (submodule under
-# ./detector-core/) or an installed wheel. Insert unconditionally at
-# position 0 — a non-trivial anaconda env may already have other
-# paths (e.g. an unrelated /…/src dir with its own `ui` package)
-# that would otherwise shadow ours.
+# ./detector-core/) or an installed wheel. Insertion order matters:
+# detector-core/ is the GEMSBlanking submodule and contains its own
+# Streamlit `ui/` package (no `widgets/` subdir). If it sits BEFORE
+# detector-pyqt in sys.path, `from ui.widgets …` resolves to the
+# Streamlit `ui` and fails. Insert detector-core first, then prepend
+# the detector-pyqt root on top of it. Final order:
+#     [detector-pyqt, detector-core, …rest]
 _repo_root = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_repo_root))
 _detector_core = _repo_root / "detector-core"
 if _detector_core.exists():
     sys.path.insert(0, str(_detector_core))
+sys.path.insert(0, str(_repo_root))
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (

@@ -34,15 +34,21 @@ from pathlib import Path
 import numpy as np
 
 # Ensure imports resolve whether this is run as `python scripts/...`
-# (from the repo root) or `python -m scripts.m1_benchmark` (from a
-# venv install). Insert at position 0 unconditionally — a non-trivial
-# anaconda env may have other paths (e.g. an unrelated /…/src dir
-# with its own `ui` package) that would otherwise shadow ours.
+# or `python -m scripts.m1_benchmark`. Insertion order matters:
+#   - `detector-core/` is the GEMSBlanking submodule and contains its
+#     own Streamlit `ui/` package (no `widgets/` subdir). If it sits
+#     BEFORE detector-pyqt in sys.path, Python finds the Streamlit
+#     `ui` first and `from ui.widgets …` fails.
+#   - So insert detector-core first, then prepend detector-pyqt
+#     root on top of it. Final order is
+#         [detector-pyqt, detector-core, …rest]
+#     which lets `from ui.widgets …` resolve to our PyQt widgets and
+#     `from detector …` fall through to the submodule.
 _repo_root = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_repo_root))
 _detector_core = _repo_root / "detector-core"
 if _detector_core.exists():
     sys.path.insert(0, str(_detector_core))
+sys.path.insert(0, str(_repo_root))
 
 
 def _peak_rss_mb() -> float:
