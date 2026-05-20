@@ -48,6 +48,11 @@ DEFAULTS: dict[str, Any] = {
     # adjusts the harmonics field manually if their setup needs
     # different frequencies (e.g. 50/100/150 for European mains).
     "preprocessing_q_factor": 30.0,
+    # Detrend toggle. When on, the per-channel mean is subtracted
+    # from the signal before filtering AND from the raw trace shown
+    # alongside the filtered trace — so both display at the same
+    # baseline. Off → both traces show their natural DC offset.
+    "preprocessing_detrend": True,
     "preprocessing_default_freqs_hz": [60.0, 120.0, 180.0],
 }
 

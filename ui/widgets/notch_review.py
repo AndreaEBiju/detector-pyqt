@@ -6,7 +6,7 @@ Layout (top to bottom):
 - Toolbar: channel picker, window-start input, span input,
   Re-run-detection button.
 - pyqtgraph plot: grey trace = raw, blue trace = notched (live).
-- Form: harmonics field (comma-separated), Q factor.
+- Form: harmonics field (comma-separated), Q factor, detrend toggle.
 - Reduction summary: per-harmonic reductions on the current channel.
 - Accept / Skip buttons.
 
@@ -26,7 +26,7 @@ import pyqtgraph as pg
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QDoubleValidator
 from PySide6.QtWidgets import (
-    QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
     QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
     QMessageBox, QPushButton, QRadioButton, QSpinBox, QVBoxLayout, QWidget,
 )
@@ -165,6 +165,7 @@ class NotchReviewDialog(QDialog):
         # profile passes its own values via `existing_notch`.
         settings = ui_settings.load_settings()
         default_q = float(settings.get("preprocessing_q_factor", 30.0))
+        default_detrend = bool(settings.get("preprocessing_detrend", True))
 
         form_box = QGroupBox("Notch parameters")
         form = QFormLayout(form_box)
@@ -189,6 +190,18 @@ class NotchReviewDialog(QDialog):
         self._q_spin.setDecimals(1)
         self._q_spin.valueChanged.connect(self._refresh_plot)
         form.addRow("Q factor", self._q_spin)
+        # Detrend toggle. When on, the per-channel mean is subtracted
+        # from BOTH the raw and notched display traces (and the
+        # batch save's filter input), so both sit at the same
+        # baseline and the user can see the actual filter effect
+        # rather than the DC shift. Default ON because most lab
+        # recordings have meaningful DC offset.
+        self._detrend_check = QCheckBox(
+            "Detrend (subtract per-channel mean before display + filter)"
+        )
+        self._detrend_check.setChecked(default_detrend)
+        self._detrend_check.toggled.connect(self._refresh_plot)
+        form.addRow(self._detrend_check)
         # Apply-to scope (plan P10.7): the filter always applies to
         # every channel of the saved output; this radio just controls
         # whether the plot's right-side preview filters ALL selected
@@ -245,6 +258,9 @@ class NotchReviewDialog(QDialog):
                 ", ".join(f"{float(h):.1f}" for h in freqs)
             )
             self._q_spin.setValue(float(existing_notch.get("q_factor", 30.0)))
+            self._detrend_check.setChecked(
+                bool(existing_notch.get("detrend", True))
+            )
         # Initial render — load data + paint
         self._on_channel_changed()
 
@@ -318,16 +334,28 @@ class NotchReviewDialog(QDialog):
             return
         window = data[i0:i1, :]
         t = np.arange(i0, i1) / fs
+        # Detrend handling. When the checkbox is on, subtract the
+        # mean from the SAME source (the visible window) for both
+        # raw display and the filter input. This ensures the grey
+        # raw and blue notched traces sit at the same baseline —
+        # the previous "they look shifted" bug came from detrending
+        # only the filter input.
+        do_detrend = self._detrend_check.isChecked()
+        window_for_display = window.copy()
+        if do_detrend:
+            window_for_display -= window_for_display.mean(axis=0, keepdims=True)
         # Raw trace — always visible underneath in light grey.
-        self._raw_curve.setData(t, window[:, 0])
+        self._raw_curve.setData(t, window_for_display[:, 0])
         # Filtered trace overlaid on top in blue. When no harmonics,
-        # set the filtered curve to nan so it doesn't render
-        # (legend still shows it as an option).
+        # the curve clears so the legend stays accurate.
         harmonics = self._parse_harmonics()
         if harmonics:
             try:
+                # Filter the detrended (or raw, per checkbox) window
+                # so the filtered trace has the same baseline as the
+                # raw trace shown above.
                 filtered = notch_mod.apply_notch_filter(
-                    window, fs, harmonics,
+                    window_for_display, fs, harmonics,
                     q_factor=float(self._q_spin.value()),
                 )
                 self._filtered_curve.setData(t, filtered[:, 0])
@@ -337,7 +365,7 @@ class NotchReviewDialog(QDialog):
                 # oscillation → mains hum was present. This is the
                 # unambiguous visual confirmation of what the
                 # filter is doing.
-                diff = window[:, 0] - filtered[:, 0]
+                diff = window_for_display[:, 0] - filtered[:, 0]
                 self._diff_curve.setData(t, diff)
             except Exception as exc:
                 self._filtered_curve.setData([], [])
@@ -482,6 +510,7 @@ class NotchReviewDialog(QDialog):
         harmonics = self._parse_harmonics()
         return {
             "q_factor": float(self._q_spin.value()),
+            "detrend": bool(self._detrend_check.isChecked()),
             "frequencies_filtered": harmonics,
             # Stamp the metric version so a future re-load can tell
             # this dict was produced under the fixed-harmonics
