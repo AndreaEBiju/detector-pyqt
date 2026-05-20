@@ -657,6 +657,12 @@ class MainWindow(QMainWindow):
         self._redo_stack.clear()
         self._dirty = False
 
+        # Autosave restore prompt. If the previous session crashed
+        # before the user clicked Save, the autosave sidecar still
+        # has their work. Offer to restore it before any mutations
+        # overwrite the in-memory state.
+        self._maybe_restore_autosave(path)
+
         # Clear M3 inference state from any previous file.
         self._on_clear_predictions()
 
@@ -692,6 +698,96 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(50, self._on_run_inference)
 
     # ------------------------------------------------------------------
+    # Autosave (per-recording crash-recovery sidecar)
+    # ------------------------------------------------------------------
+
+    def _autosave_now(self) -> None:
+        """Snapshot current label state to the per-recording autosave
+        sidecar. Bounded by the number of marked intervals (~80 bytes
+        per row in JSON), so safe to call on every mutation.
+
+        Best-effort: any failure is swallowed so a write error never
+        blocks the user's editing flow. The next Save (which goes
+        through `save_native` / `save_matlab_compatible`) is the
+        authoritative persistence path; autosave only exists for
+        crash recovery.
+        """
+        if self._recording is None:
+            return
+        try:
+            from detector import autosave as _A
+            _A.save_snapshot(
+                self._recording.source_path,
+                bad_intervals=self._bad_intervals,
+                bad_sources=self._bad_sources,
+                stim_end_idx=self._stim_end_idx,
+                model_intervals=self._model_intervals,
+            )
+        except Exception:
+            pass
+
+    def _clear_autosave(self) -> None:
+        """Drop the autosave file. Called after a successful explicit
+        Save so the next open doesn't offer to restore stale state."""
+        if self._recording is None:
+            return
+        try:
+            from detector import autosave as _A
+            _A.clear_snapshot(self._recording.source_path)
+        except Exception:
+            pass
+
+    def _maybe_restore_autosave(self, path: Path) -> None:
+        """If an autosave sidecar exists for `path` and contains MORE
+        state than the in-memory load, offer to restore it.
+
+        Called from `_open_path` after the file's existing state is
+        loaded; the prompt fires only if the autosave's interval
+        count differs from what's in memory (otherwise there's
+        nothing useful to restore)."""
+        try:
+            from detector import autosave as _A
+            snapshot = _A.load_snapshot(path)
+        except Exception:
+            snapshot = None
+        if snapshot is None:
+            return
+        as_intervals = np.asarray(
+            snapshot.get("bad_intervals", []), dtype=np.int64,
+        )
+        if as_intervals.size == 0:
+            as_intervals = as_intervals.reshape(0, 2)
+        if as_intervals.shape[0] == self._bad_intervals.shape[0]:
+            # Same count as what's on disk — nothing useful to
+            # restore. Drop the autosave silently (it can only be
+            # equal or stale at this point).
+            self._clear_autosave()
+            return
+        age = _A.snapshot_age_seconds(path)
+        age_str = _A.format_age(age) if age is not None else "unknown age"
+        resp = QMessageBox.question(
+            self, "Restore unsaved work?",
+            f"<b>Autosave found</b> for {path.name} ({age_str}).<br><br>"
+            f"It has <b>{as_intervals.shape[0]}</b> marked interval(s); "
+            f"the file on disk has <b>{self._bad_intervals.shape[0]}</b>.<br><br>"
+            "Restore the autosave, or keep what's on disk?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if resp == QMessageBox.Yes:
+            self._bad_intervals = as_intervals
+            self._bad_sources = list(snapshot.get("bad_sources", []))
+            sei = snapshot.get("stim_end_idx")
+            if sei is not None:
+                self._stim_end_idx = int(sei)
+            mi = snapshot.get("model_intervals")
+            if mi:
+                self._model_intervals = np.asarray(mi, dtype=np.int64)
+            self._dirty = True       # user must Save to make it disk-of-truth
+            self._refresh_widgets()
+        else:
+            self._clear_autosave()
+
+    # ------------------------------------------------------------------
     # Region mutations (with undo)
     # ------------------------------------------------------------------
 
@@ -714,6 +810,7 @@ class MainWindow(QMainWindow):
         self._bad_intervals = intervals
         self._bad_sources = sources
         self._stim_end_idx = stim_idx
+        self._autosave_now()
         self._refresh_widgets()
         self._action_undo.setEnabled(bool(self._undo_stack))
         self._action_redo.setEnabled(True)
@@ -727,6 +824,7 @@ class MainWindow(QMainWindow):
         self._bad_intervals = intervals
         self._bad_sources = sources
         self._stim_end_idx = stim_idx
+        self._autosave_now()
         self._refresh_widgets()
         self._action_undo.setEnabled(True)
         self._action_redo.setEnabled(bool(self._redo_stack))
@@ -749,6 +847,7 @@ class MainWindow(QMainWindow):
         sources_combined = list(self._bad_sources) + ["user"]
         self._bad_sources = [sources_combined[int(i)] for i in order]
         self._dirty = True
+        self._autosave_now()
         self._refresh_widgets()
 
     def _on_delete_interval(self, idx: int) -> None:
@@ -760,6 +859,7 @@ class MainWindow(QMainWindow):
             s for i, s in enumerate(self._bad_sources) if i != idx
         ]
         self._dirty = True
+        self._autosave_now()
         self._refresh_widgets()
 
     def _on_jump_to_interval(self, idx: int) -> None:
@@ -779,6 +879,7 @@ class MainWindow(QMainWindow):
             self._push_undo()
             self._stim_end_idx = new_idx
             self._dirty = True
+            self._autosave_now()
             self._update_status_bar()
 
     def _on_set_boundary(self) -> None:
@@ -799,6 +900,7 @@ class MainWindow(QMainWindow):
                     int(round(new_sec * self._recording.fs)) + 1)
         )
         self._dirty = True
+        self._autosave_now()
         self._refresh_widgets()
 
     # ------------------------------------------------------------------
@@ -973,6 +1075,10 @@ class MainWindow(QMainWindow):
                 if model_unsure is not None else ""
             )
             self._dirty = False
+            # The on-disk file is now the source of truth — drop the
+            # autosave so the next open doesn't offer to restore the
+            # stale snapshot.
+            self._clear_autosave()
             self.statusBar().showMessage(
                 f"saved: clean.h5={r_native['n_clean_chunks']} chunks, "
                 f".mat={r_mat['n_intervals']} intervals "
@@ -1242,6 +1348,7 @@ class MainWindow(QMainWindow):
         # Remove from predictions
         self._model_intervals = np.delete(self._model_intervals, idx, axis=0)
         self._dirty = True
+        self._autosave_now()
         self._refresh_predictions_panel()
         self._refresh_widgets()
 
@@ -1249,6 +1356,10 @@ class MainWindow(QMainWindow):
         if self._model_intervals is None or idx < 0 or idx >= self._model_intervals.shape[0]:
             return
         self._model_intervals = np.delete(self._model_intervals, idx, axis=0)
+        # Autosave so a dismissed prediction stays dismissed across
+        # crashes. Even though bad_intervals didn't change, the
+        # model_intervals state needs to persist.
+        self._autosave_now()
         self._refresh_predictions_panel()
         self._refresh_widgets()
 
@@ -1277,6 +1388,7 @@ class MainWindow(QMainWindow):
         self._bad_sources = [sources_combined[int(i)] for i in order]
         self._model_intervals = np.zeros((0, 2), dtype=np.int64)
         self._dirty = True
+        self._autosave_now()
         self._refresh_predictions_panel()
         self._refresh_widgets()
 
@@ -1414,6 +1526,7 @@ class MainWindow(QMainWindow):
         sources_combined = list(self._bad_sources) + [source]
         self._bad_sources = [sources_combined[int(i)] for i in order]
         self._dirty = True
+        self._autosave_now()
 
     def _on_save_review_json(self) -> None:
         if self._review_panel is None or self._recording is None:
