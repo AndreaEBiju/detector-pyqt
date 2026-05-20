@@ -45,6 +45,37 @@ from detector.preprocessing.tdt_io import load_stream                 # noqa: E4
 from ui.data import settings as ui_settings                           # noqa: E402
 
 
+# Engineering prefixes used when auto-scaling small signal amplitudes
+# (TDT raw recordings are typically in the µV–mV range; raw σ values
+# come out as 1e-5 to 1e-3, which read as "0.000" if formatted with
+# fixed precision). Each tuple is (multiplier, suffix). Picked by
+# bisection on the value's magnitude.
+_ENG_PREFIXES: tuple[tuple[float, str], ...] = (
+    (1e-12, "pV"),
+    (1e-9,  "nV"),
+    (1e-6,  "µV"),
+    (1e-3,  "mV"),
+    (1.0,   "V"),
+)
+
+
+def _fmt_amplitude(value: float) -> str:
+    """Format a Volts-scale amplitude with the right engineering
+    prefix (pV / nV / µV / mV / V). Picks the prefix so the displayed
+    number lands in [1, 1000)."""
+    av = abs(value)
+    if av == 0:
+        return "0.000 V"
+    # Walk from largest prefix down to find the one where the scaled
+    # value lands in [1, 1000).
+    for mult, suffix in reversed(_ENG_PREFIXES):
+        scaled = value / mult
+        if abs(scaled) >= 1.0:
+            return f"{scaled:.3f} {suffix}"
+    # Smaller than 1 pV — show in pV anyway with extra precision.
+    return f"{value / 1e-12:.4f} pV"
+
+
 class NotchReviewDialog(QDialog):
     """Modal notch-review dialog. Returns a `notch` dict suitable for
     `Profile.from_review_session`."""
@@ -101,39 +132,23 @@ class NotchReviewDialog(QDialog):
         top.addStretch(1)
         outer.addLayout(top)
 
-        # Plot — two stacked subplots with linked X-axes so the user
-        # can compare RAW vs NOTCHED at the same scale. A single
-        # overlaid plot was confusing: when the filter knocks out the
-        # mains line, the blue trace hides under the grey one in the
-        # parts where the signals match (most of the recording), and
-        # the user can't tell where the difference is. Stacking makes
-        # the before/after explicit.
-        plots_container = pg.GraphicsLayoutWidget()
-        plots_container.setBackground("#0e1117")
-        self._plot_raw = plots_container.addPlot(row=0, col=0)
-        self._plot_raw.setTitle("Raw", color="#bbb", size="10pt")
-        self._plot_raw.setLabel("left", "Amplitude")
-        self._plot_raw.showGrid(x=True, y=True, alpha=0.15)
-        self._raw_curve = self._plot_raw.plot(
-            pen=pg.mkPen(color="#bbb", width=0.7), name="raw"
+        # Plot — single overlaid panel with both traces on the same
+        # Y-axis so you can see exactly where they diverge. Raw
+        # underneath (light grey), filtered on top (blue). The legend
+        # in the top-right makes the channel role explicit.
+        self._plot_widget = pg.PlotWidget()
+        self._plot_widget.setBackground("#0e1117")
+        self._plot_widget.setLabel("bottom", "Time (s)")
+        self._plot_widget.setLabel("left", "Amplitude")
+        self._plot_widget.showGrid(x=True, y=True, alpha=0.15)
+        self._plot_widget.addLegend(offset=(-10, 10))
+        self._raw_curve = self._plot_widget.plot(
+            pen=pg.mkPen(color="#cccccc", width=0.8), name="Raw",
         )
-
-        self._plot_filtered = plots_container.addPlot(row=1, col=0)
-        self._plot_filtered.setTitle(
-            "After notch", color="#4ea3ff", size="10pt",
+        self._filtered_curve = self._plot_widget.plot(
+            pen=pg.mkPen(color="#4ea3ff", width=1.0), name="After notch",
         )
-        self._plot_filtered.setLabel("bottom", "Time (s)")
-        self._plot_filtered.setLabel("left", "Amplitude")
-        self._plot_filtered.showGrid(x=True, y=True, alpha=0.15)
-        self._filtered_curve = self._plot_filtered.plot(
-            pen=pg.mkPen(color="#4ea3ff", width=0.7), name="notched"
-        )
-        # Link X-axes so panning/zooming syncs across both subplots.
-        # Y-axes stay independent — the user can occasionally see the
-        # filtered trace at a different Y scale if the raw has DC
-        # offset, but for detrended signals they match.
-        self._plot_filtered.setXLink(self._plot_raw)
-        outer.addWidget(plots_container, stretch=1)
+        outer.addWidget(self._plot_widget, stretch=1)
 
         # Notch params form. Defaults come from the Training window's
         # Preprocessing tab (ui_settings) unless an existing per-animal
@@ -301,12 +316,11 @@ class NotchReviewDialog(QDialog):
             return
         window = data[i0:i1, :]
         t = np.arange(i0, i1) / fs
-        # Raw trace (top subplot, always visible)
+        # Raw trace — always visible underneath in light grey.
         self._raw_curve.setData(t, window[:, 0])
-        # Filtered trace (bottom subplot). When no harmonics are set,
-        # show the raw signal in the bottom plot too so the user sees
-        # both panels populated (and notices: "they match, no filter
-        # active") rather than a blank panel.
+        # Filtered trace overlaid on top in blue. When no harmonics,
+        # set the filtered curve to nan so it doesn't render
+        # (legend still shows it as an option).
         harmonics = self._parse_harmonics()
         if harmonics:
             try:
@@ -316,33 +330,17 @@ class NotchReviewDialog(QDialog):
                     detrend=self._detrend_check.isChecked(),
                 )
                 self._filtered_curve.setData(t, filtered[:, 0])
-                self._plot_filtered.setTitle(
-                    f"After notch  ·  {', '.join(f'{h:g}' for h in harmonics)} Hz",
-                    color="#4ea3ff", size="10pt",
-                )
             except Exception as exc:
-                # Bad parameters (e.g. > Nyquist) — show the raw in
-                # the bottom panel and surface the error in the
-                # summary so the user sees what went wrong.
-                self._filtered_curve.setData(t, window[:, 0])
-                self._plot_filtered.setTitle(
-                    "After notch  ·  (filter error)",
-                    color="#ff6b6b", size="10pt",
-                )
+                self._filtered_curve.setData([], [])
                 self._summary_label.setText(
                     f"<span style='color:#ff6b6b'>Filter error: {exc}</span>"
                 )
                 return
         else:
-            # No harmonics → show the raw trace in the bottom panel
-            # too, with a title indicating no filter is applied. This
-            # is more discoverable than a blank panel.
-            self._filtered_curve.setData(t, window[:, 0])
-            self._plot_filtered.setTitle(
-                "After notch  ·  (no harmonics set — same as raw)",
-                color="#888", size="10pt",
-            )
-        # Update reduction summary if we have detection results.
+            # No harmonics → hide the filtered overlay; legend stays
+            # so the user knows what each color means.
+            self._filtered_curve.setData([], [])
+        # Update the σ before/after summary.
         self._update_reduction_summary()
 
     def _parse_harmonics(self) -> list[float]:
@@ -413,9 +411,9 @@ class NotchReviewDialog(QDialog):
                     f"<b>Noise floor σ (Quiroga MAD on 60-s chunk · "
                     f"channel: {ch_label}):</b>"
                     f"<pre style='margin: 4px;'>"
-                    f"  before: {sigma_before:>9.3f}<br>"
-                    f"  after:  {sigma_after:>9.3f}   "
-                    f"({drop_pct:+.1f}%)</pre>"
+                    f"  before:  {_fmt_amplitude(sigma_before):>12}<br>"
+                    f"  after:   {_fmt_amplitude(sigma_after):>12}"
+                    f"   ({drop_pct:+.2f}%)</pre>"
                 )
             except Exception as exc:
                 headline = (
@@ -425,7 +423,7 @@ class NotchReviewDialog(QDialog):
         else:
             headline = (
                 f"<b>Noise floor σ (Quiroga MAD · channel: {ch_label}):</b> "
-                f"{sigma_before:.3f}  "
+                f"{_fmt_amplitude(sigma_before)}  "
                 "(no harmonics in chain — set some to see the reduction)"
             )
 
