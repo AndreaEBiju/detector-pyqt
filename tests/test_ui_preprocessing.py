@@ -67,7 +67,6 @@ def test_settings_has_preprocessing_defaults(isolated_home):
     from ui.data import settings as S
     out = S.load_settings()
     assert out["preprocessing_q_factor"] == 30.0
-    assert out["preprocessing_detrend"] is True
     assert out["preprocessing_default_freqs_hz"] == [60.0, 120.0, 180.0]
 
 
@@ -224,7 +223,7 @@ def test_channel_assignment_emits_correct_dict(qapp, isolated_home):
 def test_notch_review_settings_includes_apply_scope(qapp, isolated_home,
                                                       tmp_path):
     """notch_settings() carries the apply-to scope, the user's
-    chosen harmonics, q_factor / detrend / metric version."""
+    chosen harmonics, q_factor / metric version."""
     from ui.widgets.notch_review import NotchReviewDialog
     from ui.data import settings as S
 
@@ -245,7 +244,8 @@ def test_notch_review_settings_includes_apply_scope(qapp, isolated_home,
         assert out["apply_scope"] == "all_channels"
         assert out["frequencies_filtered"] == [60.0, 120.0, 180.0]
         assert out["q_factor"] == 30.0
-        assert out["detrend"] is True
+        # Detrend was dropped — matches gi-vagus-viewer exactly.
+        assert "detrend" not in out
         # Notch metric version is stamped so future loads know which
         # algorithm produced this dict.
         assert out["notch_metric_version"]

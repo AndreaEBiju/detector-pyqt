@@ -44,11 +44,10 @@ DEFAULTS: dict[str, Any] = {
     # are unaffected (they store their own values).
     # Defaults for the notch review dialog (matches gi-vagus-viewer):
     # mains hum is filtered prophylactically at 60/120/180 Hz with
-    # Q=30 + detrend. There's no per-harmonic auto-detection — the
-    # user adjusts the harmonics field manually if their setup needs
+    # Q=30. There's no per-harmonic auto-detection — the user
+    # adjusts the harmonics field manually if their setup needs
     # different frequencies (e.g. 50/100/150 for European mains).
     "preprocessing_q_factor": 30.0,
-    "preprocessing_detrend": True,
     "preprocessing_default_freqs_hz": [60.0, 120.0, 180.0],
 }
 

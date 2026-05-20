@@ -610,19 +610,6 @@ class TrainingWindow(QMainWindow):
         )
         notch_form.addRow("Q factor", self._pp_q_factor)
 
-        self._pp_detrend = QCheckBox(
-            "Detrend (subtract per-channel mean before filtering)"
-        )
-        self._pp_detrend.setChecked(
-            bool(settings.get("preprocessing_detrend", True))
-        )
-        self._pp_detrend.toggled.connect(
-            lambda v: ui_settings.update_setting(
-                "preprocessing_detrend", bool(v),
-            )
-        )
-        notch_form.addRow(self._pp_detrend)
-
         # Default notch frequencies — pre-fill the notch-review
         # dialog's Harmonics field on dialog open for new animals.
         # 60/120/180 matches the gi-vagus-viewer pipeline default;

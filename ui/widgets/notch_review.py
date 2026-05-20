@@ -6,7 +6,7 @@ Layout (top to bottom):
 - Toolbar: channel picker, window-start input, span input,
   Re-run-detection button.
 - pyqtgraph plot: grey trace = raw, blue trace = notched (live).
-- Form: harmonics field (comma-separated), Q factor, detrend toggle.
+- Form: harmonics field (comma-separated), Q factor.
 - Reduction summary: per-harmonic reductions on the current channel.
 - Accept / Skip buttons.
 
@@ -26,7 +26,7 @@ import pyqtgraph as pg
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QDoubleValidator
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
+    QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
     QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
     QMessageBox, QPushButton, QRadioButton, QSpinBox, QVBoxLayout, QWidget,
 )
@@ -148,6 +148,16 @@ class NotchReviewDialog(QDialog):
         self._filtered_curve = self._plot_widget.plot(
             pen=pg.mkPen(color="#4ea3ff", width=1.0), name="After notch",
         )
+        # "Removed" trace = raw − filtered. The energy the notch
+        # chain took out. A flat line at 0 means the filter did
+        # nothing (no hum at the selected frequencies); a visible
+        # 60 Hz oscillation means real mains pickup was removed.
+        # Lighter / dashed pen so it doesn't crowd the main traces.
+        self._diff_curve = self._plot_widget.plot(
+            pen=pg.mkPen(color="#ff6b6b", width=0.7,
+                          style=Qt.DashLine),
+            name="Removed (raw − notch)",
+        )
         outer.addWidget(self._plot_widget, stretch=1)
 
         # Notch params form. Defaults come from the Training window's
@@ -155,7 +165,6 @@ class NotchReviewDialog(QDialog):
         # profile passes its own values via `existing_notch`.
         settings = ui_settings.load_settings()
         default_q = float(settings.get("preprocessing_q_factor", 30.0))
-        default_detrend = bool(settings.get("preprocessing_detrend", True))
 
         form_box = QGroupBox("Notch parameters")
         form = QFormLayout(form_box)
@@ -180,10 +189,6 @@ class NotchReviewDialog(QDialog):
         self._q_spin.setDecimals(1)
         self._q_spin.valueChanged.connect(self._refresh_plot)
         form.addRow("Q factor", self._q_spin)
-        self._detrend_check = QCheckBox("Detrend (subtract per-channel mean)")
-        self._detrend_check.setChecked(default_detrend)
-        self._detrend_check.toggled.connect(self._refresh_plot)
-        form.addRow(self._detrend_check)
         # Apply-to scope (plan P10.7): the filter always applies to
         # every channel of the saved output; this radio just controls
         # whether the plot's right-side preview filters ALL selected
@@ -240,9 +245,6 @@ class NotchReviewDialog(QDialog):
                 ", ".join(f"{float(h):.1f}" for h in freqs)
             )
             self._q_spin.setValue(float(existing_notch.get("q_factor", 30.0)))
-            self._detrend_check.setChecked(
-                bool(existing_notch.get("detrend", True))
-            )
         # Initial render — load data + paint
         self._on_channel_changed()
 
@@ -327,19 +329,28 @@ class NotchReviewDialog(QDialog):
                 filtered = notch_mod.apply_notch_filter(
                     window, fs, harmonics,
                     q_factor=float(self._q_spin.value()),
-                    detrend=self._detrend_check.isChecked(),
                 )
                 self._filtered_curve.setData(t, filtered[:, 0])
+                # Difference trace: what the notch chain REMOVED.
+                # A flat red line at y=0 → filter did nothing (no
+                # hum at the selected frequencies). A sinusoidal
+                # oscillation → mains hum was present. This is the
+                # unambiguous visual confirmation of what the
+                # filter is doing.
+                diff = window[:, 0] - filtered[:, 0]
+                self._diff_curve.setData(t, diff)
             except Exception as exc:
                 self._filtered_curve.setData([], [])
+                self._diff_curve.setData([], [])
                 self._summary_label.setText(
                     f"<span style='color:#ff6b6b'>Filter error: {exc}</span>"
                 )
                 return
         else:
-            # No harmonics → hide the filtered overlay; legend stays
-            # so the user knows what each color means.
+            # No harmonics → hide the filtered + diff overlays;
+            # legend stays so the user knows what each color means.
             self._filtered_curve.setData([], [])
+            self._diff_curve.setData([], [])
         # Update the σ before/after summary.
         self._update_reduction_summary()
 
@@ -381,8 +392,11 @@ class NotchReviewDialog(QDialog):
 
         harmonics = self._parse_harmonics()
         col = chunk[:, 0].astype(np.float64, copy=False)
-        if self._detrend_check.isChecked():
-            col = col - col.mean()
+        # Detrend ONLY for the σ measurement (estimate_noise_floor
+        # assumes ~zero-mean input). Doesn't affect the filter or
+        # the plot — gi-vagus-viewer applies the same detrend
+        # internally to its noise estimator.
+        col = col - col.mean()
         try:
             sigma_before = float(
                 notch_mod.estimate_noise_floor(col)
@@ -402,9 +416,9 @@ class NotchReviewDialog(QDialog):
                 filtered = notch_mod.apply_notch_filter(
                     chunk, fs, harmonics,
                     q_factor=float(self._q_spin.value()),
-                    detrend=self._detrend_check.isChecked(),
                 )
                 fcol = filtered[:, 0].astype(np.float64, copy=False)
+                fcol = fcol - fcol.mean()  # detrend for σ measurement
                 sigma_after = float(notch_mod.estimate_noise_floor(fcol))
                 drop_pct = (sigma_before - sigma_after) / sigma_before * 100
                 headline = (
@@ -468,7 +482,6 @@ class NotchReviewDialog(QDialog):
         harmonics = self._parse_harmonics()
         return {
             "q_factor": float(self._q_spin.value()),
-            "detrend": self._detrend_check.isChecked(),
             "frequencies_filtered": harmonics,
             # Stamp the metric version so a future re-load can tell
             # this dict was produced under the fixed-harmonics
