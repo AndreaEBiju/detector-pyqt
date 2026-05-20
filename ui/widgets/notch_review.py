@@ -419,12 +419,14 @@ class NotchReviewDialog(QDialog):
         chunk = data[start:start + chunk_n, :]
 
         harmonics = self._parse_harmonics()
-        col = chunk[:, 0].astype(np.float64, copy=False)
-        # Detrend ONLY for the σ measurement (estimate_noise_floor
-        # assumes ~zero-mean input). Doesn't affect the filter or
-        # the plot — gi-vagus-viewer applies the same detrend
-        # internally to its noise estimator.
-        col = col - col.mean()
+        col_raw = chunk[:, 0].astype(np.float64, copy=False)
+        # Remember the DC mean so we can SHOW the user what detrend
+        # is subtracting. estimate_noise_floor needs zero-mean input,
+        # so we detrend here regardless — but the displayed mean
+        # tells the user how much the Detrend checkbox is shifting
+        # the visible traces.
+        dc_mean = float(col_raw.mean())
+        col = col_raw - dc_mean
         try:
             sigma_before = float(
                 notch_mod.estimate_noise_floor(col)
@@ -469,13 +471,29 @@ class NotchReviewDialog(QDialog):
                 "(no harmonics in chain — set some to see the reduction)"
             )
 
+        # Detrend status line — shows the user EXACTLY what the
+        # checkbox is doing for this channel. If the mean is small
+        # (the recording was already near-zero-mean) the visible
+        # effect of toggling detrend will be subtle.
+        if self._detrend_check.isChecked():
+            detrend_line = (
+                f"<b>Detrend (per-channel mean subtracted):</b> "
+                f"{_fmt_amplitude(dc_mean)}<br>"
+            )
+        else:
+            detrend_line = (
+                f"<b>Detrend OFF</b> · raw signal mean = "
+                f"{_fmt_amplitude(dc_mean)} "
+                "(toggle Detrend to subtract this from both traces)<br>"
+            )
+
         legend = (
             "<span style='color:#aaa'>σ uses the robust Quiroga MAD "
             "estimator (median(|x|)/0.6745) — the same noise floor "
             "the gi-vagus-viewer downstream pipeline uses for "
             "spike-detection thresholds.</span>"
         )
-        self._summary_label.setText(headline + "<br>" + legend)
+        self._summary_label.setText(detrend_line + headline + "<br>" + legend)
 
     # ------------------------------------------------------------------
     # Event handlers
