@@ -75,11 +75,13 @@ class TrainingWindow(QMainWindow):
         self._tab_manifest = self._build_manifest_tab()
         self._tab_versions = self._build_versions_tab()
         self._tab_retrain = self._build_retrain_tab()
+        self._tab_convergence = self._build_convergence_tab()
         self._tab_preprocessing = self._build_preprocessing_tab()
         self._tab_settings = self._build_settings_tab()
         self._tabs.addTab(self._tab_manifest, "Manifest")
         self._tabs.addTab(self._tab_versions, "Versions")
         self._tabs.addTab(self._tab_retrain, "Retrain")
+        self._tabs.addTab(self._tab_convergence, "Convergence")
         self._tabs.addTab(self._tab_preprocessing, "Preprocessing")
         self._tabs.addTab(self._tab_settings, "Settings")
         self.setCentralWidget(self._tabs)
@@ -570,6 +572,183 @@ class TrainingWindow(QMainWindow):
             pass
 
     # ==================================================================
+    # Convergence tab
+    # ==================================================================
+
+    def _build_convergence_tab(self) -> QWidget:
+        """Plots LightGBM's per-iteration validation + training metrics
+        for any version that has a `training_curve.json` sidecar (any
+        version retrained after the curve-capture feature shipped).
+
+        The plot uses pyqtgraph (already a dependency of the signal
+        viewer) — one subplot per metric (logloss, AUC, …), with the
+        train + val curves overlaid and a dashed vertical line at
+        the iteration LightGBM picked via early stopping.
+        """
+        import pyqtgraph as pg
+
+        w = QWidget()
+        layout = QVBoxLayout(w)
+
+        # Version selector at the top — most recent populated by default.
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Model version:"))
+        self._cv_version_combo = QComboBox()
+        self._cv_version_combo.setMinimumWidth(200)
+        self._cv_version_combo.currentIndexChanged.connect(
+            lambda _i: self._refresh_convergence_plot()
+        )
+        top.addWidget(self._cv_version_combo)
+        top.addStretch(1)
+        self._cv_reload_btn = QPushButton("↻ Reload list")
+        self._cv_reload_btn.clicked.connect(self._refresh_convergence_versions)
+        top.addWidget(self._cv_reload_btn)
+        layout.addLayout(top)
+
+        # Status / metadata line shown above the plot.
+        self._cv_status_label = QLabel("")
+        self._cv_status_label.setStyleSheet("color: #aaa; padding: 4px;")
+        self._cv_status_label.setWordWrap(True)
+        layout.addWidget(self._cv_status_label)
+
+        # Plot container — pyqtgraph GraphicsLayoutWidget supports
+        # stacked subplots with shared X-axis. We populate it
+        # dynamically in `_refresh_convergence_plot` because the
+        # number of metrics isn't fixed at construction time.
+        self._cv_plot_container = pg.GraphicsLayoutWidget()
+        self._cv_plot_container.setBackground("#0e1117")
+        layout.addWidget(self._cv_plot_container, stretch=1)
+
+        # Legend / caption.
+        legend = QLabel(
+            "<span style='color:#aaa'>"
+            "Grey = train metric · Blue = validation · "
+            "Red dashed = best iteration picked by early stopping. "
+            "A widening train↔val gap indicates overfitting; the "
+            "dashed line is where LightGBM stopped to avoid it."
+            "</span>"
+        )
+        legend.setWordWrap(True)
+        layout.addWidget(legend)
+
+        # Initial population.
+        self._refresh_convergence_versions()
+        return w
+
+    def _refresh_convergence_versions(self) -> None:
+        """Repopulate the version dropdown with everything that has
+        a training_curve.json sidecar."""
+        try:
+            all_versions = RT.list_versions()
+        except Exception:
+            all_versions = []
+        artifacts_dir = detector_paths.get_artifacts_dir()
+
+        with_curve: list[str] = []
+        without_curve: list[str] = []
+        for v in all_versions:
+            curve_path = artifacts_dir / f"model_{v}" / "training_curve.json"
+            (with_curve if curve_path.exists() else without_curve).append(v)
+
+        self._cv_version_combo.blockSignals(True)
+        self._cv_version_combo.clear()
+        for v in with_curve:
+            self._cv_version_combo.addItem(v, v)
+        # Disabled-looking entries for versions that predate the
+        # curve-capture feature — surfaced for clarity, not pickable.
+        for v in without_curve:
+            self._cv_version_combo.addItem(f"{v}  (no curve)", None)
+        # Default: prefer the current promoted model if it has a curve;
+        # otherwise the most recently trained version.
+        try:
+            cmv = detector_paths.get_current_model_version() or ""
+            cmv_short = cmv.removeprefix("model_") if cmv else ""
+        except Exception:
+            cmv_short = ""
+        if cmv_short and cmv_short in with_curve:
+            self._cv_version_combo.setCurrentIndex(with_curve.index(cmv_short))
+        elif with_curve:
+            self._cv_version_combo.setCurrentIndex(len(with_curve) - 1)
+        self._cv_version_combo.blockSignals(False)
+        self._refresh_convergence_plot()
+
+    def _refresh_convergence_plot(self) -> None:
+        """Repaint the plot for the currently-selected version."""
+        import pyqtgraph as pg
+        from detector.model_artifact import load_training_curve
+
+        self._cv_plot_container.clear()
+        version = self._cv_version_combo.currentData()
+        if not version:
+            self._cv_status_label.setText(
+                "<i>No version selected — pick one from the dropdown. "
+                "Versions trained before the curve-capture feature "
+                "shipped have no data to plot.</i>"
+            )
+            return
+        artifacts_dir = detector_paths.get_artifacts_dir()
+        curve = load_training_curve(artifacts_dir / f"model_{version}")
+        if curve is None:
+            self._cv_status_label.setText(
+                f"<i>No training_curve.json for <b>{version}</b>.</i>"
+            )
+            return
+        metrics = curve.get("metrics", {})
+        metric_names = sorted({
+            m for split in metrics.values() for m in split.keys()
+        })
+        if not metric_names:
+            self._cv_status_label.setText(
+                "Curve file present but no metrics recorded."
+            )
+            return
+
+        best_iter = int(curve.get("best_iteration") or 0)
+        num_round = int(curve.get("num_boost_round") or 0)
+        es = int(curve.get("early_stopping_rounds") or 0)
+        final_val = metrics.get("val", {}).get(
+            metric_names[0], [0.0],
+        )[-1]
+        self._cv_status_label.setText(
+            f"<b>{version}</b> · best iteration: <b>{best_iter}</b> of "
+            f"{num_round} max · early stopping = {es} rounds · "
+            f"final {metric_names[0]} (val) = <b>{final_val:.4f}</b>"
+        )
+
+        # Build one stacked subplot per metric.
+        prev_plot = None
+        for row_i, mname in enumerate(metric_names):
+            plot = self._cv_plot_container.addPlot(row=row_i, col=0)
+            plot.setTitle(mname, color="#bbb", size="10pt")
+            plot.setLabel("left", mname)
+            plot.showGrid(x=True, y=True, alpha=0.15)
+            if prev_plot is not None:
+                plot.setXLink(prev_plot)
+            prev_plot = plot
+            for split, color, width in (
+                ("train", "#888888", 1.0),
+                ("val", "#4ea3ff", 1.5),
+            ):
+                series = metrics.get(split, {}).get(mname)
+                if not series:
+                    continue
+                x = np.arange(1, len(series) + 1)
+                y = np.asarray(series, dtype=np.float64)
+                plot.plot(
+                    x, y, pen=pg.mkPen(color=color, width=width),
+                    name=f"{split} {mname}",
+                )
+            if best_iter > 0:
+                line = pg.InfiniteLine(
+                    pos=best_iter, angle=90,
+                    pen=pg.mkPen(color="#d62728", width=1,
+                                  style=Qt.DashLine),
+                )
+                plot.addItem(line)
+            if row_i == len(metric_names) - 1:
+                plot.setLabel("bottom", "Iteration")
+
+    # ==================================================================
     # Preprocessing tab
     # ==================================================================
 
@@ -857,6 +1036,13 @@ class TrainingWindow(QMainWindow):
         self._refresh_manifest_tab()
         self._refresh_versions_tab()
         self._refresh_retrain_tab()
+        # The convergence-tab dropdown is keyed off list_versions(),
+        # which changes after a retrain. Repopulating here picks up
+        # the newly trained model automatically.
+        try:
+            self._refresh_convergence_versions()
+        except Exception:
+            pass
 
 
 def _fmt(v, decimals: int) -> str:
