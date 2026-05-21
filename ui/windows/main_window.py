@@ -89,6 +89,13 @@ class MainWindow(QMainWindow):
         self._bad_intervals: np.ndarray = np.zeros((0, 2), dtype=np.int64)
         self._bad_sources: list[str] = []
         self._stim_end_idx: Optional[int] = None
+        # 1-based channel index where the cleanest heartbeat was
+        # observed — written as `hrChanIdx` into the saved .mat
+        # (mirrors the manual MATLAB pipeline). None = don't write
+        # the field. User sets this via Edit → Set best heartbeat
+        # channel…. Default is 1 (first nerve channel) but the
+        # user is expected to confirm + override per recording.
+        self._hr_chan_idx: Optional[int] = None
         self._undo_stack: list[tuple[np.ndarray, list[str], Optional[int]]] = []
         self._redo_stack: list[tuple[np.ndarray, list[str], Optional[int]]] = []
         # Dirty bit so we can warn before closing without saving.
@@ -255,6 +262,15 @@ class MainWindow(QMainWindow):
         self._action_set_boundary.triggered.connect(self._on_set_boundary)
         self._action_set_boundary.setEnabled(False)
         edit_menu.addAction(self._action_set_boundary)
+
+        # Edit > Set best heartbeat channel — writes `hrChanIdx`
+        # into the saved .mat, matching the manual MATLAB pipeline.
+        self._action_set_hr_chan = QAction(
+            "Set best heartbeat channel…", self,
+        )
+        self._action_set_hr_chan.triggered.connect(self._on_set_hr_chan)
+        self._action_set_hr_chan.setEnabled(False)
+        edit_menu.addAction(self._action_set_hr_chan)
 
         # Inference preferences (persisted via ui.data.settings)
         edit_menu.addSeparator()
@@ -677,6 +693,7 @@ class MainWindow(QMainWindow):
         # the boundary value at save time, so a bad value gets a
         # clear error rather than a silently dropped split.
         self._action_set_boundary.setEnabled(True)
+        self._action_set_hr_chan.setEnabled(True)
         self._action_run_inference.setEnabled(
             self._version_combo.currentData() is not None
         )
@@ -903,6 +920,49 @@ class MainWindow(QMainWindow):
         self._autosave_now()
         self._refresh_widgets()
 
+    def _on_set_hr_chan(self) -> None:
+        """Pop a dialog asking which channel carries the cleanest
+        heartbeat. The selection is written as `hrChanIdx` (1-based)
+        into the saved .mat, matching the manual MATLAB pipeline.
+        Cancel/None means the field is omitted on save.
+        """
+        if self._recording is None:
+            return
+        n_ch = int(self._recording.y.shape[1])
+        # Label format: "Ch 1 (VN1)" — matches the Streamlit picker.
+        from ui.widgets.signal_viewer import CHANNEL_NAMES_DEFAULT
+        labels = [
+            f"Ch {i + 1} ({CHANNEL_NAMES_DEFAULT[i] if i < len(CHANNEL_NAMES_DEFAULT) else f'Ch{i + 1}'})"
+            for i in range(n_ch)
+        ]
+        # Prepend an opt-out option so the user can clear a stale
+        # selection without restarting the app.
+        options = ["(none — don't write hrChanIdx)"] + labels
+        # Pre-select whatever the recording currently has, or the
+        # first nerve channel if unset.
+        if self._hr_chan_idx is None or not (1 <= self._hr_chan_idx <= n_ch):
+            cur_index = 1   # "Ch 1 (…)"
+        else:
+            cur_index = self._hr_chan_idx   # 1-based maps to options index
+        choice, ok = QInputDialog.getItem(
+            self, "Best heartbeat channel",
+            ("Which channel shows the cleanest heartbeat?\n"
+             "Saved as `hrChanIdx` in the .mat for the downstream "
+             "MATLAB HR-rate detector."),
+            options, cur_index, False,
+        )
+        if not ok:
+            return
+        if choice.startswith("(none"):
+            self._hr_chan_idx = None
+        else:
+            # Pull the 1-based int between "Ch " and " (".
+            try:
+                self._hr_chan_idx = int(choice.split(" ", 2)[1])
+            except (IndexError, ValueError):
+                self._hr_chan_idx = None
+        self._update_status_bar()
+
     # ------------------------------------------------------------------
     # View actions
     # ------------------------------------------------------------------
@@ -1032,6 +1092,7 @@ class MainWindow(QMainWindow):
                 bad_sources=sources,
                 model_unsure_intervals=model_unsure,
                 write_yout=True,
+                hr_chan_idx=self._hr_chan_idx,
             )
             r_seg = save_segment_table(
                 rec, intervals, sources,
@@ -1057,6 +1118,7 @@ class MainWindow(QMainWindow):
                         bad_sources=sources,
                         model_unsure_intervals=model_unsure,
                         write_yout=True,
+                        hr_chan_idx=self._hr_chan_idx,
                     )
                     split_msg = (
                         f"  ·  split: stim={r_split['stim_n_intervals']} + "
@@ -1128,13 +1190,15 @@ class MainWindow(QMainWindow):
         bad_frac = total_bad_samples / max(self._recording.n_samples, 1)
         bd = (f"  ·  stim_end={self._stim_end_idx}"
               if self._stim_end_idx else "")
+        hr_tag = (f"  ·  hrCh={self._hr_chan_idx}"
+                   if self._hr_chan_idx else "")
         dirty = "  ·  ●" if self._dirty else ""
         self.statusBar().showMessage(
             f"{self._recording.recording_id}  ·  "
             f"fs={self._recording.fs:.1f} Hz  ·  "
             f"{self._recording.n_samples:,} samples "
             f"({self._recording.duration_sec:.1f}s)  ·  "
-            f"marked: {n_bad} ({bad_frac:.3f}){bd}{dirty}"
+            f"marked: {n_bad} ({bad_frac:.3f}){bd}{hr_tag}{dirty}"
         )
 
     def _maybe_discard_unsaved(self) -> bool:
