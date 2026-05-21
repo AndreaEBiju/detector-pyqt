@@ -20,14 +20,23 @@ You need **Python 3.12**. From the repo root:
 ```bash
 git clone --recurse-submodules https://github.com/AndreaEBiju/detector-pyqt.git
 cd detector-pyqt
+# Install BOTH the backend (detector-core submodule) and this UI.
+# Order matters — the UI imports `from detector ...`.
+python3 -m pip install -e ./detector-core
 python3 -m pip install -e ".[dev]"
 ```
 
 If you cloned without `--recurse-submodules`:
 
 ```bash
-git submodule update --init
+git submodule update --init --recursive
 ```
+
+> **Why two installs?** The detector backend is a Git submodule
+> (`detector-core/`) that lives in its own repository. Installing
+> it editable makes `python -m detector.cli`, `from detector
+> import …`, and the `detector` console script all work from any
+> directory — without needing to set `PYTHONPATH` by hand.
 
 ### Point the tool at the shared model folder
 

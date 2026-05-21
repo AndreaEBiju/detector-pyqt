@@ -18,9 +18,10 @@ For maintainers, see [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md).
 ```bash
 git clone --recurse-submodules https://github.com/AndreaEBiju/detector-pyqt.git
 cd detector-pyqt
-python3 -m pip install -e ".[dev]"
-python3 -m detector.cli init        # one-time: point at the shared model folder
-python3 ui/app.py                   # launch
+python3 -m pip install -e ./detector-core   # backend (submodule)
+python3 -m pip install -e ".[dev]"          # this UI
+python3 -m detector.cli init                # one-time: point at the shared model folder
+python3 ui/app.py                           # launch
 ```
 
 Pass a recording path to open it on launch:
