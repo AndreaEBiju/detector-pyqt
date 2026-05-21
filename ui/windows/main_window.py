@@ -1332,31 +1332,59 @@ class MainWindow(QMainWindow):
 
     # ----- Prediction action handlers -----
 
-    def _on_accept_prediction(self, idx: int) -> None:
-        if self._model_intervals is None or idx < 0 or idx >= self._model_intervals.shape[0]:
+    def _on_accept_prediction(self, indices) -> None:
+        """Accept one or more predictions. `indices` is a list of row
+        indices into `self._model_intervals` (the panel always emits a
+        list; a single-row interaction is wrapped as `[i]`)."""
+        if self._model_intervals is None or self._model_intervals.size == 0:
             return
-        s, e = self._model_intervals[idx]
-        fs = self._recording.fs
+        # Defensive: filter to in-range indices, dedupe, sort.
+        idx_arr = np.array(sorted({
+            int(i) for i in (indices if hasattr(indices, "__iter__")
+                              else [indices])
+            if 0 <= int(i) < self._model_intervals.shape[0]
+        }), dtype=np.int64)
+        if idx_arr.size == 0:
+            return
         self._push_undo()
-        new = np.array([[int(s), int(e)]], dtype=np.int64)
+        new = self._model_intervals[idx_arr].astype(np.int64, copy=True)
         combined = (np.concatenate([self._bad_intervals, new], axis=0)
                     if self._bad_intervals.size else new)
         order = np.argsort(combined[:, 0], kind="stable")
         self._bad_intervals = combined[order]
-        sources_combined = list(self._bad_sources) + ["model_accepted"]
+        sources_combined = (
+            list(self._bad_sources)
+            + ["model_accepted"] * int(new.shape[0])
+        )
         self._bad_sources = [sources_combined[int(i)] for i in order]
-        # Remove from predictions
-        self._model_intervals = np.delete(self._model_intervals, idx, axis=0)
+        # Remove ALL accepted rows from predictions in one slice — np.delete
+        # accepts an array of indices and handles the bookkeeping (the
+        # alternative, deleting one-by-one, would invalidate later indices
+        # as the array shrinks).
+        self._model_intervals = np.delete(
+            self._model_intervals, idx_arr, axis=0,
+        )
         self._dirty = True
         self._autosave_now()
         self._refresh_predictions_panel()
         self._refresh_widgets()
 
-    def _on_dismiss_prediction(self, idx: int) -> None:
-        if self._model_intervals is None or idx < 0 or idx >= self._model_intervals.shape[0]:
+    def _on_dismiss_prediction(self, indices) -> None:
+        """Dismiss one or more predictions (remove from model list
+        without marking)."""
+        if self._model_intervals is None or self._model_intervals.size == 0:
             return
-        self._model_intervals = np.delete(self._model_intervals, idx, axis=0)
-        # Autosave so a dismissed prediction stays dismissed across
+        idx_arr = np.array(sorted({
+            int(i) for i in (indices if hasattr(indices, "__iter__")
+                              else [indices])
+            if 0 <= int(i) < self._model_intervals.shape[0]
+        }), dtype=np.int64)
+        if idx_arr.size == 0:
+            return
+        self._model_intervals = np.delete(
+            self._model_intervals, idx_arr, axis=0,
+        )
+        # Autosave so dismissed predictions stay dismissed across
         # crashes. Even though bad_intervals didn't change, the
         # model_intervals state needs to persist.
         self._autosave_now()
