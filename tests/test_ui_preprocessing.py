@@ -390,3 +390,42 @@ def test_training_window_has_preprocessing_tab(qapp, isolated_home):
         assert w._pp_q_factor.value() == pytest.approx(30.0)
     finally:
         w.close()
+
+
+def test_on_retrain_status_no_attribute_error_on_pyside6(
+    qapp, isolated_home,
+):
+    """Regression: `_on_retrain_status` used `cursor.End` (instance
+    fallback) which raises AttributeError in PySide6 6.11+ — and the
+    polling timer fires it every 500ms, so the failure spammed the
+    console while the retrain itself ran fine. Verify the method now
+    survives a representative status payload with a non-empty tail.
+    """
+    from ui.windows.training_window import TrainingWindow
+    w = TrainingWindow()
+    try:
+        # Realistic-looking status dict — same keys as
+        # detector.retrain_subprocess.status() returns mid-run.
+        fake_status = {
+            "state": "running",
+            "phase": "running LORO",
+            "progress": 0.3,
+            "fold_no": 3,
+            "gate_no": 0,
+            "pid": 12345,
+            "tail": (
+                "[retrain] from v0.1.0 -> v0.2.0\n"
+                "[retrain] running LORO\n"
+                "[fold 1] starting\n"
+                "[fold 2] starting\n"
+                "[fold 3] starting\n"
+            ),
+        }
+        # Must not raise. The bug was AttributeError on cursor.End.
+        w._on_retrain_status(fake_status)
+        # Cursor was actually moved to the end of the tail
+        # (post-condition that pins what the original code intended).
+        cur = w._retrain_log.textCursor()
+        assert cur.position() == len(w._retrain_log.toPlainText())
+    finally:
+        w.close()

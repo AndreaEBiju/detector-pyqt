@@ -26,7 +26,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtGui import QAction, QKeySequence, QTextCursor
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView,
@@ -529,7 +529,13 @@ class TrainingWindow(QMainWindow):
             # PlainText replace so we don't accumulate unbounded
             self._retrain_log.setPlainText(tail)
             cursor = self._retrain_log.textCursor()
-            cursor.movePosition(cursor.End)
+            # PySide6's strict scoped enums require accessing the
+            # enum on the class (or its MoveOperation subscope), not
+            # the instance. `cursor.End` worked on PyQt5 / older
+            # PySide via attribute fallback, but PySide 6.x raises
+            # AttributeError — and this fires every 500ms via the
+            # status timer, so the regression flooded the console.
+            cursor.movePosition(QTextCursor.MoveOperation.End)
             self._retrain_log.setTextCursor(cursor)
 
     def _on_retrain_finished(self, st: dict) -> None:
