@@ -305,8 +305,14 @@ Controls:
 - `seed` — RNG seed.
 - `no_loro` — reuse cached LORO summary (only safe if the manifest
   hasn't changed since the last LORO).
-- `rebuild_dataset` — rebuild `dataset_phase1.parquet` (~25 min;
-  required after adding recordings).
+- `rebuild_dataset` — rebuild `dataset_phase1.parquet` (raw features
+  only, ~25 min). **Does NOT regenerate Phase 2 — if you added new
+  recordings, ALSO check `rebuild_phase2` below or the model will
+  silently train on the stale Phase 2 file.**
+- `rebuild_phase2` — regenerate `dataset_phase2.parquet` (synthetic
+  augmentation; ~2-4 hours). This is the step that actually makes
+  newly-added recordings reachable for training. Required whenever
+  you've added recordings since the last training round.
 - `skip_review` — don't regenerate Phase-5 review HTMLs.
 - `force_promote` — promote even if regressions are detected
   (requires a reason).
@@ -316,6 +322,44 @@ showing old vs new metrics if `regression_report.json` exists.
 
 If you close the training window mid-retrain, the subprocess keeps
 going. Re-open the window and it'll auto-attach.
+
+#### Pre-flight check (recommended)
+
+Before kicking off a multi-hour retrain, run the readiness check
+from a terminal. It verifies that every file the pipeline needs is
+on this machine, every Python dep imports, the artifacts directory
+is writable, and Phase 2 covers your manifest — in ~10 seconds:
+
+```bash
+git pull --recurse-submodules
+python -m detector.cli check-retrain --rebuild-dataset --rebuild-phase2
+```
+
+Pass the same flags you intend to check in the UI. A `[PASS]` exit
+means everything's lined up; a `[FAIL]` lists every blocker with the
+specific file or dependency that's missing, so you can fix it before
+losing hours of compute to a mid-pipeline error. Especially worth
+running on a new collaborator's machine after a data handoff.
+
+#### Safety properties of the retrain flow
+
+A few invariants the pipeline enforces so you can't accidentally
+destroy a working model:
+
+- **Auto-bump on version collision.** If your local manifest's
+  `current_model_version` is out of sync with the shared artifacts
+  directory (e.g. you have `null` but the Drive already has
+  `model_v0.1.0`), retrain bumps the patch digit to `v0.1.1` rather
+  than overwriting. A loud `WARNING:` line in the log flags the
+  auto-bump.
+- **Phase 2 mismatch guard.** If `dataset_phase2.parquet` is missing
+  recordings from your manifest and you didn't check `rebuild_phase2`,
+  retrain refuses to start with a clear remediation message. Pass
+  `--skip-phase2-check` only if you knowingly want to train on the
+  partial Phase 2.
+- **Native-crash visibility.** The subprocess runs with
+  `PYTHONFAULTHANDLER=1` so any segfault in numpy / h5py / lightgbm
+  writes a C stack trace to the log instead of silently dying.
 
 ### Preprocessing tab
 
