@@ -525,23 +525,46 @@ class TrainingWindow(QMainWindow):
             )
             report = None
         if report and report.get("blockers"):
-            # Show blockers as a modal dialog; user must address them
-            # before the retrain can start.
-            blockers = report["blockers"]
-            head = "\n".join(f"  - {b}" for b in blockers[:15])
-            more = (f"\n  ... and {len(blockers) - 15} more"
-                    if len(blockers) > 15 else "")
-            QMessageBox.critical(
-                self, "Retrain pre-flight FAILED",
-                f"{len(blockers)} blocker(s) must be fixed before "
-                "the retrain can start:\n\n"
-                f"{head}{more}\n\n"
-                "(See the full report on the CLI: "
-                "`python -m detector.cli check-retrain "
-                f"{'--rebuild-dataset ' if rebuild_dataset else ''}"
-                f"{'--rebuild-phase2' if rebuild_phase2 else ''}`)"
-            )
-            return
+            # Two paths depending on what's blocking:
+            #
+            # (1) If the only blockers are missing data files (baselines,
+            #     splitter clean/bad, etc.), offer an interactive "pick
+            #     a folder, we'll auto-locate and copy" dialog so the
+            #     user doesn't have to copy files by hand.
+            # (2) If there are non-file blockers (missing Python deps,
+            #     low disk, etc.), they can't be auto-fixed -- show the
+            #     classic blocking dialog.
+            missing = report.get("missing_files") or []
+            non_file_blockers = [
+                b for b in report["blockers"]
+                if not (" missing: " in b
+                        and ("baseline" in b
+                             or "splitter_clean_path" in b
+                             or "splitter_bad_path" in b))
+            ]
+            if missing and not non_file_blockers:
+                if not self._offer_auto_locate(missing,
+                                                rebuild_dataset,
+                                                rebuild_phase2):
+                    return  # user cancelled
+                # _offer_auto_locate already re-ran the pre-flight if
+                # it succeeded; fall through to spawn.
+            else:
+                blockers = report["blockers"]
+                head = "\n".join(f"  - {b}" for b in blockers[:15])
+                more = (f"\n  ... and {len(blockers) - 15} more"
+                        if len(blockers) > 15 else "")
+                QMessageBox.critical(
+                    self, "Retrain pre-flight FAILED",
+                    f"{len(blockers)} blocker(s) must be fixed before "
+                    "the retrain can start:\n\n"
+                    f"{head}{more}\n\n"
+                    "(See the full report on the CLI: "
+                    "`python -m detector.cli check-retrain "
+                    f"{'--rebuild-dataset ' if rebuild_dataset else ''}"
+                    f"{'--rebuild-phase2' if rebuild_phase2 else ''}`)"
+                )
+                return
 
         if self._force_promote_cb.isChecked():
             reason, ok = QInputDialog.getText(
@@ -573,6 +596,125 @@ class TrainingWindow(QMainWindow):
         self._retrain_log.clear()
         self._retrain_phase_label.setText(f"started job {job.job_id}")
         self._retrain_progress.setValue(0)
+
+    def _offer_auto_locate(
+        self, missing: list[dict], rebuild_dataset: bool,
+        rebuild_phase2: bool,
+    ) -> bool:
+        """Interactive flow for resolving missing data files.
+
+        Shows a dialog listing the N missing files and a 'Pick folder
+        to search...' button. If the user picks a folder, walks it
+        recursively for matching basenames and copies them to the
+        expected paths. Re-runs the pre-flight after. Loops until
+        either all files are found OR the user cancels.
+
+        Returns True if the pre-flight passes after the helping
+        (caller should proceed with spawning the retrain), False if
+        the user cancelled (caller should abort).
+        """
+        from detector import retrain as _RT
+        while missing:
+            # Build a compact preview of what's missing.
+            head_lines = []
+            for entry in missing[:8]:
+                rid = entry.get("recording_id") or "(no recording_id)"
+                kind = entry.get("kind", "file")
+                head_lines.append(
+                    f"  - [{rid}] {kind}: "
+                    f"{Path(entry['expected_path']).name}"
+                )
+            more = (f"\n  ... and {len(missing) - 8} more"
+                    if len(missing) > 8 else "")
+            head = "\n".join(head_lines)
+
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Warning)
+            msg.setWindowTitle("Missing data files")
+            msg.setText(
+                f"{len(missing)} file(s) the retrain needs are not "
+                "where the manifest expects them.\n\n"
+                f"{head}{more}\n\n"
+                "Pick a folder where these files might live (e.g. your "
+                "data drive, a collaborator's baselines folder synced "
+                "via Drive, etc.) and the UI will scan it for matching "
+                "filenames and copy whatever it finds into the right "
+                "place."
+            )
+            btn_pick = msg.addButton(
+                "Pick folder to search...", QMessageBox.AcceptRole
+            )
+            msg.addButton("Cancel retrain", QMessageBox.RejectRole)
+            msg.exec()
+
+            if msg.clickedButton() is not btn_pick:
+                return False  # user cancelled
+
+            folder = QFileDialog.getExistingDirectory(
+                self, "Pick a folder to search for missing files",
+                str(Path.home()),
+            )
+            if not folder:
+                continue  # user backed out of file dialog; loop again
+
+            result = _RT.locate_and_copy_missing_files(missing, Path(folder))
+            copied = result.get("copied", [])
+            skipped = result.get("skipped", [])
+
+            if not copied:
+                QMessageBox.warning(
+                    self, "No matching files found",
+                    f"Scanned {folder} but found none of the "
+                    f"{len(missing)} expected filenames. Try a "
+                    "different folder, or cancel."
+                )
+                # Loop -- user can pick another folder.
+                continue
+
+            QMessageBox.information(
+                self, "Files copied",
+                f"Copied {len(copied)} of {len(missing)} files from "
+                f"{folder}.\n\nRe-running the pre-flight check..."
+            )
+
+            # Re-run pre-flight to refresh the missing list.
+            try:
+                report = _RT.check_retrain_readiness(
+                    detector_paths.get_manifest_path(),
+                    rebuild_dataset=rebuild_dataset,
+                    rebuild_phase2=rebuild_phase2,
+                )
+            except Exception as exc:
+                QMessageBox.critical(
+                    self, "Pre-flight crashed after locate",
+                    f"check_retrain_readiness raised: {exc}"
+                )
+                return False
+
+            # If there are NON-file blockers now (e.g. a stale dataset
+            # we couldn't help with), bail to the classic dialog path.
+            file_blockers = [
+                b for b in report["blockers"]
+                if " missing: " in b
+                and ("baseline" in b or "splitter_clean" in b
+                     or "splitter_bad" in b)
+            ]
+            non_file = [b for b in report["blockers"]
+                        if b not in file_blockers]
+            if non_file:
+                # New issues we can't auto-fix -- show the standard
+                # blocker dialog and abort.
+                QMessageBox.critical(
+                    self, "Other blockers remain",
+                    "Files were copied but other blockers remain:\n\n"
+                    + "\n".join(f"  - {b}" for b in non_file[:10])
+                )
+                return False
+            if not report.get("missing_files"):
+                return True  # all clean; proceed with retrain
+            missing = report["missing_files"]  # loop with reduced set
+
+        return True
 
     def _on_cancel_retrain(self) -> None:
         ok = self._monitor.cancel()
