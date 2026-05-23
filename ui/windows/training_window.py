@@ -500,6 +500,49 @@ class TrainingWindow(QMainWindow):
                 continue
 
     def _on_start_retrain(self) -> None:
+        # Pre-flight readiness check BEFORE we spawn anything.
+        # Catches missing files + missing Python packages + a real
+        # h5py-with-compression smoke test so the user gets a clear
+        # "fix these N things first" dialog instead of a multi-hour
+        # subprocess that dies cryptically.
+        rebuild_phase2 = bool(self._rebuild_phase2_cb.isChecked())
+        rebuild_dataset = bool(self._rebuild_cb.isChecked())
+        try:
+            from detector import retrain as _RT
+            report = _RT.check_retrain_readiness(
+                detector_paths.get_manifest_path(),
+                rebuild_dataset=rebuild_dataset,
+                rebuild_phase2=rebuild_phase2,
+            )
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Pre-flight check crashed",
+                f"check_retrain_readiness raised: {exc}\n\n"
+                "This is unusual. Falling back to the unchecked spawn "
+                "path -- if the retrain dies, run "
+                "`python -m detector.cli check-retrain` from a "
+                "terminal for diagnostics."
+            )
+            report = None
+        if report and report.get("blockers"):
+            # Show blockers as a modal dialog; user must address them
+            # before the retrain can start.
+            blockers = report["blockers"]
+            head = "\n".join(f"  - {b}" for b in blockers[:15])
+            more = (f"\n  ... and {len(blockers) - 15} more"
+                    if len(blockers) > 15 else "")
+            QMessageBox.critical(
+                self, "Retrain pre-flight FAILED",
+                f"{len(blockers)} blocker(s) must be fixed before "
+                "the retrain can start:\n\n"
+                f"{head}{more}\n\n"
+                "(See the full report on the CLI: "
+                "`python -m detector.cli check-retrain "
+                f"{'--rebuild-dataset ' if rebuild_dataset else ''}"
+                f"{'--rebuild-phase2' if rebuild_phase2 else ''}`)"
+            )
+            return
+
         if self._force_promote_cb.isChecked():
             reason, ok = QInputDialog.getText(
                 self, "Force promote reason",
@@ -514,8 +557,8 @@ class TrainingWindow(QMainWindow):
             job = self._monitor.start_new(
                 w_neg=float(self._w_neg_spin.value()),
                 seed=int(self._seed_spin.value()),
-                rebuild_dataset=bool(self._rebuild_cb.isChecked()),
-                rebuild_phase2=bool(self._rebuild_phase2_cb.isChecked()),
+                rebuild_dataset=rebuild_dataset,
+                rebuild_phase2=rebuild_phase2,
                 no_loro=bool(self._no_loro_cb.isChecked()),
                 skip_review=bool(self._skip_review_cb.isChecked()),
                 force_promote=bool(self._force_promote_cb.isChecked()),
