@@ -13,147 +13,163 @@ This guide covers the PyQt UI specifically. For backend internals
 
 ## 1. First-time setup
 
-### Install (with a dedicated Python env — recommended)
+Prerequisite (both platforms): **Python 3.12** installed system-wide.
 
-You need **Python 3.12** installed system-wide. From the repo root:
-
-```bash
-git clone --recurse-submodules https://github.com/AndreaEBiju/detector-pyqt.git
-cd detector-pyqt
-```
-
-If you cloned without `--recurse-submodules`:
-
-```bash
-git submodule update --init --recursive
-```
-
-Then run the env-setup script — this creates a dedicated `.venv/`
-inside the repo with all the project's pinned dependencies, isolated
-from any other Python install or other project's package conflicts:
-
-**macOS / Linux:**
-
-```bash
-bash scripts/setup_env.sh
-```
-
-**Windows (PowerShell):**
-
-```powershell
-.\scripts\setup_env.ps1
-```
-
-The script creates `.venv/`, installs the detector-pyqt and
-detector-core packages editable, pulls in the Streamlit deps as well
-(so this one env covers both UIs), and runs a functional check at
-the end (`numpy.linalg.solve` + `scipy.signal.sosfiltfilt`) to
-verify the install actually works end-to-end.
-
-> **Why a dedicated venv at all?** Sharing your Anaconda `base` env
-> or system Python with other projects means any unrelated
+> **Why a dedicated venv?** Sharing your Anaconda `base` env or the
+> system Python with other projects means any unrelated
 > `pip install` / `conda update` can silently break this project's
 > pinned numpy/scipy versions — and the symptom is often a
 > hours-into-a-retrain native crash, not a clean import error. The
-> venv keeps everything isolated. Other projects on the same
-> machine can break or update their dependencies freely without
+> setup scripts below create an isolated `.venv/` inside the repo.
+> Other projects on the same machine can update freely without
 > touching this one.
 
-### Activate the env (every new shell)
+### 1.1 macOS — first-time setup
 
-After setup, you need to activate the env in each new terminal
-session before running anything:
+1. **Install Python 3.12** if you don't have it:
+   - From [python.org](https://www.python.org/downloads/macos/) (recommended), or
+   - Via Homebrew: `brew install python@3.12`
 
-**macOS / Linux:**
+2. **Clone the repo with the detector-core submodule:**
+   ```bash
+   git clone --recurse-submodules https://github.com/AndreaEBiju/detector-pyqt.git
+   cd detector-pyqt
+   ```
+   If you forgot `--recurse-submodules`:
+   ```bash
+   git submodule update --init --recursive
+   ```
 
+3. **Create the venv and install all dependencies:**
+   ```bash
+   bash scripts/setup_env.sh
+   ```
+   The script creates `.venv/`, installs detector-pyqt + detector-core
+   editable, pulls every transitive dep (numpy, scipy, h5py, lightgbm,
+   matplotlib, hdf5plugin, shap, pyarrow, etc.), and runs a verification
+   block at the end that imports `detector.review`, decompresses an
+   HDF5 file with the registered filters, and confirms `numpy.linalg.solve`
+   works. If any of those fail, setup aborts with a clear message.
+
+4. **Point the tool at the shared model folder** (once per machine):
+   ```bash
+   source .venv/bin/activate
+   python -m detector.cli init
+   ```
+   At the prompt, paste the path to your Google Drive shared folder,
+   e.g.:
+   ```
+   /Users/<you>/Library/CloudStorage/GoogleDrive-<email>/Shared drives/<workspace>/detector-models
+   ```
+
+5. **Launch the UI:**
+   ```bash
+   bash scripts/run_pyqt.sh
+   ```
+   This wrapper activates the venv, sets `PYTHONFAULTHANDLER=1` so
+   any native crash writes a real stack trace, and starts the app.
+
+### 1.2 Windows — first-time setup
+
+1. **Install Python 3.12** from [python.org](https://www.python.org/downloads/windows/).
+   - Check **"Add Python 3.12 to PATH"** in the installer.
+   - **IMPORTANT — disable the Microsoft Store Python aliases**: Settings → Apps → Advanced app settings → App execution aliases → toggle **OFF** `python.exe` and `python3.exe`. Otherwise PATH will resolve `python` to a stub that opens the Microsoft Store and breaks subprocess spawning. (See Troubleshooting 11.7.)
+
+2. **Clone the repo with the detector-core submodule** (in PowerShell):
+   ```powershell
+   git clone --recurse-submodules https://github.com/AndreaEBiju/detector-pyqt.git
+   cd detector-pyqt
+   ```
+   If you forgot `--recurse-submodules`:
+   ```powershell
+   git submodule update --init --recursive
+   ```
+
+3. **Create the venv and install all dependencies:**
+   ```powershell
+   .\scripts\setup_env.ps1
+   ```
+   Same checks as the macOS script (verifies `detector.review` import,
+   HDF5 filter decode, numpy/scipy linear-algebra).
+   If PowerShell complains about execution policy:
+   ```powershell
+   Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+   ```
+
+4. **Point the tool at the shared model folder** (once per machine):
+   ```powershell
+   .\.venv\Scripts\Activate.ps1
+   python -m detector.cli init
+   ```
+   At the prompt, paste the path to your Google Drive shared folder.
+   On Windows it's usually under your Drive client's sync root, e.g.:
+   ```
+   G:\Shared drives\<workspace>\detector-models
+   ```
+
+5. **Launch the UI:**
+   ```powershell
+   .\scripts\run_pyqt.ps1
+   ```
+   Wrapper handles activation + faulthandler + launch.
+
+### 1.3 Activate the env in future shells
+
+After the one-time setup, every new terminal session needs the env activated before running anything (unless you use the launcher scripts which activate for you):
+
+**macOS:**
 ```bash
 source .venv/bin/activate
 ```
 
 **Windows:**
-
 ```powershell
 .\.venv\Scripts\Activate.ps1
 ```
 
-Your prompt prefix will change to `(.venv)` indicating the env is
-active. Run `deactivate` when you're done.
+Your prompt prefix changes to `(.venv)` to confirm. Run `deactivate` to leave.
 
-### One-step launchers (skip manual activation)
+### 1.4 Verify the install works end-to-end
 
-If you'd rather not remember to activate, the repo ships two
-launcher scripts that activate the env and start the PyQt UI in
-one command, with `-X faulthandler` enabled for clean crash
-reports:
-
-**macOS / Linux:**
+The setup scripts already do this, but if you ever want to re-check (for instance after `git pull`), with the env active:
 
 ```bash
-bash scripts/run_pyqt.sh
-# pass a recording path:
+python -m detector.cli check-retrain --rebuild-dataset --rebuild-phase2
+```
+
+This runs the full pre-flight audit (see section 7.4 — Retrain). A `[PASS]` exit means every file, package, and HDF5 filter is in place. A `[FAIL]` lists the specific blockers with remediation commands.
+
+### 1.5 Legacy install — only if you really know what you're doing
+
+If you'd rather install into your existing Anaconda or system Python (skip the venv):
+
+```bash
+pip install -e ./detector-core
+pip install -e ".[dev]"
+```
+
+Be aware that this puts the project at the mercy of any other tool on the machine that touches numpy/scipy/h5py. We've debugged multiple multi-hour outages caused by exactly this — a `conda update` that bumped numpy across a major version boundary, an OS Python shadow that hijacked `pip`, an Anaconda environment that had matplotlib pre-bundled but the venv didn't. **The venv is strongly recommended.**
+
+### 1.6 Pass a recording path on launch
+
+Both launcher scripts accept a recording path to open it directly:
+
+**macOS:**
+```bash
 bash scripts/run_pyqt.sh path/to/recording.mat
 ```
 
 **Windows:**
-
 ```powershell
-.\scripts\run_pyqt.ps1
 .\scripts\run_pyqt.ps1 path\to\recording.mat
 ```
 
-### Legacy install (without venv — only if you really insist)
-
-If you'd rather install into your existing Anaconda or system Python:
-
-```bash
-python3 -m pip install -e ./detector-core
-python3 -m pip install -e ".[dev]"
-```
-
-Be aware that this puts the project at the mercy of any other tool
-on the machine that touches numpy/scipy. We've debugged at least
-three multi-hour outages caused by exactly this. The venv is
-strongly recommended.
-
-### Point the tool at the shared model folder
-
-Run once per machine:
-
-```bash
-python3 -m detector.cli init
-```
-
-You'll be prompted for the path to the lab's shared Drive folder
-(typically something like `~/Library/CloudStorage/GoogleDrive-…/
-Shared drives/<workspace>/detector-models`). The init command:
-
-- Writes `~/.detector/config.json` with the shared path.
-- Creates an empty `~/.detector/training_manifest.json` if you don't
-  have one yet.
-- Reports which model version is currently active (read from the
-  shared folder's `current_model` text file).
-
-This is the same setup the Streamlit UI uses — share it.
-
-### Launch
-
-With the env activated (`source .venv/bin/activate` or
-`.\.venv\Scripts\Activate.ps1`):
-
-```bash
-python ui/app.py
-# or, after install:
-detector-pyqt
-```
-
-Pass a recording path to open it directly:
-
+Or after activating the venv manually:
 ```bash
 python ui/app.py path/to/recording.mat
+# also installed as a console script:
+detector-pyqt
 ```
-
-Or use the one-step launcher scripts that activate the env for you
-(see "One-step launchers" above).
 
 ---
 
@@ -406,23 +422,50 @@ showing old vs new metrics if `regression_report.json` exists.
 If you close the training window mid-retrain, the subprocess keeps
 going. Re-open the window and it'll auto-attach.
 
-#### Pre-flight check (recommended)
+#### Automatic pre-flight check
 
-Before kicking off a multi-hour retrain, run the readiness check
-from a terminal. It verifies that every file the pipeline needs is
-on this machine, every Python dep imports, the artifacts directory
-is writable, and Phase 2 covers your manifest — in ~10 seconds:
+**Clicking ▶ Retrain now automatically runs the readiness check
+first** — you don't have to do anything. The audit takes ~10
+seconds and inspects:
+
+- The manifest exists + loads.
+- Every recording's `clean.h5`, `bad.h5`, and `baseline.h5` exist at
+  the paths the manifest references.
+- `dataset_phase1.parquet` and `dataset_phase2.parquet` are present
+  (or flagged for rebuild based on your checkboxes).
+- Phase 2 covers all the recordings in your manifest (if you
+  skipped `rebuild_phase2`).
+- Every Python package the pipeline needs imports cleanly —
+  numpy, scipy, pandas, sklearn, h5py, lightgbm, matplotlib,
+  hdf5plugin, shap, pyarrow.
+- End-to-end import smoke test of every `detector.*` submodule the
+  retrain touches.
+- A real HDF5 decompression test: opens the first manifest
+  recording's `clean.h5` and reads a sample. Catches the
+  "filter returned failure during read" error class at click time.
+- The artifacts directory is writable.
+- At least 5 GB free disk.
+
+If any of these fail, the retrain **does not start** — you get a
+modal dialog listing the specific blockers with remediation hints
+(e.g. "Python module not installed: hdf5plugin → `pip install
+hdf5plugin`"). Fix them, click Retrain again. Only when the
+pre-flight passes does the actual subprocess spawn.
+
+#### Manual pre-flight check (CLI)
+
+You can also run the same audit from the terminal, for example
+on a collaborator's machine right after a data handoff before
+they even open the UI:
 
 ```bash
-git pull --recurse-submodules
 python -m detector.cli check-retrain --rebuild-dataset --rebuild-phase2
 ```
 
-Pass the same flags you intend to check in the UI. A `[PASS]` exit
-means everything's lined up; a `[FAIL]` lists every blocker with the
-specific file or dependency that's missing, so you can fix it before
-losing hours of compute to a mid-pipeline error. Especially worth
-running on a new collaborator's machine after a data handoff.
+Pass the same flags you intend to use for the actual retrain. A
+`[PASS]` exit means everything's lined up; a `[FAIL]` lists every
+blocker. Useful for scripting / CI / sanity-checking from a
+PowerShell or Terminal session without opening the UI.
 
 #### Safety properties of the retrain flow
 
@@ -654,48 +697,170 @@ app. Highlights:
 
 ## 11. Troubleshooting
 
-### Some menus look empty / missing
+### 11.1 Some menus look empty / missing (macOS)
 
 macOS Qt auto-moves actions named "About" / "Preferences" / "Quit"
 into the Application Menu (the leftmost `python3` menu). You'll find
 About there if it's not under Help.
 
-### Drag doesn't seem to mark a region
+### 11.2 Drag doesn't seem to mark a region (both platforms)
 
 Make sure you're holding **Shift** before clicking. Plain drag is
 pan; **Shift+drag** marks. The cursor doesn't change but the green
 band should appear under your mouse.
 
-### Inference is slow
+### 11.3 Inference is slow (both platforms)
 
 Use `scripts/m1_ingest.py` to convert `.mat` files to flat HDF5
 once. The viewer reads from the flat file in chunks; the original
 `.mat` layout requires 5× more disk seeks per pan. See
 `spike_results.md` for the M1 benchmark data.
 
-### Retrain hangs
+### 11.4 Retrain hangs (both platforms)
 
 Check the live log tail in `Tools → Training management → Retrain
-tab`. Common stalls: feature extraction on a large dataset (~25
-min), LORO running on 12+ folds. If genuinely stuck, click Cancel —
-the subprocess receives SIGTERM and exits at the next fold
-boundary.
+tab`. Common stalls: feature extraction on a large recording
+(~5-15 min per recording), LORO running across 12+ folds. If
+genuinely stuck, click Cancel — the subprocess receives a graceful
+signal and exits at the next fold boundary.
 
-### Drive folder unreachable
+### 11.5 Drive folder unreachable (both platforms)
 
 If `paths.get_current_model_version()` returns the shared Drive
 path but inference can't actually open `booster.txt`, the file may
-be a Drive Desktop placeholder (online-only). Force a local
-download: in Finder, right-click the file → "Available offline" /
+be a Drive Desktop placeholder (online-only).
+
+**macOS**: in Finder, right-click the file → "Available offline" /
 "Keep on this device". The runtime caches it permanently after that.
 
-### `ModuleNotFoundError: No module named 'detector'`
+**Windows**: in File Explorer, right-click → "Always keep on this
+device". Same effect.
 
-You're not in a context where Python can see the
-`detector-core/detector/` submodule. Either:
+### 11.6 `ModuleNotFoundError: No module named 'detector'`
 
-- Run from the repo root (`cd /path/to/detector-pyqt; python3 ui/app.py`)
-- Or `pip install -e .` once (after which `detector-pyqt` runs anywhere)
+You're not running in the project's venv. Three ways to fix:
+
+- Activate first: `source .venv/bin/activate` (Mac) or
+  `.\.venv\Scripts\Activate.ps1` (Windows).
+- Or use the launcher scripts (`scripts/run_pyqt.sh` /
+  `scripts/run_pyqt.ps1`) — they activate for you.
+- Or `cd` to the repo root and run with the explicit venv Python:
+  `.venv/bin/python ui/app.py` (Mac) or
+  `.\.venv\Scripts\python.exe ui\app.py` (Windows).
+
+### 11.7 Windows-only: subprocess errors with `[WinError 11]` or `[WinError 2]`
+
+If you see one of these in the Retrain failed dialog:
+
+- `[WinError 11] An attempt was made to load a program with an incorrect format`
+- `[WinError 2] The system cannot find the file specified`
+
+The Microsoft Store's App Execution Alias for `python3.exe` is
+hijacking the subprocess spawner. **Disable it:** Settings → Apps →
+Advanced app settings → App execution aliases → toggle off both
+`python.exe` and `python3.exe`. Then close + reopen the PyQt app.
+
+The aliases are 0-byte stubs that exist only to open the Microsoft
+Store. They're a known footgun for any tool that shells out to
+`python` via subprocess.
+
+### 11.8 `OSError: Can't synchronously read data (filter returned failure during read)`
+
+The HDF5 file uses a compression filter (LZ4 / zstd / blosc) that
+your venv doesn't have the codec for. Install:
+
+```bash
+pip install hdf5plugin
+```
+
+(With the venv active.) The detector package imports `hdf5plugin`
+automatically at startup, so once it's installed, all subsequent
+file reads work. This error class is also detected by the
+pre-flight check now — if you've pulled latest, you'll see it as a
+clear "install hdf5plugin" dialog at Retrain-click time instead.
+
+### 11.9 macOS-only: `Bus error` in scipy.signal / numpy.linalg
+
+If the PyQt UI crashes with `Fatal Python error: Bus error` from
+`scipy.signal.sosfiltfilt` or `numpy.linalg.solve`, your numpy and
+scipy were built against mismatched BLAS/LAPACK libraries — a
+common Anaconda failure mode after a partial `conda update`. Fix
+inside the venv:
+
+```bash
+source .venv/bin/activate
+python -m pip install --force-reinstall --no-cache-dir "numpy<2" "scipy<1.14"
+```
+
+Verify:
+
+```bash
+python -c "import numpy as np; A=np.array([[1.,2.],[3.,4.]]); print(np.linalg.solve(A, np.array([1.,2.])))"
+```
+
+Should print `[0. 0.5]`. If it crashes again, your Python install
+itself is corrupted — reinstall Python from python.org.
+
+### 11.10 `Retrain failed` dialog with no obvious error in the log
+
+Three known causes:
+
+1. **Process killed by Windows OOM / antivirus** — check Windows
+   Event Viewer → Windows Logs → Application for `python.exe`
+   crashes. Resource-Exhaustion-Detector entries indicate OOM.
+2. **Process killed mid-Phase-1 by cumulative memory pressure on
+   Windows** — fixed in detector-core 40bb541+ (streaming Phase 1
+   to disk between recordings). Update with
+   `git pull --recurse-submodules`.
+3. **Native crash in numpy/scipy** — should print a faulthandler
+   stack trace in `.ui_cache/retrain_jobs/<job_id>.log`. If not,
+   pull the latest detector-core which enables PYTHONFAULTHANDLER
+   in the subprocess env.
+
+For any "no error in log" case, also try running the retrain in
+the foreground from a terminal — it produces output in real time
+that the log file might not capture:
+
+**macOS:**
+```bash
+source .venv/bin/activate
+python -X faulthandler -m detector.cli retrain --rebuild-dataset --rebuild-phase2 --skip-review
+```
+
+**Windows:**
+```powershell
+.\.venv\Scripts\Activate.ps1
+python -X faulthandler -m detector.cli retrain --rebuild-dataset --rebuild-phase2 --skip-review
+```
+
+### 11.11 "Python 3.x not found" after a macOS crash dialog
+
+macOS's "Reopen" button on a crash dialog tries to relaunch via a
+hardcoded path. If your PATH has changed (e.g. you switched conda
+envs or removed a Python install), Reopen fails to find the
+original interpreter.
+
+**Don't click Reopen.** Just relaunch from terminal:
+
+```bash
+cd /path/to/detector-pyqt
+bash scripts/run_pyqt.sh
+```
+
+### 11.12 First-time install: the pre-flight check says I'm missing N modules
+
+The `setup_env.sh` / `setup_env.ps1` script declares every required
+package, but if you skipped the setup script and installed manually,
+or if you're on a fresh venv that pre-dates this week's dep additions,
+you might be missing `matplotlib`, `hdf5plugin`, or `pyarrow`. Quickest
+fix:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+Or just re-run the setup script. Either way, the pre-flight will
+keep flagging missing modules until they're all installed.
 
 ---
 
