@@ -107,15 +107,17 @@ python -c "
 import sys
 print('python', sys.executable)
 print('python version', sys.version.split()[0])
-import numpy, scipy, pandas, sklearn, h5py, lightgbm, matplotlib
+import numpy, scipy, pandas, sklearn, h5py, lightgbm, matplotlib, hdf5plugin
 print('numpy', numpy.__version__)
 print('scipy', scipy.__version__)
 print('pandas', pandas.__version__)
 print('lightgbm', lightgbm.__version__)
 print('h5py', h5py.__version__)
 print('matplotlib', matplotlib.__version__)
-# detector.review imports matplotlib at import-time; verify the UI
-# can resolve its full import chain without actually opening a window.
+print('hdf5plugin', hdf5plugin.__version__)
+# Importing detector triggers hdf5plugin registration as a side effect
+# (see detector/__init__.py). Verify the chain by also importing
+# detector.review (which pulls matplotlib).
 from detector import review  # noqa: F401
 print('detector.review import OK')
 import PySide6.QtCore
