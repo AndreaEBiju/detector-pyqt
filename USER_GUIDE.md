@@ -13,17 +13,13 @@ This guide covers the PyQt UI specifically. For backend internals
 
 ## 1. First-time setup
 
-### Install
+### Install (with a dedicated Python env — recommended)
 
-You need **Python 3.12**. From the repo root:
+You need **Python 3.12** installed system-wide. From the repo root:
 
 ```bash
 git clone --recurse-submodules https://github.com/AndreaEBiju/detector-pyqt.git
 cd detector-pyqt
-# Install BOTH the backend (detector-core submodule) and this UI.
-# Order matters — the UI imports `from detector ...`.
-python3 -m pip install -e ./detector-core
-python3 -m pip install -e ".[dev]"
 ```
 
 If you cloned without `--recurse-submodules`:
@@ -32,11 +28,92 @@ If you cloned without `--recurse-submodules`:
 git submodule update --init --recursive
 ```
 
-> **Why two installs?** The detector backend is a Git submodule
-> (`detector-core/`) that lives in its own repository. Installing
-> it editable makes `python -m detector.cli`, `from detector
-> import …`, and the `detector` console script all work from any
-> directory — without needing to set `PYTHONPATH` by hand.
+Then run the env-setup script — this creates a dedicated `.venv/`
+inside the repo with all the project's pinned dependencies, isolated
+from any other Python install or other project's package conflicts:
+
+**macOS / Linux:**
+
+```bash
+bash scripts/setup_env.sh
+```
+
+**Windows (PowerShell):**
+
+```powershell
+.\scripts\setup_env.ps1
+```
+
+The script creates `.venv/`, installs the detector-pyqt and
+detector-core packages editable, pulls in the Streamlit deps as well
+(so this one env covers both UIs), and runs a functional check at
+the end (`numpy.linalg.solve` + `scipy.signal.sosfiltfilt`) to
+verify the install actually works end-to-end.
+
+> **Why a dedicated venv at all?** Sharing your Anaconda `base` env
+> or system Python with other projects means any unrelated
+> `pip install` / `conda update` can silently break this project's
+> pinned numpy/scipy versions — and the symptom is often a
+> hours-into-a-retrain native crash, not a clean import error. The
+> venv keeps everything isolated. Other projects on the same
+> machine can break or update their dependencies freely without
+> touching this one.
+
+### Activate the env (every new shell)
+
+After setup, you need to activate the env in each new terminal
+session before running anything:
+
+**macOS / Linux:**
+
+```bash
+source .venv/bin/activate
+```
+
+**Windows:**
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+Your prompt prefix will change to `(.venv)` indicating the env is
+active. Run `deactivate` when you're done.
+
+### One-step launchers (skip manual activation)
+
+If you'd rather not remember to activate, the repo ships two
+launcher scripts that activate the env and start the PyQt UI in
+one command, with `-X faulthandler` enabled for clean crash
+reports:
+
+**macOS / Linux:**
+
+```bash
+bash scripts/run_pyqt.sh
+# pass a recording path:
+bash scripts/run_pyqt.sh path/to/recording.mat
+```
+
+**Windows:**
+
+```powershell
+.\scripts\run_pyqt.ps1
+.\scripts\run_pyqt.ps1 path\to\recording.mat
+```
+
+### Legacy install (without venv — only if you really insist)
+
+If you'd rather install into your existing Anaconda or system Python:
+
+```bash
+python3 -m pip install -e ./detector-core
+python3 -m pip install -e ".[dev]"
+```
+
+Be aware that this puts the project at the mercy of any other tool
+on the machine that touches numpy/scipy. We've debugged at least
+three multi-hour outages caused by exactly this. The venv is
+strongly recommended.
 
 ### Point the tool at the shared model folder
 
@@ -60,17 +137,23 @@ This is the same setup the Streamlit UI uses — share it.
 
 ### Launch
 
+With the env activated (`source .venv/bin/activate` or
+`.\.venv\Scripts\Activate.ps1`):
+
 ```bash
-python3 ui/app.py
-# or, after install, just:
+python ui/app.py
+# or, after install:
 detector-pyqt
 ```
 
 Pass a recording path to open it directly:
 
 ```bash
-python3 ui/app.py path/to/recording.mat
+python ui/app.py path/to/recording.mat
 ```
+
+Or use the one-step launcher scripts that activate the env for you
+(see "One-step launchers" above).
 
 ---
 
