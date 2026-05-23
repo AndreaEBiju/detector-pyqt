@@ -389,7 +389,27 @@ class TrainingWindow(QMainWindow):
         self._rebuild_cb = QCheckBox(
             "Rebuild dataset_phase1 (~25 min; needed after adding recordings)"
         )
+        self._rebuild_cb.setToolTip(
+            "Rebuilds raw features (Phase 1) from the manifest. "
+            "Does NOT regenerate synthetic positives (Phase 2) -- if you "
+            "added new recordings, ALSO check the 'rebuild dataset_phase2' "
+            "box below, or the model will silently train on stale Phase 2 "
+            "data missing your new recordings."
+        )
         form.addRow(self._rebuild_cb)
+        self._rebuild_phase2_cb = QCheckBox(
+            "Rebuild dataset_phase2 synthetic augmentation (~2-4 hours; "
+            "required after adding recordings)"
+        )
+        self._rebuild_phase2_cb.setToolTip(
+            "Regenerates dataset_phase2.parquet with synthetic positives "
+            "for every recording in your current manifest. This is the "
+            "step that ACTUALLY makes new recordings reachable for "
+            "training -- without it, retrain trains on whatever recordings "
+            "were in Phase 2 last time, regardless of what's in the manifest. "
+            "Slow (~hours) but only needed when you've added recordings."
+        )
+        form.addRow(self._rebuild_phase2_cb)
         self._skip_review_cb = QCheckBox(
             "Skip Phase 5 review HTML regeneration"
         )
@@ -495,6 +515,7 @@ class TrainingWindow(QMainWindow):
                 w_neg=float(self._w_neg_spin.value()),
                 seed=int(self._seed_spin.value()),
                 rebuild_dataset=bool(self._rebuild_cb.isChecked()),
+                rebuild_phase2=bool(self._rebuild_phase2_cb.isChecked()),
                 no_loro=bool(self._no_loro_cb.isChecked()),
                 skip_review=bool(self._skip_review_cb.isChecked()),
                 force_promote=bool(self._force_promote_cb.isChecked()),
