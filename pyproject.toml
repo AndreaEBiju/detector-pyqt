@@ -31,6 +31,10 @@ dependencies = [
     # Optional but referenced by detector.review (SHAP explanations).
     # Cap to a version that still works with numba 0.59 / numpy 1.26.
     "shap>=0.44,<0.50",
+    # detector.review embeds matplotlib figures in the per-fold SHAP
+    # review HTMLs. It's imported by ui.windows.main_window indirectly,
+    # so the UI fails to start without it.
+    "matplotlib>=3.7",
 ]
 
 [project.optional-dependencies]
