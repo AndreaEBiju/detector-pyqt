@@ -443,10 +443,29 @@ class TrainingWindow(QMainWindow):
             "If you reviewed the previous version's disagreement HTMLs "
             "and saved per-recording <rid>_review.json files, point at "
             "the folder containing them. Each 'false_positive' judgment "
-            "becomes a high-weight (default 3.0) negative training "
-            "example -- the canonical active-learning loop that turns "
-            "your reviews into actual model improvements."
+            "becomes a high-weight negative training example (weight "
+            "set by 'review FP weight' below) -- the canonical active-"
+            "learning loop that turns your reviews into actual model "
+            "improvements."
         )
+        # Companion spinbox for the FP-correction strength. Default
+        # 3.0 (10x the default w_neg=0.3, "strong"). Bump higher to
+        # accelerate convergence when iteration is plateauing -- the
+        # model gets a much steeper gradient on those corrections.
+        self._review_fp_weight_spin = QDoubleSpinBox()
+        self._review_fp_weight_spin.setRange(0.5, 20.0)
+        self._review_fp_weight_spin.setSingleStep(0.5)
+        self._review_fp_weight_spin.setDecimals(1)
+        self._review_fp_weight_spin.setValue(3.0)
+        self._review_fp_weight_spin.setToolTip(
+            "Sample-weight assigned to windows the user marked as "
+            "false_positive in 'review feedback dir'. Default 3.0 (10x "
+            "the default w_neg=0.3). Bump to 6.0-10.0 to accelerate "
+            "convergence when iteration is slow and you have high "
+            "recall_real headroom -- pushes harder on 'these are "
+            "definitely clean' at the cost of some recall."
+        )
+        form.addRow("review FP weight", self._review_fp_weight_spin)
         layout.addWidget(ctrl_box)
 
         # Action row
@@ -627,6 +646,7 @@ class TrainingWindow(QMainWindow):
                 force_promote_reason=force_reason,
                 manifest_path=detector_paths.get_manifest_path(),
                 review_dir=review_dir,
+                review_fp_weight=float(self._review_fp_weight_spin.value()),
             )
         except Exception as exc:
             QMessageBox.critical(self, "Start retrain failed", str(exc))
