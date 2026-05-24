@@ -425,6 +425,28 @@ class TrainingWindow(QMainWindow):
             "Force promote even if regressions detected (requires reason)"
         )
         form.addRow(self._force_promote_cb)
+        # Active-learning loop: optionally fold the previous model's
+        # review judgments back in as elevated-weight negatives. Empty
+        # = no review feedback (default; legacy behavior).
+        self._review_dir_edit = QLineEdit()
+        self._review_dir_edit.setPlaceholderText(
+            "(optional) path to previous model's review/ folder -- e.g. "
+            "<artifacts>/model_v0.2.0/review"
+        )
+        review_row = QHBoxLayout()
+        review_row.addWidget(self._review_dir_edit)
+        btn_pick_review = QPushButton("...")
+        btn_pick_review.clicked.connect(self._pick_review_dir)
+        review_row.addWidget(btn_pick_review)
+        form.addRow("review feedback dir", review_row)
+        self._review_dir_edit.setToolTip(
+            "If you reviewed the previous version's disagreement HTMLs "
+            "and saved per-recording <rid>_review.json files, point at "
+            "the folder containing them. Each 'false_positive' judgment "
+            "becomes a high-weight (default 3.0) negative training "
+            "example -- the canonical active-learning loop that turns "
+            "your reviews into actual model improvements."
+        )
         layout.addWidget(ctrl_box)
 
         # Action row
@@ -505,6 +527,15 @@ class TrainingWindow(QMainWindow):
             except Exception:
                 continue
 
+    def _pick_review_dir(self) -> None:
+        """File picker for the active-learning review feedback dir."""
+        start_dir = self._review_dir_edit.text().strip() or str(Path.home())
+        path = QFileDialog.getExistingDirectory(
+            self, "Pick previous model's review/ folder", start_dir,
+        )
+        if path:
+            self._review_dir_edit.setText(path)
+
     def _on_start_retrain(self) -> None:
         # Pre-flight readiness check BEFORE we spawn anything.
         # Catches missing files + missing Python packages + a real
@@ -583,6 +614,8 @@ class TrainingWindow(QMainWindow):
         else:
             force_reason = None
         try:
+            review_dir_text = self._review_dir_edit.text().strip()
+            review_dir = Path(review_dir_text) if review_dir_text else None
             job = self._monitor.start_new(
                 w_neg=float(self._w_neg_spin.value()),
                 seed=int(self._seed_spin.value()),
@@ -593,6 +626,7 @@ class TrainingWindow(QMainWindow):
                 force_promote=bool(self._force_promote_cb.isChecked()),
                 force_promote_reason=force_reason,
                 manifest_path=detector_paths.get_manifest_path(),
+                review_dir=review_dir,
             )
         except Exception as exc:
             QMessageBox.critical(self, "Start retrain failed", str(exc))
