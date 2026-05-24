@@ -1304,6 +1304,22 @@ class AddRecordingDialog(QDialog):
         btn_bad.clicked.connect(self._pick_bad)
         bad_row.addWidget(btn_bad)
         form.addRow("bad.h5", bad_row)
+        # Baseline file path. Optional in the manifest schema -- if
+        # left blank, the retrain pipeline falls back to its three-tier
+        # resolution (legacy <data_root>/baselines/<rid>_baseline.h5 if
+        # present, otherwise next-to-clean.h5). Picking explicitly here
+        # lets the user point at a baseline that lives anywhere on disk,
+        # so the manifest fully describes where every file is.
+        self._baseline_edit = QLineEdit()
+        self._baseline_edit.setPlaceholderText(
+            "(optional -- defaults to next to clean.h5 if blank)"
+        )
+        baseline_row = QHBoxLayout()
+        baseline_row.addWidget(self._baseline_edit)
+        btn_baseline = QPushButton("…")
+        btn_baseline.clicked.connect(self._pick_baseline)
+        baseline_row.addWidget(btn_baseline)
+        form.addRow("baseline.h5", baseline_row)
         self._rec_type_combo = QComboBox()
         self._rec_type_combo.addItems(["stim_rec", "baseline"])
         form.addRow("rec_type", self._rec_type_combo)
@@ -1356,6 +1372,21 @@ class AddRecordingDialog(QDialog):
         if path:
             self._bad_edit.setText(path)
 
+    def _pick_baseline(self) -> None:
+        # Default the dialog to the clean.h5's parent folder if set --
+        # baselines most commonly live alongside (Option A) or in a
+        # sibling `baselines/` folder (legacy convention).
+        start_dir = ""
+        clean = self._clean_edit.text().strip()
+        if clean:
+            start_dir = str(Path(clean).parent)
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Pick baseline.h5", start_dir,
+            "Baseline (*_baseline.h5);;HDF5 (*.h5);;All files (*)",
+        )
+        if path:
+            self._baseline_edit.setText(path)
+
     def _maybe_autofill_from_clean_h5(self) -> None:
         """Inspect the clean.h5 file (if set) to suggest sibling bad.h5,
         the rec_type from filename, fs, n_samples, recording_id."""
@@ -1376,6 +1407,19 @@ class AddRecordingDialog(QDialog):
                 bad_sib = clean_path.with_name(f"{base}_bad.h5")
                 if bad_sib.exists():
                     self._bad_edit.setText(str(bad_sib))
+            # Auto-fill baseline.h5 if blank -- check the two most
+            # common locations: next-to-clean.h5 (Option A) and the
+            # legacy <repo>/baselines/<rid>_baseline.h5.
+            if not self._baseline_edit.text().strip():
+                next_to = clean_path.with_name(f"{base}_baseline.h5")
+                if next_to.exists():
+                    self._baseline_edit.setText(str(next_to))
+                else:
+                    # Legacy sibling: <parent>/../baselines/<rid>_baseline.h5
+                    legacy = (clean_path.parent.parent
+                              / "baselines" / f"{base}_baseline.h5")
+                    if legacy.exists():
+                        self._baseline_edit.setText(str(legacy))
             # Auto-detect rec_type from filename
             if "_stim_rec" in base:
                 self._rec_type_combo.setCurrentText("stim_rec")
@@ -1420,7 +1464,7 @@ class AddRecordingDialog(QDialog):
         self.accept()
 
     def recording_dict(self) -> dict:
-        return {
+        d = {
             "recording_id": self._rid_edit.text().strip(),
             "source_path": str(Path(self._source_edit.text().strip()).resolve()),
             "splitter_clean_path": str(Path(self._clean_edit.text().strip()).resolve()),
@@ -1434,6 +1478,13 @@ class AddRecordingDialog(QDialog):
             "notes": self._notes_edit.text(),
             "model_version_last_trained_on": None,
         }
+        # Optional: only set splitter_baseline_path if user picked one.
+        # An empty field means "let the resolution fallback in
+        # dataset.py decide" (legacy compat).
+        baseline = self._baseline_edit.text().strip()
+        if baseline:
+            d["splitter_baseline_path"] = str(Path(baseline).resolve())
+        return d
 
 
 class ProvenanceDialog(QDialog):
