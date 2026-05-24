@@ -1517,13 +1517,15 @@ class ProvenanceDialog(QDialog):
 
 class RegressionReportDialog(QDialog):
     """Summary of the just-finished retrain's regression check vs the
-    previous version. Shows old/new metrics side-by-side."""
+    previous version. Separates real metric/gate regressions from
+    scope changes (recordings added/removed) which are informational
+    not regressive."""
 
     def __init__(self, version: str, report: dict,
                  parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.setWindowTitle(f"Regression report — {version}")
-        self.resize(720, 480)
+        self.resize(820, 600)
         layout = QVBoxLayout(self)
         header = QLabel(
             f"<b>Model {version}</b> — regression report\n"
@@ -1531,13 +1533,126 @@ class RegressionReportDialog(QDialog):
         )
         header.setStyleSheet("padding: 6px;")
         layout.addWidget(header)
-        # Show the metrics table inline
+
+        body = self._format_human_readable(report)
         view = QPlainTextEdit()
         view.setReadOnly(True)
         view.setStyleSheet("font-family: monospace; font-size: 11px;")
-        view.setPlainText(json.dumps(report, indent=2, default=str))
+        view.setPlainText(body)
         layout.addWidget(view, stretch=1)
+
         btn_box = QDialogButtonBox(QDialogButtonBox.Close)
         btn_box.rejected.connect(self.reject)
         btn_box.accepted.connect(self.accept)
         layout.addWidget(btn_box)
+
+    @staticmethod
+    def _format_human_readable(report: dict) -> str:
+        """Render report sections in priority order:
+          1. Aggregate metric regressions (loro_summary.*)
+          2. Per-recording gate flips (recs in both old + new)
+          3. Improvements (good news)
+          4. Scope changes (informational -- not regressions)
+          5. Raw JSON dump for full audit trail
+        """
+        lines: list[str] = []
+        regressions = report.get("regressions", []) or []
+        improvements = report.get("improvements", []) or []
+        scope = report.get("scope_changes") or {}
+
+        # Split regressions into aggregate vs per-recording so the
+        # user can tell at a glance which kind they have.
+        agg_reg = [r for r in regressions
+                   if not r.get("metric", "").startswith("per_recording.")]
+        per_rec_reg = [r for r in regressions
+                       if r.get("metric", "").startswith("per_recording.")]
+        agg_imp = [r for r in improvements
+                   if not r.get("metric", "").startswith("per_recording.")]
+        per_rec_imp = [r for r in improvements
+                       if r.get("metric", "").startswith("per_recording.")]
+
+        # 1. Aggregate regressions
+        if agg_reg:
+            lines.append("=" * 60)
+            lines.append(f"[REGRESSION] {len(agg_reg)} aggregate metric(s) "
+                          "got worse:")
+            for r in agg_reg:
+                old_v = r.get("old"); new_v = r.get("new")
+                rel = r.get("relative_change")
+                rel_s = f" ({rel * 100:+.1f}%)" if rel is not None else ""
+                lines.append(
+                    f"  - {r['metric']}: {old_v} -> {new_v}{rel_s}"
+                )
+            lines.append("")
+
+        # 2. Per-recording gate regressions (on recordings in BOTH
+        # corpora -- these are the ACTUAL gate flips, not scope-change
+        # artifacts).
+        if per_rec_reg:
+            lines.append("=" * 60)
+            lines.append(
+                f"[REGRESSION] {len(per_rec_reg)} per-recording gate flip(s) "
+                "(passed before, fails now):"
+            )
+            for r in per_rec_reg:
+                lines.append(f"  - {r['metric']}")
+            lines.append("")
+
+        # 3. Improvements
+        if agg_imp or per_rec_imp:
+            lines.append("=" * 60)
+            lines.append(
+                f"[IMPROVEMENT] {len(agg_imp) + len(per_rec_imp)} metric(s) "
+                "got better:"
+            )
+            for r in agg_imp:
+                old_v = r.get("old"); new_v = r.get("new")
+                rel = r.get("relative_change")
+                rel_s = f" ({rel * 100:+.1f}%)" if rel is not None else ""
+                lines.append(
+                    f"  - {r['metric']}: {old_v} -> {new_v}{rel_s}"
+                )
+            for r in per_rec_imp:
+                lines.append(f"  - {r['metric']}")
+            lines.append("")
+
+        # 4. Scope changes -- NOT regressions, just FYI.
+        only_old = scope.get("removed_from_manifest") or []
+        only_new = scope.get("added_to_manifest") or []
+        if only_old or only_new:
+            lines.append("=" * 60)
+            lines.append("[SCOPE CHANGE] The training corpus differs between "
+                         "versions; the recordings below were tested in only "
+                         "one of them and don't constitute regressions or "
+                         "improvements:")
+            if only_old:
+                lines.append(f"  Removed from manifest since "
+                              f"{report.get('previous_version', 'previous')}:")
+                for rid in only_old[:20]:
+                    lines.append(f"    - {rid}")
+                if len(only_old) > 20:
+                    lines.append(f"    ... ({len(only_old) - 20} more)")
+            if only_new:
+                lines.append("  Added to manifest in this version:")
+                for rid in only_new[:20]:
+                    lines.append(f"    - {rid}")
+                if len(only_new) > 20:
+                    lines.append(f"    ... ({len(only_new) - 20} more)")
+            lines.append("")
+
+        # 5. Verdict
+        lines.append("=" * 60)
+        if report.get("regressed"):
+            lines.append("Verdict: REGRESSION detected -- model NOT promoted.")
+            lines.append("Force-promote via Tools -> Training Management -> "
+                          "Retrain -> Force promote (with a reason) if you "
+                          "want this version active anyway.")
+        else:
+            lines.append("Verdict: No regressions -- model auto-promoted to "
+                          "current.")
+        lines.append("")
+        lines.append("=" * 60)
+        lines.append("Raw report JSON (for audit / scripting):")
+        lines.append("")
+        lines.append(json.dumps(report, indent=2, default=str))
+        return "\n".join(lines)
