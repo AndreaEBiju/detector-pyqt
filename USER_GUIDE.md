@@ -85,15 +85,28 @@ Prerequisite (both platforms): **Python 3.12** installed system-wide.
    git submodule update --init --recursive
    ```
 
-3. **Create the venv and install all dependencies:**
+3. **Allow PowerShell to run local scripts (one-time, per-user):**
+   ```powershell
+   Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+   ```
+   Type `Y` when prompted. Without this, step 4's setup script will
+   fail with **"running scripts is disabled on this system"** —
+   Windows ships with `Restricted` execution policy by default, which
+   blocks every `.ps1` file. `RemoteSigned` still blocks unsigned
+   scripts downloaded from the internet but allows local ones you
+   cloned yourself, which is the right setting for development work.
+   You only need to do this once per user account.
+
+4. **Create the venv and install all dependencies:**
    ```powershell
    .\scripts\setup_env.ps1
    ```
    Same checks as the macOS script (verifies `detector.review` import,
-   HDF5 filter decode, numpy/scipy linear-algebra).
-   If PowerShell complains about execution policy:
+   HDF5 filter decode, numpy/scipy linear-algebra). If for any reason
+   you don't want to change the execution policy permanently, you can
+   bypass for just this invocation:
    ```powershell
-   Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+   powershell -ExecutionPolicy Bypass -File .\scripts\setup_env.ps1
    ```
 
 4. **Point the tool at the shared model folder** (once per machine):
@@ -747,6 +760,25 @@ You're not running in the project's venv. Three ways to fix:
 - Or `cd` to the repo root and run with the explicit venv Python:
   `.venv/bin/python ui/app.py` (Mac) or
   `.\.venv\Scripts\python.exe ui\app.py` (Windows).
+
+### 11.6.5 Windows-only: "running scripts is disabled on this system"
+
+PowerShell refuses to run any `.ps1` file (including `setup_env.ps1`
+and `run_pyqt.ps1`) because Windows defaults the execution policy to
+`Restricted`. Fix once per user:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+```
+
+Type `Y` when prompted. Then re-run whatever script you were trying.
+
+If you'd rather not change the policy at all, you can bypass it for
+a single command:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\setup_env.ps1
+```
 
 ### 11.7 Windows-only: subprocess errors with `[WinError 11]` or `[WinError 2]`
 
