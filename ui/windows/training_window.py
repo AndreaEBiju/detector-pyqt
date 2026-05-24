@@ -387,10 +387,16 @@ class TrainingWindow(QMainWindow):
         )
         form.addRow(self._no_loro_cb)
         self._rebuild_cb = QCheckBox(
-            "Rebuild dataset_phase1 (~25 min; needed after adding recordings)"
+            "Rebuild dataset_phase1 (~5-10 min per recording; "
+            "needed after adding recordings)"
         )
         self._rebuild_cb.setToolTip(
             "Rebuilds raw features (Phase 1) from the manifest. "
+            "Single-threaded feature extraction takes ~5-10 minutes per "
+            "recording; with 4 parallel workers (default), the total "
+            "depends on recording count and CPU core count. "
+            "Override worker count with the DETECTOR_PHASE1_WORKERS "
+            "env var.\n\n"
             "Does NOT regenerate synthetic positives (Phase 2) -- if you "
             "added new recordings, ALSO check the 'rebuild dataset_phase2' "
             "box below, or the model will silently train on stale Phase 2 "

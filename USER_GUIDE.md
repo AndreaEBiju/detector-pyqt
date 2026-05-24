@@ -418,7 +418,13 @@ Controls:
 - `no_loro` — reuse cached LORO summary (only safe if the manifest
   hasn't changed since the last LORO).
 - `rebuild_dataset` — rebuild `dataset_phase1.parquet` (raw features
-  only, ~25 min). **Does NOT regenerate Phase 2 — if you added new
+  only). Single-threaded feature extraction takes **~5-10 min per
+  recording**; with the default 4-worker parallel pool this scales
+  near-linearly with CPU cores. For 18 recordings on a typical 8-core
+  laptop, expect **~30-45 minutes** total. Override the worker
+  count via the `DETECTOR_PHASE1_WORKERS` env var (default 4, set
+  higher if you have a beefy machine with abundant RAM ~1.5 GB per
+  worker peak). **Does NOT regenerate Phase 2 — if you added new
   recordings, ALSO check `rebuild_phase2` below or the model will
   silently train on the stale Phase 2 file.**
 - `rebuild_phase2` — regenerate `dataset_phase2.parquet` (synthetic
