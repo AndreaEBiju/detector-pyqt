@@ -431,7 +431,13 @@ Controls:
   augmentation; ~2-4 hours). This is the step that actually makes
   newly-added recordings reachable for training. Required whenever
   you've added recordings since the last training round.
-- `skip_review` — don't regenerate Phase-5 review HTMLs.
+- `skip_review` — when UNchecked (default), retrain generates
+  per-fold **disagreement-review HTML reports** alongside the
+  trained model (see "Phase 5 review HTMLs" subsection below for
+  what they are and how to use them). Parallelized across folds:
+  ~5-15 min total on a 12-worker machine. Check the box only if
+  you're iterating on retrain settings and don't need the review
+  HTMLs for every attempt.
 - `force_promote` — promote even if regressions are detected
   (requires a reason).
 
@@ -440,6 +446,68 @@ showing old vs new metrics if `regression_report.json` exists.
 
 If you close the training window mid-retrain, the subprocess keeps
 going. Re-open the window and it'll auto-attach.
+
+#### Phase 5 review HTMLs (post-training diagnostics)
+
+When `skip_review` is unchecked, retrain produces one HTML report
+per recording showing every place where the new model's
+predictions **disagreed** with your human-labeled regions during
+LORO. Each entry on the page shows:
+
+- A channel plot of the signal segment containing the disputed window
+- The model's probability + the LORO held-out probability for that
+  window
+- SHAP top-20 features explaining the model's decision (red = pushing
+  toward "bad", blue = pulling toward "clean")
+
+Use these to spot-check the model's reasoning, find labels you may
+want to flip, and audit systematic errors (e.g. "the model keeps
+flagging clean stim onset as bad" or "the model misses a class of
+real artifacts that look like X").
+
+**Where they land:**
+
+```
+<artifacts_dir>/model_v0.X.Y/review/
+├── <recording_id_1>_review.html
+├── <recording_id_2>_review.html
+├── ...
+└── <recording_id_N>_review.html
+```
+
+For Andrea: `~/.detector/artifacts/model_v0.2.0/review/` (or your
+shared Drive's `model_v0.2.0/review/` if `detector init` is pointing
+there).
+
+**To view them:** Open any of the HTMLs in a web browser. They're
+self-contained — no internet, no Python, no extra files. Drag-and-drop
+into Chrome / Safari / Firefox works.
+
+**To re-generate (without retraining the model):** Sometimes you want
+to re-run Phase 5 against an existing model — e.g. you've adjusted
+labels and want to see how disagreements change. The standalone CLI
+does this:
+
+```bash
+# In an active venv:
+python -m detector.cli review --model <artifact_dir>
+# Or pass --fold <recording_id> for just one recording
+```
+
+Parallelized the same way the in-retrain path is; auto-detects
+worker count from your machine. Pass `--workers N` to override.
+
+**To aggregate review judgments into a summary JSON** (after you've
+clicked through HTMLs and saved per-recording judgment JSONs):
+
+```bash
+python -m detector.cli review --aggregate \
+  --out-dir <artifact_dir>/review/
+```
+
+Produces `review_summary.json` with `true_artifact_count`,
+`borderline_count`, `false_positive_count`, and rates -- useful for
+deciding which judgments to feed back into manifest label updates.
 
 #### Automatic pre-flight check
 
