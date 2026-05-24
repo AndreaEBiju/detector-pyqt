@@ -30,6 +30,10 @@ dependencies = [
     # Registers HDF5 compression filters (LZ4 / zstd / blosc) so the
     # splitter's compressed clean/bad/baseline H5 files can be read.
     "hdf5plugin>=4.0",
+    # Used by detector.dataset to size the parallel Phase 1 worker
+    # pool based on actual machine RAM. Without it, the worker count
+    # falls back to a CPU-only heuristic capped at 8.
+    "psutil>=5.0",
     "lightgbm>=4.0",
     # Optional but referenced by detector.review (SHAP explanations).
     # Cap to a version that still works with numba 0.59 / numpy 1.26.

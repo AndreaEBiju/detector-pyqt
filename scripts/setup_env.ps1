@@ -102,7 +102,7 @@ import sys
 print('python', sys.executable)
 print('python version', sys.version.split()[0])
 import importlib.metadata as _ilm
-import numpy, scipy, pandas, sklearn, h5py, lightgbm, matplotlib, hdf5plugin
+import numpy, scipy, pandas, sklearn, h5py, lightgbm, matplotlib, hdf5plugin, psutil
 print('numpy', numpy.__version__)
 print('scipy', scipy.__version__)
 print('pandas', pandas.__version__)
@@ -111,6 +111,7 @@ print('h5py', h5py.__version__)
 print('matplotlib', matplotlib.__version__)
 # hdf5plugin 6.0 dropped the public `__version__` attribute.
 print('hdf5plugin', _ilm.version('hdf5plugin'))
+print('psutil', psutil.__version__)
 from detector import review  # noqa: F401
 print('detector.review import OK')
 import PySide6.QtCore

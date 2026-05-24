@@ -108,7 +108,7 @@ import sys
 print('python', sys.executable)
 print('python version', sys.version.split()[0])
 import importlib.metadata as _ilm
-import numpy, scipy, pandas, sklearn, h5py, lightgbm, matplotlib, hdf5plugin
+import numpy, scipy, pandas, sklearn, h5py, lightgbm, matplotlib, hdf5plugin, psutil
 print('numpy', numpy.__version__)
 print('scipy', scipy.__version__)
 print('pandas', pandas.__version__)
@@ -118,6 +118,7 @@ print('matplotlib', matplotlib.__version__)
 # hdf5plugin 6.0 dropped the public `__version__` attribute --
 # query installed-package metadata instead, works across versions.
 print('hdf5plugin', _ilm.version('hdf5plugin'))
+print('psutil', psutil.__version__)
 # Importing detector triggers hdf5plugin registration as a side effect
 # (see detector/__init__.py). Verify the chain by also importing
 # detector.review (which pulls matplotlib).
