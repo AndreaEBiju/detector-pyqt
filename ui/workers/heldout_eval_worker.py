@@ -37,17 +37,23 @@ from detector.model_artifact import ModelArtifact                # noqa: E402
 
 class HeldoutEvalWorker(QObject):
     """One-shot worker: load manifest, run evaluate_heldout(), emit
-    the report dict.
+    the report dict + per-recording interval cache.
 
     Progress signal fires once per recording: (idx_done, total,
     next_recording_id). The dialog displays this as "Evaluating
     recording 3/7: rec_XYZ".
+
+    The cache is `{recording_id: {"model": ndarray, "human": ndarray,
+    "fs": float, "n_samples": int}}` -- the Phase-3 overlay window
+    reads from it to redraw model vs. human bands without re-running
+    `detect_bad` (which is the slow part of the eval). Empty when no
+    recording was successfully evaluated.
     """
 
     # (idx_starting_now, total, recording_id)
     progress = Signal(int, int, str)
-    # report dict from evaluate_heldout
-    finished = Signal(dict)
+    # (report dict, interval_cache dict) from evaluate_heldout
+    finished = Signal(dict, dict)
     # human-readable error message
     error = Signal(str)
 
@@ -72,11 +78,13 @@ class HeldoutEvalWorker(QObject):
             def _cb(i: int, total: int, rid: str) -> None:
                 self.progress.emit(int(i), int(total), str(rid))
 
+            interval_cache: dict = {}
             report = HE.evaluate_heldout(
                 m, self._artifact,
                 rec_ids=self._rec_ids,
                 progress_callback=_cb,
+                interval_cache=interval_cache,
             )
-            self.finished.emit(report)
+            self.finished.emit(report, interval_cache)
         except Exception as e:
             self.error.emit(f"{type(e).__name__}: {e}")

@@ -504,14 +504,20 @@ class MainWindow(QMainWindow):
             f"Evaluating held-out recordings ({idx+1}/{total}) …\n{rid}"
         )
 
-    def _on_heldout_finished(self, report: dict) -> None:
+    def _on_heldout_finished(self, report: dict, interval_cache: dict) -> None:
         if self._heldout_progress is not None:
             self._heldout_progress.close()
             self._heldout_progress = None
         self._action_heldout_eval.setEnabled(True)
         # Lazy import to avoid circulars on startup.
         from ui.dialogs.heldout_eval_dialog import HeldoutEvalDialog
-        dlg = HeldoutEvalDialog(report, self)
+        from detector import paths as _detector_paths
+        dlg = HeldoutEvalDialog(
+            report,
+            interval_cache=interval_cache,
+            manifest_path=_detector_paths.get_manifest_path(),
+            parent=self,
+        )
         dlg.exec()
 
     def _on_heldout_error(self, msg: str) -> None:

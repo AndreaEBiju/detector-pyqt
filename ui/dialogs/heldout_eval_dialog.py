@@ -3,15 +3,18 @@
 Shows the report from `detector.heldout_eval.evaluate_heldout`:
   - Header with model version + recording count.
   - Per-recording table (recording_id, agreement, precision, recall,
-    F1, FP%, FN%, human bad-fraction, model bad-fraction, elapsed).
+    F1, FP%, FN%, human bad-fraction, model bad-fraction, elapsed,
+    and a "View overlay" button that opens a per-recording
+    HeldoutOverlayWindow).
   - Aggregate block with both micro (sample-weighted) and macro
     (recording-weighted) averages.
   - "Save report JSON…" button.
 
-Single-window read-only display -- no editing. The plot-overlay
-viewer (a per-recording window with model predictions overlaid on
-the signal, like the labeling UI) is a follow-up (Phase 3 of the
-held-out work).
+The per-row "View" button opens `HeldoutOverlayWindow` (Phase 3),
+which shows the recording's signal with human ground-truth + model
+prediction overlays. Intervals come from the cache the worker
+captured during the eval run, so opening an overlay does NOT
+re-run detect_bad.
 """
 
 from __future__ import annotations
@@ -23,8 +26,8 @@ from typing import Optional
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog, QDialogButtonBox, QFileDialog, QGroupBox, QHBoxLayout,
-    QHeaderView, QLabel, QPushButton, QTableWidget, QTableWidgetItem,
-    QVBoxLayout, QWidget,
+    QHeaderView, QLabel, QMessageBox, QPushButton, QTableWidget,
+    QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 
@@ -41,14 +44,33 @@ def _fmt_ratio(v) -> str:
 
 
 class HeldoutEvalDialog(QDialog):
-    def __init__(self, report: dict, parent: Optional[QWidget] = None):
+    def __init__(
+        self,
+        report: dict,
+        *,
+        interval_cache: Optional[dict] = None,
+        manifest_path: Optional[Path] = None,
+        parent: Optional[QWidget] = None,
+    ):
         super().__init__(parent)
         version = report.get("model_version", "unknown")
         n_eval = report.get("n_recordings_evaluated", 0)
         n_skip = report.get("n_recordings_skipped", 0)
         self.setWindowTitle(f"Held-out evaluation — {version}")
-        self.resize(1100, 640)
+        self.resize(1200, 660)
         self._report = report
+        self._interval_cache = interval_cache or {}
+        self._manifest_path = (
+            Path(manifest_path) if manifest_path is not None else None
+        )
+        # Resolve manifest -> recording-id lookup once so the View
+        # button click is a constant-time dict access. Done lazily to
+        # tolerate a missing manifest path (e.g. tests that exercise
+        # the dialog with a synthetic report).
+        self._rec_by_id: dict[str, dict] = self._load_recordings_by_id()
+        # Hold references to overlay windows so they aren't garbage-
+        # collected the moment the click handler returns.
+        self._overlay_windows: list[QWidget] = []
 
         root = QVBoxLayout(self)
 
@@ -108,6 +130,7 @@ class HeldoutEvalDialog(QDialog):
             ("bad_fraction_model", "Model bad%"),
             ("n_samples", "N samples"),
             ("elapsed_s", "Elapsed (s)"),
+            ("__overlay", "Overlay"),
         ]
         table = QTableWidget(len(per_rec), len(columns))
         table.setHorizontalHeaderLabels([c[1] for c in columns])
@@ -118,6 +141,29 @@ class HeldoutEvalDialog(QDialog):
 
         for row_i, rec in enumerate(per_rec):
             for col_i, (key, _label) in enumerate(columns):
+                if key == "__overlay":
+                    rid = str(rec.get("recording_id", ""))
+                    btn = QPushButton("View")
+                    btn.setToolTip(
+                        "Open the signal with human + model overlays "
+                        "for this held-out recording."
+                    )
+                    # Disabled when we can't resolve the manifest entry
+                    # (e.g. dialog opened from a saved JSON report
+                    # without a corresponding manifest path).
+                    enabled = rid in self._rec_by_id
+                    btn.setEnabled(enabled)
+                    if not enabled:
+                        btn.setToolTip(
+                            "Manifest entry not found for this "
+                            "recording -- overlay unavailable."
+                        )
+                    btn.clicked.connect(
+                        lambda _checked=False, _rid=rid:
+                        self._open_overlay(_rid)
+                    )
+                    table.setCellWidget(row_i, col_i, btn)
+                    continue
                 v = rec.get(key)
                 if key == "recording_id":
                     txt = str(v)
@@ -140,6 +186,46 @@ class HeldoutEvalDialog(QDialog):
             0, QHeaderView.Stretch
         )
         return table
+
+    # ----------------------------------------------------------------
+    # Overlay window plumbing
+    # ----------------------------------------------------------------
+
+    def _load_recordings_by_id(self) -> dict[str, dict]:
+        """Build {recording_id: manifest_entry} so the View button can
+        look up source_path + splitter_bad_path in O(1). Returns an
+        empty dict (no error) if the manifest can't be loaded -- the
+        View buttons just stay disabled in that case."""
+        if self._manifest_path is None or not self._manifest_path.exists():
+            return {}
+        try:
+            from detector.manifest import Manifest
+            m = Manifest.load(self._manifest_path)
+            return {
+                r["recording_id"]: r
+                for r in m.list_recordings(include_held_out=True)
+            }
+        except Exception:
+            return {}
+
+    def _open_overlay(self, recording_id: str) -> None:
+        rec = self._rec_by_id.get(recording_id)
+        if rec is None:
+            QMessageBox.warning(
+                self, "Overlay unavailable",
+                f"No manifest entry found for recording {recording_id}.",
+            )
+            return
+        cache_entry = self._interval_cache.get(recording_id)
+        # Lazy import to keep the dialog import light (signal_viewer
+        # transitively imports pyqtgraph + h5py).
+        from ui.windows.heldout_overlay_window import HeldoutOverlayWindow
+        win = HeldoutOverlayWindow(rec, cache_entry, parent=self)
+        # Use top-level Window flag so the user can park it next to
+        # the results dialog without it being modal-trapped.
+        win.setWindowFlag(Qt.Window, True)
+        win.show()
+        self._overlay_windows.append(win)
 
     # ----------------------------------------------------------------
     # Aggregate box
