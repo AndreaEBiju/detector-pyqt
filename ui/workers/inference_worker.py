@@ -44,8 +44,10 @@ if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
 from detector import paths as detector_paths                    # noqa: E402
+from detector.animal_id import extract_animal_letter             # noqa: E402
 from detector.model_artifact import ModelArtifact                # noqa: E402
 from detector.predict import detect_bad_with_progress            # noqa: E402
+from detector.retrain_per_animal import list_per_animal_versions  # noqa: E402
 
 
 # ----------------------------------------------------------------------
@@ -54,16 +56,114 @@ from detector.predict import detect_bad_with_progress            # noqa: E402
 
 _artifact_cache: dict[str, ModelArtifact] = {}
 
+# Sentinel prefix for the per-animal auto-routing dropdown entry.
+# The full version string is "_per_animal_auto:<recording_path>".
+# `load_model_artifact_cached` detects this prefix and dispatches
+# to `resolve_per_animal_auto` to pick the right per-animal model
+# (or fall back to the combined promoted model).
+PER_ANIMAL_AUTO_SENTINEL = "_per_animal_auto"
+
+
+def resolve_per_animal_auto(recording_path) -> dict:
+    """Resolve which on-disk model artifact to use for a recording when
+    the user picks the per-animal (auto) dropdown entry. Pure-logic
+    helper -- doesn't load anything off disk beyond directory listing.
+
+    Steps:
+      1. extract_animal_letter(recording_path) -- e.g. 'J' for
+         E10_JEL_E10_bl_1315.mat.
+      2. Find <artifacts_dir>/per_animal/<animal>/ and list its
+         model_v*/ subdirs via list_per_animal_versions.
+      3. If a per-animal model exists, return its info.
+      4. Otherwise, fall back to the combined promoted model and
+         record the fallback reason for the UI to surface.
+
+    Returns:
+        {
+            "animal": str | None,
+            "per_animal_version": str | None,  # "v0.1.0" if found
+            "per_animal_dir": Path | None,      # absolute model_v*/ dir
+            "used_fallback": bool,
+            "fallback_reason": str | None,
+            "fallback_version": str | None,    # combined model version
+                                                  # (only when used_fallback)
+        }
+    """
+    animal = extract_animal_letter(str(recording_path)) if recording_path else None
+    artifacts_dir = detector_paths.get_artifacts_dir()
+    out: dict = {
+        "animal": animal,
+        "per_animal_version": None,
+        "per_animal_dir": None,
+        "used_fallback": False,
+        "fallback_reason": None,
+        "fallback_version": None,
+    }
+    if animal is None:
+        out["used_fallback"] = True
+        out["fallback_reason"] = (
+            "Couldn't extract an animal letter from the recording "
+            "filename -- falling back to the combined promoted model."
+        )
+        out["fallback_version"] = detector_paths.get_current_model_version()
+        return out
+    workdir = Path(artifacts_dir) / "per_animal" / animal
+    versions = list_per_animal_versions(workdir)
+    if not versions:
+        out["used_fallback"] = True
+        out["fallback_reason"] = (
+            f"No per-animal model on disk for animal '{animal}' -- "
+            "falling back to the combined promoted model."
+        )
+        out["fallback_version"] = detector_paths.get_current_model_version()
+        return out
+    # Newest version is last (sorted ascending).
+    newest = versions[-1]
+    out["per_animal_version"] = newest
+    out["per_animal_dir"] = workdir / f"model_{newest}"
+    return out
+
 
 def load_model_artifact_cached(version: Optional[str]) -> ModelArtifact:
     """Load (and cache by version string) a `ModelArtifact`.
 
-    `version=None` → the current promoted version (whatever
-    `paths.get_current_model_version()` returns from the shared Drive
-    folder). `version="model_v0.1.0"` → load that explicit version.
-    The "model_" prefix is accepted both with and without (for
-    backward compat with the Streamlit short form "v0.1.0").
+    Three calling shapes:
+      - `version=None` → the current promoted version (whatever
+        `paths.get_current_model_version()` returns from the shared
+        Drive folder).
+      - `version="model_v0.1.0"` / `"v0.1.0"` → that explicit version,
+        loaded from `<artifacts_dir>/model_<version>/`. The "model_"
+        prefix is accepted both with and without.
+      - `version="_per_animal_auto:<recording_path>"` → the inference
+        auto-routing sentinel. Resolves to a per-animal model under
+        `<artifacts_dir>/per_animal/<letter>/model_v*/` based on the
+        recording's filename, OR falls back to the combined promoted
+        model when no per-animal model exists for the recording's
+        animal. Callers that need to surface the fallback to the user
+        (status-bar warning) should call `resolve_per_animal_auto`
+        first to see what got picked.
     """
+    # Per-animal auto-routing sentinel.
+    if version is not None and version.startswith(
+        f"{PER_ANIMAL_AUTO_SENTINEL}:"
+    ):
+        recording_path = version[len(PER_ANIMAL_AUTO_SENTINEL) + 1:]
+        info = resolve_per_animal_auto(recording_path)
+        if info["per_animal_dir"] is not None:
+            # Cache key bakes in the absolute path so two different
+            # animals' per-animal models don't collide on the
+            # "v0.1.0" short version string (each animal's version
+            # counter is independent).
+            cache_key = str(info["per_animal_dir"])
+            if cache_key in _artifact_cache:
+                return _artifact_cache[cache_key]
+            artifact = ModelArtifact.load(info["per_animal_dir"])
+            _artifact_cache[cache_key] = artifact
+            return artifact
+        # Fallback: recurse with the resolved combined version (or
+        # None, which then falls back to the promoted pointer).
+        return load_model_artifact_cached(info["fallback_version"])
+
     if version is None:
         version = detector_paths.get_current_model_version()
         if version is None:

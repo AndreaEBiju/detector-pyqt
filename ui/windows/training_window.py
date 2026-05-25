@@ -25,15 +25,15 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QAction, QKeySequence, QTextCursor
+from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import QAction, QBrush, QColor, QKeySequence, QTextCursor
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView,
     QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
-    QProgressBar, QPushButton, QSpinBox, QSplitter, QTabWidget,
-    QTableWidget, QTableWidgetItem, QTextEdit, QToolBar, QVBoxLayout, QWidget,
-    QDoubleSpinBox,
+    QProgressBar, QProgressDialog, QPushButton, QSpinBox, QSplitter,
+    QTabWidget, QTableWidget, QTableWidgetItem, QTextEdit, QToolBar,
+    QVBoxLayout, QWidget, QDoubleSpinBox,
 )
 
 _repo_root = Path(__file__).resolve().parent.parent.parent
@@ -49,6 +49,10 @@ from detector.manifest import Manifest, ManifestError
 from detector.preprocessing import profiles as detector_profiles
 
 from ui.data import settings as ui_settings
+from ui.widgets.per_animal_table import (
+    PerAnimalTable, normalize_animal_letter,
+)
+from ui.workers.per_animal_train_worker import PerAnimalTrainWorker
 from ui.workers.retrain_worker import (
     RetrainMonitor, list_recent_jobs,
 )
@@ -71,16 +75,30 @@ class TrainingWindow(QMainWindow):
         self._monitor.finished.connect(self._on_retrain_finished)
         self._monitor.failed.connect(self._on_retrain_failed)
 
+        # Per-animal training state. Owned here so the worker outlives
+        # any single tab refresh. None when no job is running.
+        self._per_animal_thread: Optional[QThread] = None
+        self._per_animal_worker: Optional[PerAnimalTrainWorker] = None
+        self._per_animal_progress: Optional[QProgressDialog] = None
+        # Extra files added via the per-animal "Add additional files..."
+        # button. These get trained alongside the manifest-driven recs
+        # but never enter the combined-training manifest. Each entry is
+        # a recording-dict-shaped subset with extra=True. Reset on
+        # window open; not persisted.
+        self._per_animal_extras: list[dict] = []
+
         self._tabs = QTabWidget()
         self._tab_manifest = self._build_manifest_tab()
         self._tab_versions = self._build_versions_tab()
         self._tab_retrain = self._build_retrain_tab()
+        self._tab_per_animal = self._build_per_animal_tab()
         self._tab_convergence = self._build_convergence_tab()
         self._tab_preprocessing = self._build_preprocessing_tab()
         self._tab_settings = self._build_settings_tab()
         self._tabs.addTab(self._tab_manifest, "Manifest")
         self._tabs.addTab(self._tab_versions, "Versions")
         self._tabs.addTab(self._tab_retrain, "Retrain")
+        self._tabs.addTab(self._tab_per_animal, "Per-animal training")
         self._tabs.addTab(self._tab_convergence, "Convergence")
         self._tabs.addTab(self._tab_preprocessing, "Preprocessing")
         self._tabs.addTab(self._tab_settings, "Settings")
@@ -1007,6 +1025,431 @@ class TrainingWindow(QMainWindow):
             pass
 
     # ==================================================================
+    # Per-animal training tab
+    # ==================================================================
+
+    def _build_per_animal_tab(self) -> QWidget:
+        """Per-animal training UI: edit the Animal column inline, see
+        eligible/skipped counts live, optionally add 'extra' recordings
+        that train alongside the manifest but don't enter the combined
+        corpus, kick off a sequential per-animal training round."""
+        w = QWidget()
+        layout = QVBoxLayout(w)
+
+        # Top summary -- updated live as the user edits the animal col.
+        self._pa_summary = QLabel("")
+        self._pa_summary.setStyleSheet("font-weight: bold; padding: 4px;")
+        self._pa_summary.setWordWrap(True)
+        layout.addWidget(self._pa_summary)
+
+        # Per-animal count badges (one chip per letter).
+        self._pa_counts = QLabel("")
+        self._pa_counts.setStyleSheet("font-family: monospace; padding: 2px;")
+        self._pa_counts.setWordWrap(True)
+        layout.addWidget(self._pa_counts)
+
+        # The grouping table.
+        self._pa_table = PerAnimalTable()
+        self._pa_table.set_min_recordings_per_animal(3)
+        self._pa_table.animal_edited.connect(self._on_per_animal_animal_edited)
+        layout.addWidget(self._pa_table, stretch=1)
+
+        # Action row
+        action_row = QHBoxLayout()
+        self._btn_pa_add_files = QPushButton("➕ Add additional files…")
+        self._btn_pa_add_files.setToolTip(
+            "Pick recording files (clean.h5) that aren't in the main "
+            "training manifest. They get tagged with their auto-"
+            "detected animal letter and added to the same per-animal "
+            "training pool, but flagged as 'extra' so they don't enter "
+            "the combined-training manifest."
+        )
+        self._btn_pa_add_files.clicked.connect(self._on_per_animal_add_files)
+        self._btn_pa_clear_extras = QPushButton("Clear extras")
+        self._btn_pa_clear_extras.clicked.connect(
+            self._on_per_animal_clear_extras
+        )
+        self._btn_pa_clear_extras.setEnabled(False)
+        self._btn_pa_train = QPushButton("▶ Train per-animal models")
+        self._btn_pa_train.clicked.connect(self._on_per_animal_train)
+        self._btn_pa_train.setEnabled(False)
+        self._btn_pa_refresh = QPushButton("↻ Refresh")
+        self._btn_pa_refresh.clicked.connect(self._refresh_per_animal_tab)
+        action_row.addWidget(self._btn_pa_add_files)
+        action_row.addWidget(self._btn_pa_clear_extras)
+        action_row.addStretch(1)
+        action_row.addWidget(self._btn_pa_refresh)
+        action_row.addWidget(self._btn_pa_train)
+        layout.addLayout(action_row)
+
+        # Results table (populated after a training round completes).
+        results_box = QGroupBox("Last training results")
+        results_layout = QVBoxLayout(results_box)
+        self._pa_results_label = QLabel("(no per-animal training run yet)")
+        self._pa_results_label.setStyleSheet("color: #aaa; padding: 2px;")
+        results_layout.addWidget(self._pa_results_label)
+        self._pa_results_table = QTableWidget(0, 5)
+        self._pa_results_table.setHorizontalHeaderLabels([
+            "Animal", "Status", "Version", "Elapsed (s)", "Notes",
+        ])
+        self._pa_results_table.setSelectionBehavior(
+            QAbstractItemView.SelectRows
+        )
+        self._pa_results_table.setSelectionMode(
+            QAbstractItemView.SingleSelection
+        )
+        self._pa_results_table.setEditTriggers(
+            QAbstractItemView.NoEditTriggers
+        )
+        self._pa_results_table.setAlternatingRowColors(True)
+        hdr = self._pa_results_table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(4, QHeaderView.Stretch)
+        results_layout.addWidget(self._pa_results_table)
+        layout.addWidget(results_box)
+        return w
+
+    def _refresh_per_animal_tab(self) -> None:
+        """Reload manifest rows + merge in current extras + recompute
+        the summary."""
+        manifest_path = detector_paths.get_manifest_path()
+        if not manifest_path.exists():
+            self._pa_summary.setText(
+                f"No manifest at {manifest_path}. Run `detector init` "
+                "to create one."
+            )
+            self._pa_counts.setText("")
+            self._pa_table.set_recordings([])
+            self._btn_pa_train.setEnabled(False)
+            return
+        try:
+            m = Manifest.load(manifest_path)
+        except Exception as exc:
+            self._pa_summary.setText(f"Failed to load manifest: {exc}")
+            self._pa_counts.setText("")
+            self._pa_table.set_recordings([])
+            self._btn_pa_train.setEnabled(False)
+            return
+        # Include held-out rows so the user can see them in the table,
+        # even though they don't contribute to eligibility counts.
+        recs = m.list_recordings(include_held_out=True)
+        combined = list(recs) + list(self._per_animal_extras)
+        self._pa_table.set_recordings(combined)
+        self._btn_pa_clear_extras.setEnabled(
+            len(self._per_animal_extras) > 0
+        )
+        self._update_per_animal_summary()
+
+    def _update_per_animal_summary(self) -> None:
+        """Repaint the live eligible/skipped/badges header from the
+        table's current state."""
+        s = self._pa_table.summary()
+        n_eligible = s["n_eligible"]
+        n_skipped = s["n_skipped"]
+        unknown = s["unknown"]
+        unknown_txt = (
+            f"  ·  {unknown} recording(s) missing an animal letter "
+            "(edit the Animal column to set one)" if unknown else ""
+        )
+        self._pa_summary.setText(
+            f"{n_eligible} eligible animal(s) (>= 3 recordings each), "
+            f"{n_skipped} skipped (too few recordings){unknown_txt}"
+        )
+        # Per-animal count chips. Highlight letters that are eligible
+        # (n>=3) in green-ish, skipped (n<3) in dim grey.
+        chips = []
+        for letter in sorted(s["groups"].keys()):
+            n = s["groups"][letter]
+            colour = "#4caf50" if n >= 3 else "#888"
+            chips.append(
+                f"<span style='color:{colour}; padding-right:10px;'>"
+                f"<b>{letter}</b>:{n}</span>"
+            )
+        self._pa_counts.setText("  ".join(chips) or
+                                  "<i>(no animals identified)</i>")
+        # Enable training only if at least one eligible animal exists,
+        # and no training is currently running.
+        running = (self._per_animal_thread is not None
+                   and self._per_animal_thread.isRunning())
+        self._btn_pa_train.setEnabled(n_eligible > 0 and not running)
+
+    def _on_per_animal_animal_edited(self, recording_id: str,
+                                       new_letter: object) -> None:
+        """User edited the Animal column. Save back to the manifest
+        (skip if this is an 'extra' row -- those aren't in the
+        manifest) and refresh the summary."""
+        # Track whether the edit belongs to an extra (not in the
+        # manifest) so we update self._per_animal_extras instead.
+        for extra in self._per_animal_extras:
+            if extra.get("recording_id") == recording_id:
+                extra["animal"] = new_letter
+                self._update_per_animal_summary()
+                return
+        # Otherwise it's a manifest row -- persist it.
+        manifest_path = detector_paths.get_manifest_path()
+        try:
+            m = Manifest.load(manifest_path)
+            hit = False
+            for r in m.recordings:
+                if r.get("recording_id") == recording_id:
+                    r["animal"] = new_letter
+                    hit = True
+                    break
+            if not hit:
+                # Stale row (manifest changed under us); refresh to
+                # avoid a silent no-op.
+                self._refresh_per_animal_tab()
+                return
+            m.save(manifest_path)
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Save failed",
+                f"Could not save animal edit to manifest:\n{exc}",
+            )
+            self._refresh_per_animal_tab()
+            return
+        self._update_per_animal_summary()
+        # Notify other tabs / the main window.
+        self.manifest_or_versions_changed.emit()
+
+    def _on_per_animal_add_files(self) -> None:
+        """File-picker for additional recordings to fold into the
+        per-animal pool. Each file is auto-tagged with its detected
+        animal letter and added with extra=True."""
+        from detector.animal_id import extract_animal_letter
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Pick additional recordings to fold into per-animal "
+            "training (clean.h5 files)",
+            "", "Splitter clean.h5 (*_clean.h5);;HDF5 (*.h5);;"
+                "All files (*)",
+        )
+        if not paths:
+            return
+        # Build a set of existing IDs so we don't double-add.
+        existing_ids = {
+            r.get("recording_id") for r in self._pa_table.recordings()
+        }
+        added = 0
+        for p in paths:
+            stem = Path(p).stem
+            # Strip the conventional "_clean" suffix to get the rid.
+            rid = stem[:-len("_clean")] if stem.endswith("_clean") else stem
+            if rid in existing_ids:
+                continue
+            existing_ids.add(rid)
+            self._per_animal_extras.append({
+                "recording_id": rid,
+                "rec_type": ("stim_rec" if "_stim_rec" in rid
+                              else "baseline" if "_bl" in rid
+                              else "unknown"),
+                "held_out": False,
+                "animal": extract_animal_letter(rid),
+                "extra": True,
+                "splitter_clean_path": str(p),
+            })
+            added += 1
+        if added == 0:
+            QMessageBox.information(
+                self, "Nothing to add",
+                "All picked files are already in the table.",
+            )
+            return
+        self._refresh_per_animal_tab()
+
+    def _on_per_animal_clear_extras(self) -> None:
+        if not self._per_animal_extras:
+            return
+        self._per_animal_extras = []
+        self._refresh_per_animal_tab()
+
+    def _on_per_animal_train(self) -> None:
+        """Kick off retrain_per_animal in a background thread. Disables
+        the train button + opens a progress dialog while it runs."""
+        if (self._per_animal_thread is not None
+                and self._per_animal_thread.isRunning()):
+            QMessageBox.information(
+                self, "Already running",
+                "Per-animal training is already in progress.",
+            )
+            return
+        s = self._pa_table.summary()
+        if s["n_eligible"] == 0:
+            QMessageBox.information(
+                self, "Nothing to train",
+                "No animals have >= 3 recordings. Edit the Animal "
+                "column to group recordings, or add more recordings "
+                "for the existing animals first.",
+            )
+            return
+        # If the user added 'extra' files, those aren't in the manifest
+        # we're going to pass to retrain_per_animal -- the orchestrator
+        # only sees Manifest entries. Warn the user before kicking off.
+        if self._per_animal_extras:
+            resp = QMessageBox.question(
+                self, "Extras not yet wired",
+                "You added 'extra' recordings via the Add additional "
+                "files... button, but the orchestrator currently only "
+                "consumes recordings from the training manifest. The "
+                "extras will be IGNORED in this round.\n\n"
+                "Continue anyway?",
+            )
+            if resp != QMessageBox.Yes:
+                return
+        manifest_path = detector_paths.get_manifest_path()
+        artifacts_dir = detector_paths.get_artifacts_dir()
+        # Re-use the existing retrain tab's settings for w_neg/seed/
+        # rebuild flags so the user doesn't have to set them twice.
+        # rebuild_phase2 defaults to True for per-animal because each
+        # sub-corpus needs its own fresh Phase 2 generation.
+        try:
+            self._per_animal_worker = PerAnimalTrainWorker(
+                manifest_path,
+                artifacts_dir=artifacts_dir,
+                only_animals=None,
+                min_recordings_per_animal=3,
+                w_neg=float(self._w_neg_spin.value()),
+                seed=int(self._seed_spin.value()),
+                rebuild_dataset=True,
+                rebuild_phase2=True,
+                rebuild_loro=True,
+                skip_phase2_check=True,
+                skip_review=bool(self._skip_review_cb.isChecked()),
+            )
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Could not start per-animal training", str(exc),
+            )
+            return
+        self._per_animal_thread = QThread()
+        self._per_animal_worker.moveToThread(self._per_animal_thread)
+        self._per_animal_thread.started.connect(
+            self._per_animal_worker.run
+        )
+        self._per_animal_worker.progress.connect(
+            self._on_per_animal_progress
+        )
+        self._per_animal_worker.finished.connect(
+            self._on_per_animal_finished
+        )
+        self._per_animal_worker.error.connect(self._on_per_animal_error)
+        self._per_animal_worker.finished.connect(
+            self._per_animal_thread.quit
+        )
+        self._per_animal_worker.error.connect(
+            self._per_animal_thread.quit
+        )
+        self._per_animal_thread.finished.connect(
+            self._per_animal_worker.deleteLater
+        )
+        self._per_animal_thread.finished.connect(
+            self._per_animal_thread.deleteLater
+        )
+
+        # Range 0..100 because the dialog converts (idx,total) into a
+        # percentage of total animals trained.
+        self._per_animal_progress = QProgressDialog(
+            "Preparing per-animal training…", "Cancel", 0, 100, self,
+        )
+        self._per_animal_progress.setWindowTitle("Per-animal training")
+        self._per_animal_progress.setWindowModality(Qt.WindowModal)
+        self._per_animal_progress.setMinimumDuration(0)
+        # The orchestrator can't be safely cancelled mid-animal -- the
+        # retrain subprocess has its own gates and produces partial
+        # artifacts. So Cancel is best-effort: it just hides the dialog
+        # and stops listening; the background thread keeps running
+        # until the CURRENT animal finishes.
+        self._per_animal_progress.canceled.connect(
+            lambda: self._per_animal_progress.hide()
+        )
+        self._per_animal_progress.setValue(0)
+        self._btn_pa_train.setEnabled(False)
+        self._per_animal_thread.start()
+
+    def _on_per_animal_progress(self, idx: int, total: int,
+                                  animal: str, status: str) -> None:
+        if self._per_animal_progress is None:
+            return
+        # The orchestrator calls the callback twice per animal: once
+        # before training ("starting") and once after (ok/error/skip).
+        # We bucket by completed-animal count for the bar percentage.
+        completed = idx if status != "starting" else max(idx, 0)
+        if total > 0:
+            pct = int(min(100, max(0, 100 * completed / total)))
+        else:
+            pct = 0
+        self._per_animal_progress.setValue(pct)
+        label = (f"Animal {animal} -- {status}"
+                 if status == "starting"
+                 else f"Animal {animal}: {status} "
+                      f"({completed}/{total} done)")
+        self._per_animal_progress.setLabelText(label)
+
+    def _on_per_animal_finished(self, results: dict) -> None:
+        if self._per_animal_progress is not None:
+            self._per_animal_progress.setValue(100)
+            self._per_animal_progress.close()
+            self._per_animal_progress = None
+        self._per_animal_worker = None
+        self._per_animal_thread = None
+        self._render_per_animal_results(results)
+        # Per-animal training writes new model_v*/ subdirs under
+        # per_animal/<animal>/, so the inference auto-routing layer
+        # will pick them up next time. Refresh tabs that depend on
+        # version listings (combined-model versions tab is unaffected
+        # but the main window's per-animal-aware dropdown is).
+        self.manifest_or_versions_changed.emit()
+        self._update_per_animal_summary()
+
+    def _on_per_animal_error(self, message: str) -> None:
+        if self._per_animal_progress is not None:
+            self._per_animal_progress.close()
+            self._per_animal_progress = None
+        self._per_animal_worker = None
+        self._per_animal_thread = None
+        QMessageBox.critical(
+            self, "Per-animal training failed",
+            f"The per-animal orchestrator crashed:\n\n{message}",
+        )
+        self._update_per_animal_summary()
+
+    def _render_per_animal_results(self, results: dict) -> None:
+        """Populate the results table from a retrain_per_animal()
+        return dict."""
+        ok = sum(1 for r in results.values() if r.get("status") == "ok")
+        err = sum(1 for r in results.values() if r.get("status") == "error")
+        skip = sum(1 for r in results.values() if r.get("status") == "skipped")
+        self._pa_results_label.setText(
+            f"<b>{ok}</b> trained · <b>{err}</b> failed · "
+            f"<b>{skip}</b> skipped"
+        )
+        # Sort: ok first (alphabetically), then errors, then skips.
+        order = {"ok": 0, "error": 1, "skipped": 2}
+        rows = sorted(
+            results.items(),
+            key=lambda kv: (order.get(kv[1].get("status"), 3), kv[0]),
+        )
+        self._pa_results_table.setRowCount(len(rows))
+        for i, (animal, r) in enumerate(rows):
+            status = r.get("status", "?")
+            version = r.get("new_version") or r.get("model_dir") or "—"
+            elapsed = r.get("elapsed_s")
+            elapsed_s = f"{elapsed:.1f}" if isinstance(elapsed, (int, float)) else "—"
+            notes = r.get("reason") or r.get("error") or ""
+            if status == "ok" and r.get("promoted"):
+                notes = "promoted" + (f" · {notes}" if notes else "")
+            cells = [animal, status, str(version), elapsed_s, str(notes)]
+            for col, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                if status == "error":
+                    item.setForeground(QBrush(QColor("#c44")))
+                elif status == "skipped":
+                    item.setForeground(QBrush(QColor("#888")))
+                self._pa_results_table.setItem(i, col, item)
+
+    # ==================================================================
     # Convergence tab
     # ==================================================================
 
@@ -1471,6 +1914,7 @@ class TrainingWindow(QMainWindow):
         self._refresh_manifest_tab()
         self._refresh_versions_tab()
         self._refresh_retrain_tab()
+        self._refresh_per_animal_tab()
         # The convergence-tab dropdown is keyed off list_versions(),
         # which changes after a retrain. Repopulating here picks up
         # the newly trained model automatically.

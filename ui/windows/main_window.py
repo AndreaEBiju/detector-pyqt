@@ -61,8 +61,9 @@ from ui.widgets.overview_strip import OverviewStrip
 from ui.widgets.predictions_panel import PredictionsPanel
 from ui.widgets.review_panel import ReviewPanel
 from ui.workers.inference_worker import (
-    InferenceWorker, current_promoted_version_short,
-    load_model_artifact_cached,
+    InferenceWorker, PER_ANIMAL_AUTO_SENTINEL,
+    current_promoted_version_short, load_model_artifact_cached,
+    resolve_per_animal_auto,
 )
 from ui.workers.heldout_eval_worker import (
     HeldoutEvalWorker, HeldoutEvalMultiModelWorker,
@@ -838,11 +839,20 @@ class MainWindow(QMainWindow):
         else:
             promoted = current_promoted_version_short()
             preferred = self._settings.get("model_version") or promoted
+            # First entry: per-animal auto-routing sentinel. Stored
+            # as a literal magic string in the combo's data role; the
+            # actual recording path gets appended in
+            # _on_run_inference (see _resolve_dropdown_version()).
+            self._version_combo.addItem(
+                "per-animal (auto)", PER_ANIMAL_AUTO_SENTINEL,
+            )
             for v in versions:
                 # Mark the promoted version in the dropdown.
                 label = f"{v} ★" if v == promoted else v
                 self._version_combo.addItem(label, v)
-            # Select the preferred version if present.
+            # Select the preferred version if present. The per-animal
+            # sentinel can also be preferred (e.g. if the user picked
+            # it last session and we persisted it).
             if preferred:
                 for i in range(self._version_combo.count()):
                     if self._version_combo.itemData(i) == preferred:
@@ -1779,8 +1789,35 @@ class MainWindow(QMainWindow):
                 "model folder via `detector init` (CLI).",
             )
             return
+        # Per-animal auto-routing: resolve which per-animal model to use
+        # based on the current recording's filename. If no per-animal
+        # model exists, fall back to the combined promoted model and
+        # surface a status-bar warning so the user knows what got loaded.
+        resolved_label = version
+        if version == PER_ANIMAL_AUTO_SENTINEL:
+            rec_path = (self._recording.source_path
+                        if self._recording is not None else None)
+            info = resolve_per_animal_auto(rec_path)
+            if info.get("used_fallback"):
+                fb_ver = info.get("fallback_version") or "promoted"
+                self.statusBar().showMessage(
+                    f"per-animal (auto): {info.get('fallback_reason')} "
+                    f"using {fb_ver}",
+                    10_000,
+                )
+                resolved_label = f"combined ({fb_ver})"
+            else:
+                resolved_label = (
+                    f"per-animal {info['animal']} "
+                    f"{info['per_animal_version']}"
+                )
+            # Embed the recording path into the sentinel so
+            # load_model_artifact_cached can dispatch correctly.
+            cache_lookup = f"{PER_ANIMAL_AUTO_SENTINEL}:{rec_path}"
+        else:
+            cache_lookup = version
         try:
-            artifact = load_model_artifact_cached(version)
+            artifact = load_model_artifact_cached(cache_lookup)
         except Exception as exc:
             QMessageBox.critical(
                 self, "Failed to load model",
@@ -1840,7 +1877,7 @@ class MainWindow(QMainWindow):
 
         self._inference_thread.start()
         self.statusBar().showMessage(
-            f"running inference with model {version} "
+            f"running inference with model {resolved_label} "
             f"(scope = {'recovery_only' if offset else 'full'}) …"
         )
 
@@ -2267,6 +2304,29 @@ class MainWindow(QMainWindow):
                     "running bulk inference.",
                 )
                 return
+            # Bulk inference uses ONE model for the whole queue (output
+            # filenames embed it). The per-animal auto-routing sentinel
+            # is per-recording, so it doesn't make sense here -- fall
+            # back to the combined promoted model and notify the user.
+            if version_short == PER_ANIMAL_AUTO_SENTINEL:
+                fallback = current_promoted_version_short()
+                if not fallback:
+                    QMessageBox.critical(
+                        self, "No fallback model",
+                        "Bulk inference can't use the per-animal auto-"
+                        "routing entry (one model per run). No combined "
+                        "promoted model is available either -- pick an "
+                        "explicit version from the toolbar.",
+                    )
+                    return
+                QMessageBox.information(
+                    self, "Per-animal auto disabled for bulk",
+                    "Bulk inference runs one model across the whole queue, "
+                    "so the per-animal auto-routing entry isn't supported "
+                    f"here. Using the combined promoted model "
+                    f"({fallback}) instead.",
+                )
+                version_short = fallback
             artifacts_dir = detector_paths.get_artifacts_dir()
             dir_name = (version_short if version_short.startswith("model_")
                          else f"model_{version_short}")
