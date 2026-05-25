@@ -406,11 +406,13 @@ class MainWindow(QMainWindow):
 
     def _run_heldout_eval(self) -> None:
         """Kick off `detector heldout_eval.evaluate_heldout` in a
-        background thread. Shows a progress dialog while running;
-        opens a results dialog when done. The model used is whichever
-        version the main toolbar dropdown currently has selected."""
+        background thread. Shows a model picker first (defaults to the
+        toolbar dropdown's current selection), then a progress dialog
+        while running, then a results dialog when done."""
         from PySide6.QtCore import QThread, Qt
-        from PySide6.QtWidgets import QProgressDialog, QMessageBox
+        from PySide6.QtWidgets import (
+            QInputDialog, QProgressDialog, QMessageBox,
+        )
         from detector import paths as _detector_paths
         from detector.manifest import Manifest as _Manifest
 
@@ -445,14 +447,57 @@ class MainWindow(QMainWindow):
             )
             return
 
-        # Pick the model artifact -- use whatever's in the toolbar combo.
+        # ------------------------------------------------------------
+        # Model picker
+        # ------------------------------------------------------------
+        # Show a chooser populated from the same versions list the
+        # toolbar dropdown uses. Default the highlighted item to
+        # whatever the toolbar currently has selected -- the user is
+        # most likely evaluating "the model I'm working with right
+        # now". The ★ marker on the promoted version is preserved so
+        # it's obvious which one is currently in production.
+        versions = list_available_versions()
+        if not versions:
+            QMessageBox.critical(
+                self, "No model versions",
+                "No model versions found on disk. Train at least one "
+                "model before running held-out evaluation.",
+            )
+            return
+        promoted = current_promoted_version_short()
+        toolbar_choice = (
+            self._version_combo.currentData()
+            if hasattr(self, "_version_combo") and self._version_combo
+            else None
+        )
+        labels = [f"{v} ★" if v == promoted else v for v in versions]
+        # Map label -> raw version (the ★ suffix is display-only).
+        label_to_version = dict(zip(labels, versions))
+        default_version = toolbar_choice or promoted or versions[0]
         try:
-            version_short = current_promoted_version_short()
-            artifact = load_model_artifact_cached(None)
+            default_idx = versions.index(default_version)
+        except ValueError:
+            default_idx = 0
+
+        chosen_label, ok = QInputDialog.getItem(
+            self,
+            "Choose model for held-out evaluation",
+            (f"Evaluate {len(held)} held-out recording(s) against "
+             "which model?\n\n(★ = currently promoted)"),
+            labels,
+            current=default_idx,
+            editable=False,
+        )
+        if not ok:
+            return   # user cancelled
+        version_short = label_to_version[chosen_label]
+
+        try:
+            artifact = load_model_artifact_cached(version_short)
         except Exception as e:
             QMessageBox.critical(
                 self, "Model load failed",
-                f"Could not load model artifact:\n{e}",
+                f"Could not load model artifact {version_short}:\n{e}",
             )
             return
 
