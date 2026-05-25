@@ -129,6 +129,7 @@ class HeldoutEvalMultiModelWorker(QObject):
         *,
         rec_ids: Optional[list[str]] = None,
         n_workers: Optional[int] = None,
+        parallelize: str = "recordings",
         parent: Optional[QObject] = None,
     ):
         super().__init__(parent)
@@ -136,6 +137,11 @@ class HeldoutEvalMultiModelWorker(QObject):
         self._artifact_paths = [Path(p) for p in artifact_paths]
         self._rec_ids = list(rec_ids) if rec_ids else None
         self._n_workers = n_workers
+        # "recordings" | "flat" -- forwarded straight to the backend.
+        # The backend may still fall back from "flat" to "recordings"
+        # if the RAM cap drops below 2 workers; the resulting report
+        # carries `_parallelize_used` so the dialog can surface it.
+        self._parallelize = parallelize
 
     @Slot()
     def run(self) -> None:
@@ -152,6 +158,7 @@ class HeldoutEvalMultiModelWorker(QObject):
                 progress_callback=_cb,
                 interval_cache=interval_cache,
                 n_workers=self._n_workers,
+                parallelize=self._parallelize,
             )
             self.finished.emit(report, interval_cache)
         except Exception as e:

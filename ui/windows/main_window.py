@@ -671,6 +671,7 @@ class MainWindow(QMainWindow):
         if picker.exec() != HeldoutMultiModelPicker.Accepted:
             return
         chosen = picker.chosen_versions()
+        chosen_parallelize = picker.chosen_parallelize()
         if len(chosen) < 2:
             return   # safety net; picker already validates
 
@@ -700,6 +701,7 @@ class MainWindow(QMainWindow):
         self._heldout_multi_thread = QThread()
         self._heldout_multi_worker = HeldoutEvalMultiModelWorker(
             manifest_path, artifact_paths,
+            parallelize=chosen_parallelize,
         )
         self._heldout_multi_worker.moveToThread(self._heldout_multi_thread)
         self._heldout_multi_thread.started.connect(

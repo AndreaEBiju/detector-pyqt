@@ -24,9 +24,10 @@ from typing import Optional
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QGroupBox,
-    QHBoxLayout, QHeaderView, QLabel, QMessageBox, QPushButton,
-    QScrollArea, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QButtonGroup, QCheckBox, QDialog, QDialogButtonBox, QFileDialog,
+    QGroupBox, QHBoxLayout, QHeaderView, QLabel, QMessageBox,
+    QPushButton, QRadioButton, QScrollArea, QTableWidget,
+    QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 
@@ -83,6 +84,56 @@ class HeldoutMultiModelPicker(QDialog):
         layout.addWidget(self._count_label)
         self._update_count()
 
+        # ---- Parallelization mode ----------------------------------
+        # Default recommendation depends on detected RAM. We surface
+        # the hint via the option's subtitle so the user knows which
+        # to pick without reading docs.
+        para_box = QGroupBox("Parallelization")
+        para_l = QVBoxLayout(para_box)
+        para_l.addWidget(QLabel(
+            "<i>How to parallelize when running models against "
+            "recordings.</i>"
+        ))
+        self._parallelize_group = QButtonGroup(self)
+        self._radio_recordings = QRadioButton(
+            "Across recordings (recommended, safest)"
+        )
+        self._radio_recordings.setToolTip(
+            "One worker per recording; models run sequentially inside "
+            "each worker. Each recording's signal is loaded once. "
+            "Bounded by len(held_recs), so no benefit beyond that many "
+            "cores -- but it's the safest on memory-constrained "
+            "machines and never reloads the same recording."
+        )
+        self._radio_flat = QRadioButton(
+            "Fully parallel (across recordings AND models)"
+        )
+        self._radio_flat.setToolTip(
+            "Flattens (recording, model) pairs into one job each. "
+            "Higher parallelism on high-core boxes with few recordings; "
+            "the same recording may be loaded by multiple workers "
+            "concurrently (more peak RAM). The backend auto-caps the "
+            "worker count to fit available RAM (with a 20% safety "
+            "buffer) and falls back to 'across recordings' if the cap "
+            "drops below 2 workers."
+        )
+        self._parallelize_group.addButton(self._radio_recordings, 0)
+        self._parallelize_group.addButton(self._radio_flat, 1)
+        para_l.addWidget(self._radio_recordings)
+        para_l.addWidget(self._radio_flat)
+        # Auto-recommend "flat" only on machines with both spare cores
+        # AND ample RAM. Otherwise default to the safer mode.
+        recommend_flat = self._machine_can_handle_flat()
+        if recommend_flat:
+            self._radio_flat.setChecked(True)
+            self._radio_flat.setText(
+                "Fully parallel (across recordings AND models) — "
+                "recommended for your machine"
+            )
+        else:
+            self._radio_recordings.setChecked(True)
+        layout.addWidget(para_box)
+
         btn_box = QDialogButtonBox(
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel
         )
@@ -90,6 +141,28 @@ class HeldoutMultiModelPicker(QDialog):
         btn_box.rejected.connect(self.reject)
         layout.addWidget(btn_box)
         self._btn_box = btn_box
+
+    @staticmethod
+    def _machine_can_handle_flat() -> bool:
+        """Recommend 'flat' mode only when the machine has BOTH:
+          - many cores (>= 8)  -- otherwise per-recording parallelism
+            already saturates the CPU
+          - ample RAM (>= 24 GB)  -- so a few extra concurrent signal
+            loads don't push us toward OOM
+        Conservative threshold: errs on the side of recommending the
+        safer mode. Users with edge-case hardware can flip the radio
+        regardless of recommendation."""
+        try:
+            import os as _os
+            cpu = _os.cpu_count() or 4
+        except Exception:
+            cpu = 4
+        try:
+            import psutil
+            ram_gb = psutil.virtual_memory().total / (1024 ** 3)
+        except Exception:
+            ram_gb = 8.0
+        return cpu >= 8 and ram_gb >= 24.0
 
     def _enforce_cap(self, _state: int) -> None:
         """When user already has `max_models` checked, the other
@@ -125,6 +198,13 @@ class HeldoutMultiModelPicker(QDialog):
 
     def chosen_versions(self) -> list[str]:
         return self._chosen_versions()
+
+    def chosen_parallelize(self) -> str:
+        """Returns the backend's parallelize= argument: 'flat' or
+        'recordings'. The picker exposes it as a radio above OK."""
+        if self._radio_flat.isChecked():
+            return "flat"
+        return "recordings"
 
 
 # ----------------------------------------------------------------------
@@ -182,11 +262,36 @@ class HeldoutMultiModelDialog(QDialog):
         root = QVBoxLayout(self)
 
         # ---- Header --------------------------------------------------
+        # Surface the parallelize-used audit fields so the user can see
+        # whether a "flat" request was honored or fell back to
+        # "recordings" mode under RAM pressure (the backend records
+        # this in _parallelize_used / _workers_cap_reason).
+        para_req = report.get("_parallelize_requested", "?")
+        para_used = report.get("_parallelize_used", "?")
+        n_workers_used = report.get("_n_workers_used", "?")
+        para_note = ""
+        if para_req != "?" and para_used != "?":
+            if para_req != para_used:
+                para_note = (
+                    f"     <span style='color:#d62728;'>"
+                    f"<b>Parallelization:</b> requested <i>{para_req}</i> → "
+                    f"fell back to <i>{para_used}</i> "
+                    f"({n_workers_used} workers)</span>"
+                )
+            else:
+                para_note = (
+                    f"     <b>Parallelization:</b> {para_used} "
+                    f"({n_workers_used} workers)"
+                )
         header = QLabel(
             f"<b>Models:</b> {', '.join(versions) or '—'}     "
             f"<b>Held-out recordings:</b> {n_targeted}"
+            f"{para_note}"
         )
         header.setTextFormat(Qt.RichText)
+        header.setToolTip(
+            str(report.get("_workers_cap_reason", ""))
+        )
         root.addWidget(header)
 
         if not models or n_targeted == 0:
