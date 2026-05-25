@@ -487,6 +487,71 @@ class TrainingWindow(QMainWindow):
             "lower (toward 1.0) to keep the manifest authoritative."
         )
         form.addRow("review FN weight", self._review_fn_weight_spin)
+
+        # ----- Auto-FN (model-driven FN identification) ----------------
+        # Run the picked model on the training corpus before training,
+        # find label=1 rows where prev_model_proba < threshold (these
+        # are misses the previous model makes on its own training data),
+        # bump their weight to auto_fn_weight. Direct recall recovery
+        # signal -- targets what the current model is actually missing
+        # instead of what the manifest mislabeled.
+        self._auto_fn_check = QCheckBox(
+            "Enable auto-FN: bump rows the previous model misses"
+        )
+        self._auto_fn_check.setToolTip(
+            "Pre-train step. Run the model picked below on the FULL "
+            "training corpus, find every label=1 row whose predicted "
+            "probability is BELOW threshold (= rows the previous model "
+            "is currently missing), and bump those rows' sample_weight "
+            "to 'auto-FN weight'. Sidecar JSON auto_fn_corrections.json "
+            "in the new artifact dir records exactly which rows were "
+            "flagged + their prev-model probabilities."
+        )
+        self._auto_fn_check.toggled.connect(self._on_auto_fn_toggled)
+        form.addRow(self._auto_fn_check)
+        # Model picker (populated lazily when the user opens this dialog
+        # so freshly-trained models are visible without restart).
+        self._auto_fn_model_combo = QComboBox()
+        self._auto_fn_model_combo.setToolTip(
+            "Which model's misses to identify. Default: the currently "
+            "promoted model (★)."
+        )
+        self._auto_fn_model_combo.setEnabled(False)
+        self._populate_auto_fn_model_combo()
+        form.addRow("auto-FN model", self._auto_fn_model_combo)
+        self._auto_fn_weight_spin = QDoubleSpinBox()
+        self._auto_fn_weight_spin.setRange(0.5, 20.0)
+        self._auto_fn_weight_spin.setSingleStep(0.5)
+        self._auto_fn_weight_spin.setDecimals(1)
+        self._auto_fn_weight_spin.setValue(5.0)
+        self._auto_fn_weight_spin.setEnabled(False)
+        self._auto_fn_weight_spin.setToolTip(
+            "Sample-weight applied to rows the auto-FN scan flags as "
+            "currently-missed positives. Default 5.0 -- 5x stronger "
+            "than the default review FN weight because auto-FN is "
+            "targeting actual current misses (high signal) vs review-"
+            "judgment manifest corrections (lower-signal label fixes). "
+            "Raise to 6-10 for aggressive recall recovery; lower toward "
+            "3.0 to be gentler."
+        )
+        form.addRow("auto-FN weight", self._auto_fn_weight_spin)
+        self._auto_fn_max_spin = QSpinBox()
+        self._auto_fn_max_spin.setRange(0, 1_000_000)
+        self._auto_fn_max_spin.setSingleStep(500)
+        self._auto_fn_max_spin.setValue(3000)
+        self._auto_fn_max_spin.setEnabled(False)
+        self._auto_fn_max_spin.setToolTip(
+            "Cap on how many rows to bump. The auto-FN scan can flag "
+            "thousands of label=1 rows as currently missed; applying "
+            "all at once may dominate the next training pass. The cap "
+            "picks the LOWEST-probability rows first (= most "
+            "confidently missed). 0 = no cap. Default 3000 is "
+            "conservative; raise to 10000+ if the previous model's "
+            "recall is very low and you want strong recovery."
+        )
+        form.addRow("auto-FN max corrections (0 = no cap)",
+                     self._auto_fn_max_spin)
+
         layout.addWidget(ctrl_box)
 
         # Action row
@@ -575,6 +640,62 @@ class TrainingWindow(QMainWindow):
         )
         if path:
             self._review_dir_edit.setText(path)
+
+    # ------------------------------------------------------------------
+    # Auto-FN UI helpers
+    # ------------------------------------------------------------------
+
+    def _on_auto_fn_toggled(self, checked: bool) -> None:
+        """Enable/disable the auto-FN sub-controls in lockstep with
+        the master checkbox so the user can't accidentally configure
+        a value that won't get used."""
+        self._auto_fn_model_combo.setEnabled(checked)
+        self._auto_fn_weight_spin.setEnabled(checked)
+        self._auto_fn_max_spin.setEnabled(checked)
+        if checked and self._auto_fn_model_combo.count() == 0:
+            # Re-populate -- maybe a fresh model landed in artifacts/.
+            self._populate_auto_fn_model_combo()
+
+    def _populate_auto_fn_model_combo(self) -> None:
+        """Fill the picker with every model_v*/ on disk. Highlight the
+        currently-promoted one (★) and pre-select it."""
+        from detector.predict import list_available_versions
+        try:
+            from ui.workers.inference_worker import (
+                current_promoted_version_short,
+            )
+            promoted = current_promoted_version_short()
+        except Exception:
+            promoted = None
+        self._auto_fn_model_combo.clear()
+        versions = list_available_versions()
+        if not versions:
+            self._auto_fn_model_combo.addItem("(no models on disk)", None)
+            self._auto_fn_model_combo.setEnabled(False)
+            return
+        for v in versions:
+            label = f"{v} ★" if v == promoted else v
+            self._auto_fn_model_combo.addItem(label, v)
+        # Default to the promoted version when available.
+        if promoted:
+            for i in range(self._auto_fn_model_combo.count()):
+                if self._auto_fn_model_combo.itemData(i) == promoted:
+                    self._auto_fn_model_combo.setCurrentIndex(i)
+                    break
+
+    def _resolved_auto_fn_model_path(self):
+        """Returns the path to the auto-FN model's artifact dir, or
+        None when auto-FN is disabled / no models exist."""
+        if not self._auto_fn_check.isChecked():
+            return None
+        version = self._auto_fn_model_combo.currentData()
+        if not version:
+            return None
+        from detector import paths as detector_paths
+        artifacts_dir = detector_paths.get_artifacts_dir()
+        dir_name = (version if version.startswith("model_")
+                    else f"model_{version}")
+        return artifacts_dir / dir_name
 
     def _on_start_retrain(self) -> None:
         # Pre-flight readiness check BEFORE we spawn anything.
@@ -669,6 +790,12 @@ class TrainingWindow(QMainWindow):
                 review_dir=review_dir,
                 review_fp_weight=float(self._review_fp_weight_spin.value()),
                 review_fn_weight=float(self._review_fn_weight_spin.value()),
+                auto_fn_model_path=self._resolved_auto_fn_model_path(),
+                auto_fn_weight=float(self._auto_fn_weight_spin.value()),
+                auto_fn_max_corrections=(
+                    int(self._auto_fn_max_spin.value())
+                    if self._auto_fn_max_spin.value() > 0 else None
+                ),
             )
         except Exception as exc:
             QMessageBox.critical(self, "Start retrain failed", str(exc))
