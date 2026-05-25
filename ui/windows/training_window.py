@@ -1398,6 +1398,21 @@ class AddRecordingDialog(QDialog):
         form.addRow("n_channels", self._n_ch_spin)
         self._notes_edit = QLineEdit()
         form.addRow("notes", self._notes_edit)
+        # Held-out flag. When checked, this recording is EXCLUDED from
+        # the training corpus (manifest.list_recordings filters it out
+        # by default) and shows up only in the held-out evaluator
+        # (Tools -> Held-out evaluation). Use this for fresh-eye
+        # ground-truth recordings from never-seen animals, so we can
+        # measure honest generalization across retrains.
+        self._held_out_check = QCheckBox(
+            "Hold out from training (use only for evaluation)"
+        )
+        self._held_out_check.setToolTip(
+            "Recording will be EXCLUDED from training corpus and used "
+            "only by the held-out evaluator to measure model-vs-human "
+            "accuracy on never-trained data."
+        )
+        form.addRow("held_out", self._held_out_check)
 
         button_box = QDialogButtonBox(
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel
@@ -1537,6 +1552,7 @@ class AddRecordingDialog(QDialog):
             "added_by": "pyqt_ui",
             "notes": self._notes_edit.text(),
             "model_version_last_trained_on": None,
+            "held_out": bool(self._held_out_check.isChecked()),
         }
         # Optional: only set splitter_baseline_path if user picked one.
         # An empty field means "let the resolution fallback in

@@ -64,6 +64,7 @@ from ui.workers.inference_worker import (
     InferenceWorker, current_promoted_version_short,
     load_model_artifact_cached,
 )
+from ui.workers.heldout_eval_worker import HeldoutEvalWorker
 
 
 UNDO_DEPTH = 20
@@ -111,6 +112,12 @@ class MainWindow(QMainWindow):
         self._inference_thread: Optional[QThread] = None
         self._inference_worker: Optional[InferenceWorker] = None
         self._inference_progress: Optional[QProgressDialog] = None
+        # Held-out evaluation -- separate worker/thread/dialog refs so
+        # the user can still use the labeling UI while it runs in the
+        # background.
+        self._heldout_thread: Optional[QThread] = None
+        self._heldout_worker: Optional[HeldoutEvalWorker] = None
+        self._heldout_progress: Optional[QProgressDialog] = None
         # Settings shape: {"model_version", "auto_run_on_open",
         # "inference_skip_stim", "last_recording_dir"}.
         self._settings = ui_settings.load_settings()
@@ -303,6 +310,15 @@ class MainWindow(QMainWindow):
         self._action_show_queue.setCheckable(True)
         self._action_show_queue.toggled.connect(self._on_toggle_queue_panel)
         tools_menu.addAction(self._action_show_queue)
+        # Held-out evaluation: runs the current model against every
+        # manifest entry tagged held_out=True (which are excluded from
+        # training), reports per-sample model-vs-human agreement. The
+        # honest generalization metric: "how well does the model do
+        # on animals/recordings it has never seen?"
+        tools_menu.addSeparator()
+        self._action_heldout_eval = QAction("Held-out evaluation…", self)
+        self._action_heldout_eval.triggered.connect(self._run_heldout_eval)
+        tools_menu.addAction(self._action_heldout_eval)
 
         # Help menu. On macOS, Qt's `TextHeuristicRole` (default) auto-
         # moves actions named "About" / "Preferences" / "Quit" into
@@ -375,6 +391,128 @@ class MainWindow(QMainWindow):
         self._training_window.show()
         self._training_window.raise_()
         self._training_window.activateWindow()
+
+    # ------------------------------------------------------------------
+    # Held-out evaluation
+    # ------------------------------------------------------------------
+
+    def _run_heldout_eval(self) -> None:
+        """Kick off `detector heldout_eval.evaluate_heldout` in a
+        background thread. Shows a progress dialog while running;
+        opens a results dialog when done. The model used is whichever
+        version the main toolbar dropdown currently has selected."""
+        from PySide6.QtCore import QThread, Qt
+        from PySide6.QtWidgets import QProgressDialog, QMessageBox
+        from detector import paths as _detector_paths
+        from detector.manifest import Manifest as _Manifest
+
+        manifest_path = _detector_paths.get_manifest_path()
+        if not manifest_path.exists():
+            QMessageBox.warning(
+                self, "No manifest",
+                f"No training manifest at:\n{manifest_path}\n\n"
+                "Run `detector init` or add at least one recording first.",
+            )
+            return
+
+        # Sanity-check that at least one recording is marked held_out=True
+        # before spinning up the worker. Otherwise the dialog just shows
+        # "0 recordings evaluated" -- friendlier to catch it here.
+        try:
+            m = _Manifest.load(manifest_path)
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Manifest load failed",
+                f"Could not load manifest:\n{e}",
+            )
+            return
+        held = [r for r in m.list_recordings(include_held_out=True)
+                if r.get("held_out", False)]
+        if not held:
+            QMessageBox.information(
+                self, "No held-out recordings",
+                "No recordings in the manifest are marked held_out=True.\n\n"
+                "Hold-out a recording by checking 'Hold out from training' "
+                "in Training Management → Add recording.",
+            )
+            return
+
+        # Pick the model artifact -- use whatever's in the toolbar combo.
+        try:
+            version_short = current_promoted_version_short()
+            artifact = load_model_artifact_cached(None)
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Model load failed",
+                f"Could not load model artifact:\n{e}",
+            )
+            return
+
+        # Background worker + progress dialog.
+        self._heldout_thread = QThread()
+        self._heldout_worker = HeldoutEvalWorker(
+            manifest_path, artifact,
+        )
+        self._heldout_worker.moveToThread(self._heldout_thread)
+        self._heldout_thread.started.connect(self._heldout_worker.run)
+        self._heldout_worker.progress.connect(self._on_heldout_progress)
+        self._heldout_worker.finished.connect(self._on_heldout_finished)
+        self._heldout_worker.error.connect(self._on_heldout_error)
+        self._heldout_worker.finished.connect(self._heldout_thread.quit)
+        self._heldout_worker.error.connect(self._heldout_thread.quit)
+        self._heldout_thread.finished.connect(
+            self._heldout_worker.deleteLater
+        )
+        self._heldout_thread.finished.connect(
+            self._heldout_thread.deleteLater
+        )
+
+        # Progress is per-recording (0 .. n_held); start at 0.
+        self._heldout_progress = QProgressDialog(
+            f"Evaluating held-out recordings (0/{len(held)}) …",
+            "Cancel", 0, len(held), self,
+        )
+        self._heldout_progress.setWindowTitle(
+            f"Held-out evaluation — model {version_short or '(unknown)'}"
+        )
+        self._heldout_progress.setWindowModality(Qt.WindowModal)
+        self._heldout_progress.setMinimumDuration(0)
+        # Cancel is best-effort: detector.predict has no cancel hook,
+        # so closing the dialog stops the UI updates but the eval
+        # finishes in the background. Same UX as the inference worker.
+        self._heldout_progress.canceled.connect(
+            lambda: self._action_heldout_eval.setEnabled(True)
+        )
+
+        self._action_heldout_eval.setEnabled(False)
+        self._heldout_thread.start()
+
+    def _on_heldout_progress(self, idx: int, total: int, rid: str) -> None:
+        if self._heldout_progress is None:
+            return
+        self._heldout_progress.setMaximum(total)
+        self._heldout_progress.setValue(idx)
+        self._heldout_progress.setLabelText(
+            f"Evaluating held-out recordings ({idx+1}/{total}) …\n{rid}"
+        )
+
+    def _on_heldout_finished(self, report: dict) -> None:
+        if self._heldout_progress is not None:
+            self._heldout_progress.close()
+            self._heldout_progress = None
+        self._action_heldout_eval.setEnabled(True)
+        # Lazy import to avoid circulars on startup.
+        from ui.dialogs.heldout_eval_dialog import HeldoutEvalDialog
+        dlg = HeldoutEvalDialog(report, self)
+        dlg.exec()
+
+    def _on_heldout_error(self, msg: str) -> None:
+        from PySide6.QtWidgets import QMessageBox
+        if self._heldout_progress is not None:
+            self._heldout_progress.close()
+            self._heldout_progress = None
+        self._action_heldout_eval.setEnabled(True)
+        QMessageBox.critical(self, "Held-out evaluation failed", msg)
 
     def _build_toolbar(self) -> None:
         tb = QToolBar("Main")
