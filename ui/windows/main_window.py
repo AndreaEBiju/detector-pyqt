@@ -40,14 +40,13 @@ import numpy as np
 from PySide6.QtCore import Qt, QThread, QTimer
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDockWidget, QFileDialog, QInputDialog, QLabel,
+    QComboBox, QDockWidget, QFileDialog, QInputDialog, QLabel,
     QMainWindow, QMessageBox, QProgressDialog, QPushButton, QStatusBar,
     QTabWidget, QToolBar, QWidget,
 )
 
 from detector import paths as detector_paths
 from detector import review as detector_review
-from detector.baseline import compute_baseline as _compute_baseline
 from detector.recording_io import Recording, load_recording
 from detector.labeled_save import (
     save_native, save_matlab_compatible, save_period_split,
@@ -66,6 +65,7 @@ from ui.workers.inference_worker import (
     load_model_artifact_cached,
 )
 from ui.workers.heldout_eval_worker import HeldoutEvalWorker
+from ui.workers.baseline_worker import BaselineWorker
 
 
 UNDO_DEPTH = 20
@@ -119,6 +119,13 @@ class MainWindow(QMainWindow):
         self._heldout_thread: Optional[QThread] = None
         self._heldout_worker: Optional[HeldoutEvalWorker] = None
         self._heldout_progress: Optional[QProgressDialog] = None
+        # Background baseline.h5 computation (runs after Save). Only
+        # one in flight at a time — a second save while the prior
+        # baseline is still computing is blocked at _save_to entry
+        # rather than queued, since they'd race on the same on-disk
+        # baseline.h5 path.
+        self._baseline_thread: Optional[QThread] = None
+        self._baseline_worker: Optional[BaselineWorker] = None
         # Settings shape: {"model_version", "auto_run_on_open",
         # "inference_skip_stim", "last_recording_dir"}.
         self._settings = ui_settings.load_settings()
@@ -1206,6 +1213,22 @@ class MainWindow(QMainWindow):
         self._save_to(clean_path, mat_path, seg_path)
 
     def _save_to(self, clean_path: Path, mat_path: Path, seg_path: Path) -> None:
+        # Block re-entry while a prior baseline is still computing in
+        # the background -- otherwise two BaselineWorkers would race
+        # on the same on-disk baseline.h5. The clean/bad/.mat/seg
+        # writes themselves are fast (sub-second) and would succeed,
+        # but the second compute_baseline would step on the first's
+        # output. Simpler to block until the prior one lands.
+        if (self._baseline_thread is not None
+                and self._baseline_thread.isRunning()):
+            QMessageBox.information(
+                self, "Baseline still computing",
+                "The previous Save's baseline.h5 is still being "
+                "computed in the background. Wait for the status "
+                "bar to show \"baseline ready\" before saving again.",
+            )
+            return
+
         rec = self._recording
         intervals = self._bad_intervals
         sources = self._bad_sources
@@ -1241,57 +1264,6 @@ class MainWindow(QMainWindow):
                 model_version=self._model_version,
                 threshold_used=self._model_threshold_used,
             )
-            # Co-locate the per-recording baseline.h5 next to the
-            # just-written clean.h5 ("Option A" baseline layout). This
-            # was previously skipped at save-time, so the retrain
-            # pipeline had to fall back to the legacy central
-            # `<data_root>/baselines/` dir -- or fail outright on fresh
-            # recordings that had no central-dir entry. Writing the
-            # baseline here means the manifest's splitter_baseline_path
-            # resolution chain finds it next to clean.h5 with zero
-            # config, and a newly-blanked recording is immediately
-            # train-ready.
-            #
-            # Naming: <stem>_baseline.h5 where <stem> matches the
-            # clean.h5's stem with "_clean" stripped. Mirrors the
-            # save_native bad.h5 derivation.
-            stem_for_baseline = clean_path.stem
-            if stem_for_baseline.endswith("_clean"):
-                stem_for_baseline = stem_for_baseline[: -len("_clean")]
-            baseline_path = clean_path.with_name(
-                f"{stem_for_baseline}_baseline.h5"
-            )
-            baseline_msg = ""
-            self.statusBar().showMessage(
-                "Saved clean/bad/.mat -- now computing baseline …", 0,
-            )
-            QApplication.processEvents()   # flush the status message
-            try:
-                _compute_baseline(
-                    rec.recording_id,
-                    paths={
-                        "clean_path": str(clean_path),
-                        "baseline_path": str(baseline_path),
-                        "fs": float(rec.fs),
-                    },
-                    force=True,   # clean.h5 just changed; don't reuse stale cache
-                )
-                baseline_msg = "  ·  baseline.h5 written"
-            except Exception as bx:
-                # Don't fail the whole save -- clean/bad/.mat/seg are
-                # already on disk and useful. Surface the baseline
-                # error in the status bar so the user can investigate.
-                baseline_msg = f"  ·  baseline FAILED: {bx}"
-                QMessageBox.warning(
-                    self, "Baseline computation failed",
-                    "The clean.h5 / bad.h5 / .mat / segments.json were "
-                    "saved successfully, but the per-recording "
-                    "baseline.h5 could not be computed:\n\n"
-                    f"{type(bx).__name__}: {bx}\n\n"
-                    "You can either rerun Save (overwrites all files) "
-                    "or manually run detector.baseline.compute_baseline "
-                    "on the clean.h5 to produce the baseline.",
-                )
             # Per-period split whenever a boundary is set, regardless
             # of filename-derived rec_type. The user may have a
             # generic .mat file (no _stim_rec_ in the name) but still
@@ -1331,17 +1303,102 @@ class MainWindow(QMainWindow):
             # autosave so the next open doesn't offer to restore the
             # stale snapshot.
             self._clear_autosave()
+            # Co-locate the per-recording baseline.h5 next to the
+            # just-written clean.h5 ("Option A" baseline layout). The
+            # compute is offloaded to a Qt worker thread so the UI
+            # doesn't freeze for the 5-15s it takes to scan every
+            # clean chunk on a multi-GB recording. The status-bar line
+            # below shows the save success combined with "computing
+            # baseline (background)…"; the BaselineWorker's
+            # finished/error slots overwrite it when the baseline
+            # lands or fails.
+            #
+            # Naming: <stem>_baseline.h5 where <stem> matches the
+            # clean.h5's stem with "_clean" stripped. Mirrors the
+            # save_native bad.h5 derivation.
+            stem_for_baseline = clean_path.stem
+            if stem_for_baseline.endswith("_clean"):
+                stem_for_baseline = stem_for_baseline[: -len("_clean")]
+            baseline_path = clean_path.with_name(
+                f"{stem_for_baseline}_baseline.h5"
+            )
+            self._start_baseline_worker(
+                rec.recording_id, clean_path, baseline_path, float(rec.fs),
+            )
             self.statusBar().showMessage(
                 f"saved: clean.h5={r_native['n_clean_chunks']} chunks, "
                 f".mat={r_mat['n_intervals']} intervals "
                 f"(user={r_mat['n_user']}, "
                 f"model_accepted={r_mat['n_model_accepted']}, "
                 f"existing={r_mat['n_existing']})"
-                f"{unsure_msg}{split_msg}{baseline_msg}",
-                12_000,
+                f"{unsure_msg}{split_msg}"
+                f"  ·  computing baseline (background) …",
+                0,    # no timeout -- replaced when the baseline worker lands
             )
         except Exception as exc:
             QMessageBox.critical(self, "Save failed", f"{exc}")
+
+    # ------------------------------------------------------------------
+    # Background baseline.h5 computation
+    # ------------------------------------------------------------------
+
+    def _start_baseline_worker(
+        self,
+        recording_id: str,
+        clean_path: Path,
+        baseline_path: Path,
+        fs: float,
+    ) -> None:
+        """Spawn the background BaselineWorker for a just-saved
+        clean.h5. Wires the standard finished -> thread.quit ->
+        deleteLater chain so the QThread doesn't leak when it
+        completes. Re-entry guarding lives in `_save_to` -- by the
+        time we reach this method, any prior baseline has finished.
+        """
+        self._baseline_thread = QThread()
+        self._baseline_worker = BaselineWorker(
+            recording_id, clean_path, baseline_path, fs,
+            force=True,    # clean.h5 just changed; don't reuse stale cache
+        )
+        self._baseline_worker.moveToThread(self._baseline_thread)
+        self._baseline_thread.started.connect(self._baseline_worker.run)
+        self._baseline_worker.finished.connect(self._on_baseline_finished)
+        self._baseline_worker.error.connect(self._on_baseline_error)
+        self._baseline_worker.finished.connect(self._baseline_thread.quit)
+        self._baseline_worker.error.connect(self._baseline_thread.quit)
+        self._baseline_thread.finished.connect(
+            self._baseline_worker.deleteLater
+        )
+        self._baseline_thread.finished.connect(
+            self._baseline_thread.deleteLater
+        )
+        self._baseline_thread.start()
+
+    def _on_baseline_finished(self, baseline_path: str) -> None:
+        self.statusBar().showMessage(
+            f"baseline ready: {Path(baseline_path).name}",
+            12_000,
+        )
+
+    def _on_baseline_error(self, message: str) -> None:
+        # Match the inline-baseline error UX from commit f8bbfe3 --
+        # status-bar note + QMessageBox.warning with remediation
+        # instructions. The clean/bad/.mat/seg files are already on
+        # disk so this only affects baseline-dependent retrains.
+        self.statusBar().showMessage(
+            f"baseline FAILED: {message}",
+            12_000,
+        )
+        QMessageBox.warning(
+            self, "Baseline computation failed",
+            "The clean.h5 / bad.h5 / .mat / segments.json were "
+            "saved successfully, but the per-recording "
+            "baseline.h5 could not be computed:\n\n"
+            f"{message}\n\n"
+            "You can either rerun Save (overwrites all files) "
+            "or manually run detector.baseline.compute_baseline "
+            "on the clean.h5 to produce the baseline.",
+        )
 
     # ------------------------------------------------------------------
     # House-keeping
@@ -1405,10 +1462,33 @@ class MainWindow(QMainWindow):
         return resp == QMessageBox.Discard
 
     def closeEvent(self, event) -> None:
-        if self._maybe_discard_unsaved():
-            event.accept()
-        else:
+        if not self._maybe_discard_unsaved():
             event.ignore()
+            return
+        # If a background baseline is still computing, ask the user
+        # whether to wait. Quitting without waiting orphans the
+        # QThread -- on the next event loop turn it'd try to emit
+        # `finished` into a torn-down main window. Blocking on wait()
+        # here freezes the close for up to 5-15s on big recordings,
+        # but the user just asked to close, so a brief block is
+        # acceptable.
+        if (self._baseline_thread is not None
+                and self._baseline_thread.isRunning()):
+            resp = QMessageBox.question(
+                self, "Baseline still computing",
+                "A baseline.h5 is still being computed in the "
+                "background. Wait for it to finish before closing?\n\n"
+                "(Choosing 'No' will close the window now; the "
+                "baseline will be abandoned and may leave a partial "
+                "file on disk.)",
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+            )
+            if resp == QMessageBox.Cancel:
+                event.ignore()
+                return
+            if resp == QMessageBox.Yes:
+                self._baseline_thread.wait()
+        event.accept()
 
     # ------------------------------------------------------------------
     # M3 — inference
