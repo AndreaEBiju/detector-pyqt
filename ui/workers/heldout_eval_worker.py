@@ -88,3 +88,71 @@ class HeldoutEvalWorker(QObject):
             self.finished.emit(report, interval_cache)
         except Exception as e:
             self.error.emit(f"{type(e).__name__}: {e}")
+
+
+class HeldoutEvalMultiModelWorker(QObject):
+    """Multi-model variant of HeldoutEvalWorker. Runs
+    `detector.heldout_eval.evaluate_heldout_multi_model` in a
+    background QThread, emits a multi-model report dict + the
+    multi-model interval cache.
+
+    The cache shape (for the overlay viewer's model dropdown) is:
+        cache[recording_id] = {
+            "human":     (k, 2) int64,
+            "fs":        float,
+            "n_samples": int,
+            "models":    {version: (k, 2) int64, ...},
+        }
+
+    Inputs:
+      - manifest_path: same as single-model worker.
+      - artifact_paths: list of Path to model_v*/ directories.
+        These are PATHS not loaded artifacts, because the underlying
+        multi-model function uses multiprocessing.Pool with spawn
+        semantics -- workers reload each artifact themselves to
+        avoid pickling LightGBM boosters across process boundaries.
+      - n_workers: optional override; default from
+        `detector.dataset._default_phase1_workers` (machine-aware).
+    """
+
+    # (idx_completed, total, recording_id_just_done)
+    progress = Signal(int, int, str)
+    # (multi-model report dict, interval_cache dict)
+    finished = Signal(dict, dict)
+    # human-readable error message
+    error = Signal(str)
+
+    def __init__(
+        self,
+        manifest_path: Path,
+        artifact_paths: list[Path],
+        *,
+        rec_ids: Optional[list[str]] = None,
+        n_workers: Optional[int] = None,
+        parent: Optional[QObject] = None,
+    ):
+        super().__init__(parent)
+        self._manifest_path = Path(manifest_path)
+        self._artifact_paths = [Path(p) for p in artifact_paths]
+        self._rec_ids = list(rec_ids) if rec_ids else None
+        self._n_workers = n_workers
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            m = Manifest.load(self._manifest_path)
+
+            def _cb(i: int, total: int, rid: str) -> None:
+                self.progress.emit(int(i), int(total), str(rid))
+
+            interval_cache: dict = {}
+            report = HE.evaluate_heldout_multi_model(
+                m, self._artifact_paths,
+                rec_ids=self._rec_ids,
+                progress_callback=_cb,
+                interval_cache=interval_cache,
+                n_workers=self._n_workers,
+            )
+            self.finished.emit(report, interval_cache)
+        except Exception as e:
+            self.error.emit(f"{type(e).__name__}: {e}")

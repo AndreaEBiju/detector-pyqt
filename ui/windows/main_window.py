@@ -64,7 +64,9 @@ from ui.workers.inference_worker import (
     InferenceWorker, current_promoted_version_short,
     load_model_artifact_cached,
 )
-from ui.workers.heldout_eval_worker import HeldoutEvalWorker
+from ui.workers.heldout_eval_worker import (
+    HeldoutEvalWorker, HeldoutEvalMultiModelWorker,
+)
 from ui.workers.baseline_worker import BaselineWorker
 
 
@@ -119,6 +121,13 @@ class MainWindow(QMainWindow):
         self._heldout_thread: Optional[QThread] = None
         self._heldout_worker: Optional[HeldoutEvalWorker] = None
         self._heldout_progress: Optional[QProgressDialog] = None
+        # Multi-model variant uses its own slots so a single-model and
+        # multi-model run can't collide. Two separate "trains" are
+        # never queued concurrently because the menu actions get
+        # disabled while a run is in flight.
+        self._heldout_multi_thread: Optional[QThread] = None
+        self._heldout_multi_worker: Optional[HeldoutEvalMultiModelWorker] = None
+        self._heldout_multi_progress: Optional[QProgressDialog] = None
         # Background baseline.h5 computation (runs after Save). Only
         # one in flight at a time — a second save while the prior
         # baseline is still computing is blocked at _save_to entry
@@ -327,6 +336,18 @@ class MainWindow(QMainWindow):
         self._action_heldout_eval = QAction("Held-out evaluation…", self)
         self._action_heldout_eval.triggered.connect(self._run_heldout_eval)
         tools_menu.addAction(self._action_heldout_eval)
+        # Multi-model comparison: runs 2-3 models against the same
+        # held-out set in one pass (parallelized across recordings).
+        # Same metrics as single-model held-out eval, side-by-side
+        # per model, plus a per-recording table and an overlay viewer
+        # whose model dropdown swaps the predicted-bad band instantly.
+        self._action_heldout_multi = QAction(
+            "Compare models on held-out…", self,
+        )
+        self._action_heldout_multi.triggered.connect(
+            self._run_heldout_multi_model
+        )
+        tools_menu.addAction(self._action_heldout_multi)
 
         # Help menu. On macOS, Qt's `TextHeuristicRole` (default) auto-
         # moves actions named "About" / "Preferences" / "Quit" into
@@ -572,6 +593,196 @@ class MainWindow(QMainWindow):
             self._heldout_progress = None
         self._action_heldout_eval.setEnabled(True)
         QMessageBox.critical(self, "Held-out evaluation failed", msg)
+
+    # ------------------------------------------------------------------
+    # Multi-model held-out comparison
+    # ------------------------------------------------------------------
+
+    def _run_heldout_multi_model(self) -> None:
+        """Tools -> Compare models on held-out: pick 2-3 models, run
+        them in parallel against the held-out set, show side-by-side
+        results dialog."""
+        from PySide6.QtCore import QThread, Qt
+        from PySide6.QtWidgets import QProgressDialog, QMessageBox
+        from detector import paths as _detector_paths
+        from detector.manifest import Manifest as _Manifest
+
+        manifest_path = _detector_paths.get_manifest_path()
+        if not manifest_path.exists():
+            QMessageBox.warning(
+                self, "No manifest",
+                f"No training manifest at:\n{manifest_path}\n\n"
+                "Run `detector init` or add at least one recording first.",
+            )
+            return
+
+        try:
+            m = _Manifest.load(manifest_path)
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Manifest load failed",
+                f"Could not load manifest:\n{e}",
+            )
+            return
+        held = [r for r in m.list_recordings(include_held_out=True)
+                if r.get("held_out", False)]
+        if not held:
+            QMessageBox.information(
+                self, "No held-out recordings",
+                "No recordings in the manifest are marked held_out=True.\n\n"
+                "Hold-out a recording by checking 'Hold out from training' "
+                "in Training Management → Add recording.",
+            )
+            return
+
+        # Model picker
+        versions = list_available_versions()
+        if len(versions) < 2:
+            QMessageBox.information(
+                self, "Need at least 2 models",
+                "Multi-model comparison needs at least 2 trained models "
+                f"on disk; found {len(versions)}.",
+            )
+            return
+        from ui.dialogs.heldout_multi_model_dialog import (
+            HeldoutMultiModelPicker,
+        )
+        promoted = current_promoted_version_short()
+        toolbar_choice = (
+            self._version_combo.currentData()
+            if hasattr(self, "_version_combo") and self._version_combo
+            else None
+        )
+        # Default: toolbar selection + promoted (if different), else
+        # just promoted (or first two versions if no promoted).
+        default_selected: list[str] = []
+        if toolbar_choice:
+            default_selected.append(toolbar_choice)
+        if promoted and promoted not in default_selected:
+            default_selected.append(promoted)
+        if not default_selected:
+            default_selected = versions[:2]
+        picker = HeldoutMultiModelPicker(
+            versions,
+            promoted=promoted,
+            default_selected=default_selected,
+            parent=self,
+        )
+        if picker.exec() != HeldoutMultiModelPicker.Accepted:
+            return
+        chosen = picker.chosen_versions()
+        if len(chosen) < 2:
+            return   # safety net; picker already validates
+
+        # Resolve picked versions -> on-disk artifact dirs.
+        try:
+            artifacts_dir = _detector_paths.get_artifacts_dir()
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Artifacts dir not configured",
+                f"{e}",
+            )
+            return
+        artifact_paths = []
+        for v in chosen:
+            d = (artifacts_dir / v if v.startswith("model_")
+                 else artifacts_dir / f"model_{v}")
+            if not (d / "booster.txt").exists():
+                QMessageBox.critical(
+                    self, "Model artifact missing",
+                    f"Expected booster.txt at:\n{d}\n\n"
+                    "The version may not be fully synced from Drive yet.",
+                )
+                return
+            artifact_paths.append(d)
+
+        # Background worker.
+        self._heldout_multi_thread = QThread()
+        self._heldout_multi_worker = HeldoutEvalMultiModelWorker(
+            manifest_path, artifact_paths,
+        )
+        self._heldout_multi_worker.moveToThread(self._heldout_multi_thread)
+        self._heldout_multi_thread.started.connect(
+            self._heldout_multi_worker.run
+        )
+        self._heldout_multi_worker.progress.connect(
+            self._on_heldout_multi_progress
+        )
+        self._heldout_multi_worker.finished.connect(
+            self._on_heldout_multi_finished
+        )
+        self._heldout_multi_worker.error.connect(self._on_heldout_multi_error)
+        self._heldout_multi_worker.finished.connect(
+            self._heldout_multi_thread.quit
+        )
+        self._heldout_multi_worker.error.connect(
+            self._heldout_multi_thread.quit
+        )
+        self._heldout_multi_thread.finished.connect(
+            self._heldout_multi_worker.deleteLater
+        )
+        self._heldout_multi_thread.finished.connect(
+            self._heldout_multi_thread.deleteLater
+        )
+
+        self._heldout_multi_progress = QProgressDialog(
+            f"Evaluating {len(held)} recording(s) × {len(chosen)} model(s) …",
+            "Cancel", 0, len(held), self,
+        )
+        self._heldout_multi_progress.setWindowTitle(
+            f"Multi-model held-out: {' vs '.join(chosen)}"
+        )
+        self._heldout_multi_progress.setWindowModality(Qt.WindowModal)
+        self._heldout_multi_progress.setMinimumDuration(0)
+        # Stash the chosen versions so we can display them in the
+        # finished/error handlers if needed.
+        self._heldout_multi_chosen = list(chosen)
+        self._heldout_multi_progress.canceled.connect(
+            lambda: self._action_heldout_multi.setEnabled(True)
+        )
+
+        self._action_heldout_multi.setEnabled(False)
+        self._heldout_multi_thread.start()
+
+    def _on_heldout_multi_progress(
+        self, idx: int, total: int, rid: str,
+    ) -> None:
+        if self._heldout_multi_progress is None:
+            return
+        self._heldout_multi_progress.setMaximum(total)
+        self._heldout_multi_progress.setValue(idx)
+        self._heldout_multi_progress.setLabelText(
+            f"Evaluated {idx+1}/{total} recordings (last: {rid})"
+        )
+
+    def _on_heldout_multi_finished(
+        self, report: dict, interval_cache: dict,
+    ) -> None:
+        if self._heldout_multi_progress is not None:
+            self._heldout_multi_progress.close()
+            self._heldout_multi_progress = None
+        self._action_heldout_multi.setEnabled(True)
+        from ui.dialogs.heldout_multi_model_dialog import (
+            HeldoutMultiModelDialog,
+        )
+        from detector import paths as _detector_paths
+        dlg = HeldoutMultiModelDialog(
+            report,
+            interval_cache=interval_cache,
+            manifest_path=_detector_paths.get_manifest_path(),
+            parent=self,
+        )
+        dlg.exec()
+
+    def _on_heldout_multi_error(self, msg: str) -> None:
+        from PySide6.QtWidgets import QMessageBox
+        if self._heldout_multi_progress is not None:
+            self._heldout_multi_progress.close()
+            self._heldout_multi_progress = None
+        self._action_heldout_multi.setEnabled(True)
+        QMessageBox.critical(
+            self, "Multi-model held-out evaluation failed", msg,
+        )
 
     def _build_toolbar(self) -> None:
         tb = QToolBar("Main")

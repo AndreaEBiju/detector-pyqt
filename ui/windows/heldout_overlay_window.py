@@ -33,7 +33,7 @@ import numpy as np
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
-    QLabel, QMainWindow, QMessageBox, QToolBar, QWidget,
+    QComboBox, QLabel, QMainWindow, QMessageBox, QToolBar, QWidget,
 )
 
 # Mirror the worker's sys.path setup so the window works whether it
@@ -64,14 +64,36 @@ class HeldoutOverlayWindow(QMainWindow):
         cache_entry: Optional[dict],
         *,
         artifact=None,
+        available_versions: Optional[list[str]] = None,
         parent: Optional[QWidget] = None,
     ):
+        """Construct a held-out overlay viewer.
+
+        Single-model mode: `cache_entry` has shape
+        `{"model": (k, 2) int64, "human": ..., "fs": ..., "n_samples": ...}`
+        and `available_versions` is None. One model band is drawn.
+
+        Multi-model mode: `cache_entry` has shape
+        `{"models": {version: intervals, ...}, "human": ..., ...}` and
+        `available_versions` is a list of version strings. A model
+        dropdown is added to the toolbar; switching it redraws the
+        model band without re-running detect_bad (the intervals come
+        straight from the cache)."""
         super().__init__(parent)
         rid = recording_entry.get("recording_id", "?")
         self.setWindowTitle(f"Held-out overlay — {rid}")
         self.resize(1200, 720)
         self._lazy: Optional[LazyRecording] = None
         self._viewer: Optional[MultiChannelViewer] = None
+        self._rid = rid
+        self._cache_entry = cache_entry
+        self._artifact = artifact
+        # Multi-model state. None => single-model mode.
+        self._available_versions: Optional[list[str]] = (
+            list(available_versions) if available_versions else None
+        )
+        self._model_combo: Optional[QComboBox] = None
+        self._n_human_intervals = 0
 
         source_path = Path(recording_entry["source_path"])
         bad_path = Path(recording_entry["splitter_bad_path"])
@@ -95,16 +117,35 @@ class HeldoutOverlayWindow(QMainWindow):
 
         # Load human bad intervals.
         human_intervals = self._load_human_intervals(bad_path)
-        # Resolve model intervals (cache first, fallback to detect_bad
-        # if a model artifact was passed in).
-        model_intervals = self._resolve_model_intervals(
-            cache_entry, artifact, rid,
-        )
-
+        self._n_human_intervals = int(len(human_intervals))
         self._viewer.set_bad_intervals(human_intervals)
-        self._viewer.set_model_intervals(model_intervals)
 
-        self._build_toolbar(rid, human_intervals, model_intervals)
+        # Multi-model dropdown OR single-model resolve.
+        if (self._available_versions
+                and cache_entry is not None
+                and isinstance(cache_entry.get("models"), dict)):
+            # Pick the first available version present in the cache as
+            # the initial draw. Cache may be a subset of the requested
+            # versions if some recordings errored.
+            cache_models = cache_entry["models"]
+            initial = next(
+                (v for v in self._available_versions if v in cache_models),
+                None,
+            )
+            initial_intervals = (
+                np.asarray(cache_models[initial], dtype=np.int64)
+                if initial is not None
+                else np.zeros((0, 2), dtype=np.int64)
+            )
+            self._viewer.set_model_intervals(initial_intervals)
+            self._build_toolbar_multi(rid, initial)
+        else:
+            # Single-model: existing path.
+            model_intervals = self._resolve_model_intervals(
+                cache_entry, artifact, rid,
+            )
+            self._viewer.set_model_intervals(model_intervals)
+            self._build_toolbar(rid, human_intervals, model_intervals)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -184,6 +225,93 @@ class HeldoutOverlayWindow(QMainWindow):
         legend.setTextFormat(Qt.RichText)
         legend.setContentsMargins(12, 0, 12, 0)
         tb.addWidget(legend)
+
+    def _build_toolbar_multi(
+        self,
+        rid: str,
+        initial_version: Optional[str],
+    ) -> None:
+        """Multi-model toolbar: Fit / First 60s + a Model dropdown.
+        Switching the dropdown swaps the displayed model band by
+        reading from the already-cached intervals dict."""
+        tb = QToolBar("Overlay")
+        tb.setMovable(False)
+        self.addToolBar(tb)
+
+        act_fit = QAction("Fit all", self)
+        act_fit.triggered.connect(self._fit_all)
+        tb.addAction(act_fit)
+
+        act_first60 = QAction("First 60s", self)
+        act_first60.triggered.connect(self._first_60s)
+        tb.addAction(act_first60)
+
+        tb.addSeparator()
+
+        tb.addWidget(QLabel(f"  <b>{rid}</b>  |  Model: "))
+        self._model_combo = QComboBox()
+        cache_models: dict = (self._cache_entry or {}).get("models", {})
+        for v in (self._available_versions or []):
+            # Disable versions that aren't in the cache (recording
+            # errored under that model). User still sees the version
+            # listed -- helpful for context.
+            self._model_combo.addItem(v, v)
+        # Mark missing versions with a strikethrough-ish suffix.
+        for i in range(self._model_combo.count()):
+            v = self._model_combo.itemData(i)
+            if v not in cache_models:
+                self._model_combo.setItemText(i, f"{v}  (no data)")
+        if initial_version is not None:
+            for i in range(self._model_combo.count()):
+                if self._model_combo.itemData(i) == initial_version:
+                    self._model_combo.setCurrentIndex(i)
+                    break
+        self._model_combo.currentIndexChanged.connect(
+            self._on_model_combo_changed
+        )
+        tb.addWidget(self._model_combo)
+
+        tb.addSeparator()
+
+        self._legend_label = QLabel("")
+        self._legend_label.setTextFormat(Qt.RichText)
+        self._legend_label.setContentsMargins(12, 0, 12, 0)
+        tb.addWidget(self._legend_label)
+        self._update_multi_legend(initial_version)
+
+    def _on_model_combo_changed(self, _idx: int) -> None:
+        if self._model_combo is None or self._viewer is None:
+            return
+        version = self._model_combo.currentData()
+        cache_models: dict = (self._cache_entry or {}).get("models", {})
+        intervals = cache_models.get(version)
+        if intervals is None:
+            # Recording errored under this model -- show empty band
+            # rather than a stale one from the prior selection.
+            self._viewer.set_model_intervals(
+                np.zeros((0, 2), dtype=np.int64)
+            )
+        else:
+            self._viewer.set_model_intervals(
+                np.asarray(intervals, dtype=np.int64)
+            )
+        self._update_multi_legend(version)
+
+    def _update_multi_legend(self, version: Optional[str]) -> None:
+        if not hasattr(self, "_legend_label") or self._legend_label is None:
+            return
+        cache_models: dict = (self._cache_entry or {}).get("models", {})
+        n_model = 0
+        if version is not None and version in cache_models:
+            n_model = int(len(cache_models[version]))
+        self._legend_label.setText(
+            f"  <span style='color:#d62728;'>&#9608;</span> human bad "
+            f"({self._n_human_intervals} interval"
+            f"{'s' if self._n_human_intervals != 1 else ''})  "
+            f"<span style='color:#ff7f0e;'>&#9608;</span> {version or '—'} "
+            f"bad ({n_model} interval{'s' if n_model != 1 else ''})  "
+            f"<i>(read-only)</i>"
+        )
 
     def _fit_all(self) -> None:
         if self._viewer is None or self._lazy is None:
