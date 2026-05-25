@@ -244,7 +244,19 @@ class TrainingWindow(QMainWindow):
         btn_row = QHBoxLayout()
         self._btn_view_provenance = QPushButton("📄 View provenance JSON")
         self._btn_view_provenance.clicked.connect(self._on_view_provenance)
-        self._btn_rollback = QPushButton("⟲ Roll back to selected version…")
+        # "Make current" handles both directions: promoting a newly-
+        # trained version that the regression-gate refused to auto-
+        # promote, AND rolling back to an older version when a recent
+        # one misbehaves. Under the hood it's the same operation
+        # (set current_model_version), so one button covers both cases.
+        self._btn_rollback = QPushButton("★ Make selected version current…")
+        self._btn_rollback.setToolTip(
+            "Set current_model_version to whichever version is "
+            "selected above. Works in both directions: promoting "
+            "a newer version that didn't auto-promote (e.g. blocked "
+            "by a scope-change regression) AND rolling back to an "
+            "older version when a recent one misbehaves."
+        )
         self._btn_rollback.clicked.connect(self._on_rollback)
         btn_row.addWidget(self._btn_view_provenance)
         btn_row.addWidget(self._btn_rollback)
@@ -313,7 +325,7 @@ class TrainingWindow(QMainWindow):
         try:
             m = Manifest.load(manifest_path)
         except Exception as exc:
-            QMessageBox.critical(self, "Rollback failed",
+            QMessageBox.critical(self, "Make current failed",
                                    f"Manifest load: {exc}")
             return
         if m.current_model_version == target_version:
@@ -323,7 +335,7 @@ class TrainingWindow(QMainWindow):
             )
             return
         reason, ok = QInputDialog.getText(
-            self, "Confirm rollback",
+            self, f"Confirm: make {target_version} current",
             f"current_model_version: {m.current_model_version or '—'} → "
             f"{target_version}\n\nReason (audited in manifest history):",
         )
@@ -338,7 +350,7 @@ class TrainingWindow(QMainWindow):
             # Feature-schema mismatch raises SystemExit per detector.retrain.
             override = QMessageBox.question(
                 self, "Schema mismatch",
-                f"Rollback failed: {exc}\n\n"
+                f"Set current_model_version failed: {exc}\n\n"
                 "Override the feature-schema check? Only do this if you "
                 "have verified the schemas are equivalent.",
             )
@@ -350,13 +362,15 @@ class TrainingWindow(QMainWindow):
                     enforce_feature_schema=False,
                 )
             except Exception as exc2:
-                QMessageBox.critical(self, "Rollback failed", str(exc2))
+                QMessageBox.critical(
+                    self, "Make current failed", str(exc2),
+                )
                 return
         except Exception as exc:
-            QMessageBox.critical(self, "Rollback failed", str(exc))
+            QMessageBox.critical(self, "Make current failed", str(exc))
             return
         QMessageBox.information(
-            self, "Rolled back",
+            self, "Done",
             f"current_model_version: {res['from_version']} → {res['to_version']}",
         )
         self._refresh_all()
