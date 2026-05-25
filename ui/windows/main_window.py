@@ -40,13 +40,14 @@ import numpy as np
 from PySide6.QtCore import Qt, QThread, QTimer
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
-    QComboBox, QDockWidget, QFileDialog, QInputDialog, QLabel, QMainWindow,
-    QMessageBox, QProgressDialog, QPushButton, QStatusBar, QTabWidget,
-    QToolBar, QWidget,
+    QApplication, QComboBox, QDockWidget, QFileDialog, QInputDialog, QLabel,
+    QMainWindow, QMessageBox, QProgressDialog, QPushButton, QStatusBar,
+    QTabWidget, QToolBar, QWidget,
 )
 
 from detector import paths as detector_paths
 from detector import review as detector_review
+from detector.baseline import compute_baseline as _compute_baseline
 from detector.recording_io import Recording, load_recording
 from detector.labeled_save import (
     save_native, save_matlab_compatible, save_period_split,
@@ -1240,6 +1241,57 @@ class MainWindow(QMainWindow):
                 model_version=self._model_version,
                 threshold_used=self._model_threshold_used,
             )
+            # Co-locate the per-recording baseline.h5 next to the
+            # just-written clean.h5 ("Option A" baseline layout). This
+            # was previously skipped at save-time, so the retrain
+            # pipeline had to fall back to the legacy central
+            # `<data_root>/baselines/` dir -- or fail outright on fresh
+            # recordings that had no central-dir entry. Writing the
+            # baseline here means the manifest's splitter_baseline_path
+            # resolution chain finds it next to clean.h5 with zero
+            # config, and a newly-blanked recording is immediately
+            # train-ready.
+            #
+            # Naming: <stem>_baseline.h5 where <stem> matches the
+            # clean.h5's stem with "_clean" stripped. Mirrors the
+            # save_native bad.h5 derivation.
+            stem_for_baseline = clean_path.stem
+            if stem_for_baseline.endswith("_clean"):
+                stem_for_baseline = stem_for_baseline[: -len("_clean")]
+            baseline_path = clean_path.with_name(
+                f"{stem_for_baseline}_baseline.h5"
+            )
+            baseline_msg = ""
+            self.statusBar().showMessage(
+                "Saved clean/bad/.mat -- now computing baseline …", 0,
+            )
+            QApplication.processEvents()   # flush the status message
+            try:
+                _compute_baseline(
+                    rec.recording_id,
+                    paths={
+                        "clean_path": str(clean_path),
+                        "baseline_path": str(baseline_path),
+                        "fs": float(rec.fs),
+                    },
+                    force=True,   # clean.h5 just changed; don't reuse stale cache
+                )
+                baseline_msg = "  ·  baseline.h5 written"
+            except Exception as bx:
+                # Don't fail the whole save -- clean/bad/.mat/seg are
+                # already on disk and useful. Surface the baseline
+                # error in the status bar so the user can investigate.
+                baseline_msg = f"  ·  baseline FAILED: {bx}"
+                QMessageBox.warning(
+                    self, "Baseline computation failed",
+                    "The clean.h5 / bad.h5 / .mat / segments.json were "
+                    "saved successfully, but the per-recording "
+                    "baseline.h5 could not be computed:\n\n"
+                    f"{type(bx).__name__}: {bx}\n\n"
+                    "You can either rerun Save (overwrites all files) "
+                    "or manually run detector.baseline.compute_baseline "
+                    "on the clean.h5 to produce the baseline.",
+                )
             # Per-period split whenever a boundary is set, regardless
             # of filename-derived rec_type. The user may have a
             # generic .mat file (no _stim_rec_ in the name) but still
@@ -1284,7 +1336,8 @@ class MainWindow(QMainWindow):
                 f".mat={r_mat['n_intervals']} intervals "
                 f"(user={r_mat['n_user']}, "
                 f"model_accepted={r_mat['n_model_accepted']}, "
-                f"existing={r_mat['n_existing']}){unsure_msg}{split_msg}",
+                f"existing={r_mat['n_existing']})"
+                f"{unsure_msg}{split_msg}{baseline_msg}",
                 12_000,
             )
         except Exception as exc:
