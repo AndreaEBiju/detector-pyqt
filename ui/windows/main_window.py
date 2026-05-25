@@ -349,6 +349,19 @@ class MainWindow(QMainWindow):
             self._run_heldout_multi_model
         )
         tools_menu.addAction(self._action_heldout_multi)
+        # Migrate legacy blankmotion -> splitter h5. Opens a window
+        # where the user builds a queue of `_blankmotion.mat` files
+        # (manual pickers or folder scan), pre-validates source-
+        # sibling status, and one button runs the bulk conversion
+        # (parallel pool, same heuristic as the rest of the pipeline).
+        tools_menu.addSeparator()
+        self._action_migrate_blankmotion = QAction(
+            "Migrate legacy blankmotion files…", self,
+        )
+        self._action_migrate_blankmotion.triggered.connect(
+            self._open_blankmotion_migration_window
+        )
+        tools_menu.addAction(self._action_migrate_blankmotion)
 
         # Help menu. On macOS, Qt's `TextHeuristicRole` (default) auto-
         # moves actions named "About" / "Preferences" / "Quit" into
@@ -421,6 +434,21 @@ class MainWindow(QMainWindow):
         self._training_window.show()
         self._training_window.raise_()
         self._training_window.activateWindow()
+
+    def _open_blankmotion_migration_window(self) -> None:
+        """Tools -> Migrate legacy blankmotion files...
+        Opens the bulk-migration window non-modally so the user can
+        keep labeling / inferencing while the migration runs."""
+        from ui.windows.blankmotion_migration_window import (
+            BlankmotionMigrationWindow,
+        )
+        win = getattr(self, "_blankmotion_window", None)
+        if win is None:
+            win = BlankmotionMigrationWindow(self)
+            self._blankmotion_window = win
+        win.show()
+        win.raise_()
+        win.activateWindow()
 
     # ------------------------------------------------------------------
     # Held-out evaluation
