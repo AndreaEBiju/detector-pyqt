@@ -45,6 +45,28 @@ export MKL_NUM_THREADS=1
 export OMP_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 
+# ---------------------------------------------------------------
+# h5py + CloudStorage (Drive) concurrency workaround.
+#
+# When multiple multiprocessing.Pool workers concurrently open
+# large h5py files hosted on macOS CloudStorage (Google Drive /
+# OneDrive / iCloud), h5py's default file-locking conflicts with
+# the CloudStorage layer and some workers see a misleading
+# "OSError: Unable to synchronously open file (file signature
+# not found)" -- even when the file is fully synced and the
+# magic bytes are correct.
+#
+# Disabling h5py's locking with this env var lets concurrent
+# read-only access succeed on Drive paths. Safe for our usage
+# (we never WRITE to the source recording files; outputs land
+# in separate files).
+#
+# The retrain subprocess already sets this; the PyQt app didn't
+# until Andrea hit it during bulk inference on 18 notched
+# recordings (9 failed, all the larger stim_rec_ files).
+# ---------------------------------------------------------------
+export HDF5_USE_FILE_LOCKING=FALSE
+
 # Defense-in-depth: enable Python's fault handler so any native
 # crash (segfault / bus error) writes a C stack trace instead of
 # dying silently.
