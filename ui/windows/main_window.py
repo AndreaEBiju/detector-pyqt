@@ -2222,10 +2222,24 @@ class MainWindow(QMainWindow):
         self._open_path(Path(path))
 
     def _on_bulk_inference(self) -> None:
-        """Sequentially run inference on all queue items with
-        status='pending'. Results land alongside each recording as
-        `<rid>_modelblank.h5` (via detector.predict.detect_bad's
-        normal output path). Progress dialog tracks per-file."""
+        """Run inference on every pending queue item in parallel via
+        multiprocessing.Pool. Outputs are written next to each
+        recording with model-version-tagged filenames:
+            <stem>_<model_version>_clean.h5
+            <stem>_<model_version>_bad.h5
+            <stem>_<model_version>_blankmotion.mat
+            <stem>_<model_version>_segments.json
+            <stem>_<model_version>_baseline.h5
+        These coexist with human-labeled `<stem>_clean.h5` etc. with
+        no overwrite risk -- you can run bulk inference on a folder
+        that already has human labels and both sets of files survive.
+
+        Worker count comes from the same psutil-aware Phase-1
+        heuristic the rest of the pipeline uses (typically ~6 on a
+        Mac, ~9-12 on Arjun's Windows box). Each worker loads one
+        recording at a time, so peak memory ≈ workers × signal size."""
+        from ui.workers.bulk_inference_worker import BulkInferenceWorker
+
         if getattr(self, "_queue_panel", None) is None:
             return
         pending = [
@@ -2234,107 +2248,158 @@ class MainWindow(QMainWindow):
         ]
         if not pending:
             return
-        # Build a sequential plan and walk through it via a small
-        # state machine (QTimer-driven so we yield to the event loop
-        # between recordings).
-        self._bulk_queue: list = list(pending)
+
+        # Resolve the model artifact path. Use whichever version the
+        # toolbar dropdown currently has selected (falling back to the
+        # promoted version). One model per bulk run -- the output
+        # filenames embed that version so you can re-run the same
+        # folder under a different model later without overwriting.
+        try:
+            version_short = (
+                self._version_combo.currentData()
+                if hasattr(self, "_version_combo") and self._version_combo
+                else None
+            ) or current_promoted_version_short()
+            if not version_short:
+                QMessageBox.critical(
+                    self, "No model selected",
+                    "Pick a model version from the main toolbar before "
+                    "running bulk inference.",
+                )
+                return
+            artifacts_dir = detector_paths.get_artifacts_dir()
+            dir_name = (version_short if version_short.startswith("model_")
+                         else f"model_{version_short}")
+            artifact_path = artifacts_dir / dir_name
+            if not (artifact_path / "booster.txt").exists():
+                QMessageBox.critical(
+                    self, "Model not on disk",
+                    f"Expected booster.txt at:\n{artifact_path}\n\n"
+                    "The version may not be fully synced from Drive yet.",
+                )
+                return
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Model resolution failed", str(e),
+            )
+            return
+
+        # Spin up the worker.
         self._bulk_total = len(pending)
         self._bulk_done = 0
+        self._bulk_cancelled = False
+        self._bulk_pending_items: list = list(pending)
+
+        self._bulk_thread = QThread()
+        self._bulk_worker = BulkInferenceWorker(
+            [Path(it.path) for it in pending],
+            artifact_path,
+            skip_existing=True,
+        )
+        self._bulk_worker.moveToThread(self._bulk_thread)
+        self._bulk_thread.started.connect(self._bulk_worker.run)
+        self._bulk_worker.progress.connect(self._on_bulk_progress)
+        self._bulk_worker.finished.connect(self._on_bulk_finished)
+        self._bulk_worker.error.connect(self._on_bulk_error)
+        self._bulk_worker.finished.connect(self._bulk_thread.quit)
+        self._bulk_worker.error.connect(self._bulk_thread.quit)
+        self._bulk_thread.finished.connect(self._bulk_worker.deleteLater)
+        self._bulk_thread.finished.connect(self._bulk_thread.deleteLater)
+
+        # Progress dialog. The cancel button is best-effort (workers
+        # already in-flight finish; no further jobs are dispatched).
         self._bulk_progress = QProgressDialog(
-            f"Bulk inference: {self._bulk_total} recordings",
+            f"Bulk inference: {self._bulk_total} recording(s) with "
+            f"{version_short} (parallel) …",
             "Cancel", 0, self._bulk_total, self,
+        )
+        self._bulk_progress.setWindowTitle(
+            f"Bulk inference — {version_short}"
         )
         self._bulk_progress.setWindowModality(Qt.WindowModal)
         self._bulk_progress.setMinimumDuration(0)
         self._bulk_progress.canceled.connect(self._on_bulk_inference_cancel)
-        self._bulk_cancelled = False
-        self._bulk_step()
 
-    def _bulk_step(self) -> None:
-        """Process the next queue item."""
-        if self._bulk_cancelled or not self._bulk_queue:
-            self._on_bulk_inference_done()
-            return
-        item = self._bulk_queue.pop(0)
-        path = Path(item.path)
-        self._bulk_progress.setLabelText(
-            f"[{self._bulk_done + 1}/{self._bulk_total}] {path.name}"
-        )
-        # We open the recording into the main viewer + auto-fire
-        # inference, then on finish we mark + step.
-        try:
-            self._open_path(path)
-        except Exception as exc:
-            QMessageBox.warning(
-                self, "Bulk inference",
-                f"Skipping {path.name}: {exc}",
+        self._bulk_thread.start()
+
+    def _on_bulk_progress(
+        self, n_done: int, n_total: int, result: dict,
+    ) -> None:
+        """One recording just finished. Update the queue + progress UI."""
+        self._bulk_done = n_done
+        if self._bulk_progress is not None:
+            self._bulk_progress.setMaximum(n_total)
+            self._bulk_progress.setValue(n_done)
+            rec_path = result.get("recording_path", "?")
+            rec_name = Path(rec_path).name if rec_path else "?"
+            status = result.get("status", "?")
+            self._bulk_progress.setLabelText(
+                f"[{n_done}/{n_total}] {rec_name}  -> {status}"
             )
-            self._bulk_done += 1
-            self._bulk_progress.setValue(self._bulk_done)
-            QTimer.singleShot(0, self._bulk_step)
+        # Update the queue panel with the per-recording outcome.
+        if getattr(self, "_queue_panel", None) is None:
             return
-
-        # Hook a one-shot listener for the inference finish.
-        if self._inference_worker is None:
-            # Auto-run is OFF? Force a manual run.
-            QTimer.singleShot(50, self._on_run_inference)
-        # Wait for finish via the worker's `finished` signal.
-        # We re-connect each step because the worker is replaced
-        # each run.
-        def _hook(_result):
+        rec_path = result.get("recording_path")
+        if not rec_path:
+            return
+        if result.get("status") in ("ok", "skipped_existing"):
             try:
-                if self._recording is not None:
-                    # Save the predictions so they persist.
-                    self._on_save_clicked()
-                # Update queue status
-                if getattr(self, "_queue_panel", None) is not None:
-                    self._queue_panel.mark_status(item.path, "done")
-            finally:
-                self._bulk_done += 1
-                self._bulk_progress.setValue(self._bulk_done)
-                # The next step runs after the event loop yields so the
-                # progress dialog can repaint.
-                QTimer.singleShot(50, self._bulk_step)
-
-        # Wait a tick for the inference worker to spawn (it's set up
-        # inside _open_path's auto-run logic via QTimer.singleShot).
-        def _wait_for_worker():
-            if self._inference_worker is None:
-                # Auto-run disabled — call _on_run_inference directly.
-                self._on_run_inference()
-            if self._inference_worker is not None:
-                self._inference_worker.finished.connect(_hook)
-                # If error, treat as done-with-warning and continue.
-                self._inference_worker.error.connect(
-                    lambda msg: (self._bulk_skip_with_warning(item.path, msg))
+                self._queue_panel.mark_status(rec_path, "done")
+            except Exception:
+                pass
+        else:
+            # error path -> note in the queue, don't fail the batch.
+            err = result.get("error", "unknown error")
+            try:
+                self._queue_panel.mark_status(
+                    rec_path, "skipped",
+                    notes=f"bulk inference failed: {err}",
                 )
-            else:
-                # Couldn't start; skip
-                self._bulk_done += 1
-                self._bulk_progress.setValue(self._bulk_done)
-                QTimer.singleShot(50, self._bulk_step)
+            except Exception:
+                pass
 
-        QTimer.singleShot(100, _wait_for_worker)
-
-    def _bulk_skip_with_warning(self, path: str, msg: str) -> None:
-        QMessageBox.warning(self, "Bulk inference",
-                              f"{Path(path).name} failed: {msg}")
-        self._bulk_done += 1
-        self._bulk_progress.setValue(self._bulk_done)
-        QTimer.singleShot(50, self._bulk_step)
-
-    def _on_bulk_inference_cancel(self) -> None:
-        self._bulk_cancelled = True
-
-    def _on_bulk_inference_done(self) -> None:
+    def _on_bulk_finished(self, results: list) -> None:
+        n_ok = sum(1 for r in results if r.get("status") == "ok")
+        n_skipped = sum(
+            1 for r in results if r.get("status") == "skipped_existing"
+        )
+        n_err = sum(1 for r in results if r.get("status") == "error")
         if self._bulk_progress is not None:
             self._bulk_progress.close()
             self._bulk_progress = None
         self.statusBar().showMessage(
-            f"bulk inference: processed {self._bulk_done}/{self._bulk_total} "
-            f"recording(s)",
-            10_000,
+            f"bulk inference: {n_ok} processed, {n_skipped} skipped "
+            f"(already done), {n_err} failed",
+            15_000,
         )
+        if n_err > 0:
+            # Surface errors in a dialog so the user knows which
+            # recordings need attention.
+            errs = [
+                f"  - {Path(r.get('recording_path', '?')).name}: "
+                f"{r.get('error', '?')}"
+                for r in results if r.get("status") == "error"
+            ]
+            QMessageBox.warning(
+                self, f"Bulk inference: {n_err} failure(s)",
+                "Some recordings failed during bulk inference:\n\n"
+                + "\n".join(errs[:20])
+                + ("\n  …" if len(errs) > 20 else ""),
+            )
+
+    def _on_bulk_error(self, msg: str) -> None:
+        if self._bulk_progress is not None:
+            self._bulk_progress.close()
+            self._bulk_progress = None
+        QMessageBox.critical(self, "Bulk inference failed", msg)
+
+    def _on_bulk_inference_cancel(self) -> None:
+        self._bulk_cancelled = True
+        if hasattr(self, "_bulk_worker") and self._bulk_worker is not None:
+            try:
+                self._bulk_worker.request_cancel()
+            except Exception:
+                pass
 
     def _on_about(self) -> None:
         QMessageBox.information(
