@@ -466,6 +466,27 @@ class TrainingWindow(QMainWindow):
             "definitely clean' at the cost of some recall."
         )
         form.addRow("review FP weight", self._review_fp_weight_spin)
+        # FN-correction strength (manifest false-negatives). A
+        # `true_artifact` verdict means the manifest had this row as
+        # label=0 but the human caught it as bad. The retrain flips
+        # label 0->1 and bumps weight to fn_weight. Default 3.0
+        # mirrors fp_weight; bump higher to push recall up faster.
+        self._review_fn_weight_spin = QDoubleSpinBox()
+        self._review_fn_weight_spin.setRange(0.5, 20.0)
+        self._review_fn_weight_spin.setSingleStep(0.5)
+        self._review_fn_weight_spin.setDecimals(1)
+        self._review_fn_weight_spin.setValue(3.0)
+        self._review_fn_weight_spin.setToolTip(
+            "Sample-weight assigned to windows the user marked as "
+            "true_artifact in 'review feedback dir' -- manifest "
+            "false-negatives the human caught. Those rows are flipped "
+            "from label=0 to label=1 AND given this weight, so the "
+            "model gets high-confidence positive training examples "
+            "from regions the manifest mislabeled. Default 3.0; raise "
+            "to push recall up when the model is missing real artifacts; "
+            "lower (toward 1.0) to keep the manifest authoritative."
+        )
+        form.addRow("review FN weight", self._review_fn_weight_spin)
         layout.addWidget(ctrl_box)
 
         # Action row
@@ -647,6 +668,7 @@ class TrainingWindow(QMainWindow):
                 manifest_path=detector_paths.get_manifest_path(),
                 review_dir=review_dir,
                 review_fp_weight=float(self._review_fp_weight_spin.value()),
+                review_fn_weight=float(self._review_fn_weight_spin.value()),
             )
         except Exception as exc:
             QMessageBox.critical(self, "Start retrain failed", str(exc))
