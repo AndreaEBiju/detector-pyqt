@@ -264,6 +264,13 @@ class TrainingWindow(QMainWindow):
         self._per_animal_thread: Optional[QThread] = None
         self._per_animal_worker: Optional[PerAnimalTrainWorker] = None
         self._per_animal_progress: Optional[QProgressDialog] = None
+        # Pre-train migration state. Set up only when the user clicks
+        # Train with pending blankmotion entries in the extras list.
+        # Reset to None after the migration finishes + control flows
+        # back into _on_per_animal_train.
+        self._pre_train_thread = None
+        self._pre_train_worker = None
+        self._pre_train_progress = None
         # Extra files added via the per-animal "Add additional files..."
         # button. These get trained alongside the manifest-driven recs
         # but never enter the combined-training manifest. Each entry is
@@ -1254,13 +1261,28 @@ class TrainingWindow(QMainWindow):
         action_row = QHBoxLayout()
         self._btn_pa_add_files = QPushButton("➕ Add additional files…")
         self._btn_pa_add_files.setToolTip(
-            "Pick recording files (clean.h5) that aren't in the main "
-            "training manifest. They get tagged with their auto-"
-            "detected animal letter and added to the same per-animal "
-            "training pool, but flagged as 'extra' so they don't enter "
-            "the combined-training manifest."
+            "Pick individual recording files (clean.h5 / blankmotion.mat "
+            "/ source .mat). Each file's siblings are resolved at add "
+            "time; if a blankmotion has no splitter siblings, you're "
+            "prompted to migrate inline (one at a time)."
         )
         self._btn_pa_add_files.clicked.connect(self._on_per_animal_add_files)
+        # NEW: bulk folder scan. Defers migration to train time so the
+        # user doesn't have to wait per file. Recursively finds
+        # `_blankmotion.mat` files; pre-migrated ones land as full
+        # records, un-migrated ones land as pending records that get
+        # batch-migrated in parallel right before training starts.
+        self._btn_pa_add_folder = QPushButton("📁 Add folder…")
+        self._btn_pa_add_folder.setToolTip(
+            "Recursively scan a folder for `_blankmotion.mat` files. "
+            "Pre-migrated files (with `_clean.h5` siblings) are added "
+            "immediately. Un-migrated files become pending entries -- "
+            "they batch-migrate in parallel just before the training "
+            "run starts, so you don't wait per file at add time."
+        )
+        self._btn_pa_add_folder.clicked.connect(
+            self._on_per_animal_add_folder
+        )
         self._btn_pa_clear_extras = QPushButton("Clear extras")
         self._btn_pa_clear_extras.clicked.connect(
             self._on_per_animal_clear_extras
@@ -1272,6 +1294,7 @@ class TrainingWindow(QMainWindow):
         self._btn_pa_refresh = QPushButton("↻ Refresh")
         self._btn_pa_refresh.clicked.connect(self._refresh_per_animal_tab)
         action_row.addWidget(self._btn_pa_add_files)
+        action_row.addWidget(self._btn_pa_add_folder)
         action_row.addWidget(self._btn_pa_clear_extras)
         action_row.addStretch(1)
         action_row.addWidget(self._btn_pa_refresh)
@@ -1504,6 +1527,140 @@ class TrainingWindow(QMainWindow):
                 "Also: " + "; ".join(details) + ".",
             )
 
+    def _on_per_animal_add_folder(self) -> None:
+        """Recursively scan a folder for `_blankmotion.mat` files and
+        queue them as extras. Pre-migrated files (with `_clean.h5`
+        siblings) land as complete records right away. Un-migrated
+        files become PENDING records -- they batch-migrate in
+        parallel just before per-animal training starts, so the user
+        doesn't sit through one prompt per file at add-time.
+
+        The pending record carries:
+          - recording_id, source_path, blankmotion_path (real)
+          - splitter_* paths set to where they WILL be after migration
+          - pending_migration=True flag
+          - placeholder fs/n_samples/n_channels (filled in post-migration)
+        """
+        from detector.animal_id import extract_animal_letter
+        from detector.migrate_blankmotion import (
+            find_blankmotion_files, _find_source_for_blankmotion,
+        )
+
+        folder = QFileDialog.getExistingDirectory(
+            self, "Pick folder to scan for `_blankmotion.mat` files "
+                  "(recursive)", "",
+        )
+        if not folder:
+            return
+
+        found = find_blankmotion_files(Path(folder), recursive=True)
+        if not found:
+            QMessageBox.information(
+                self, "No files found",
+                f"No `_blankmotion.mat` files under:\n{folder}",
+            )
+            return
+
+        existing_ids = {
+            r.get("recording_id") for r in self._pa_table.recordings()
+        }
+        added_now = 0       # fully-resolved (already migrated)
+        added_pending = 0   # waiting for batch migration at train time
+        skipped_duplicate = 0
+        skipped_no_source = 0
+
+        for bp in found:
+            # Try to resolve with siblings -- if all splitter files are
+            # already on disk, take that path (no migration needed).
+            record = resolve_record_from_picked_file(
+                bp, parent_widget=None,    # silent: no prompts here
+                auto_migrate_blankmotion=False,
+            )
+            if record is not None:
+                if record["recording_id"] in existing_ids:
+                    skipped_duplicate += 1
+                    continue
+                existing_ids.add(record["recording_id"])
+                record["extra"] = True
+                self._per_animal_extras.append(record)
+                added_now += 1
+                continue
+            # Resolver returned None -- splitter siblings missing.
+            # Build a pending record if a source exists.
+            source = _find_source_for_blankmotion(bp)
+            if source is None:
+                skipped_no_source += 1
+                continue
+            # Strip the `_blankmotion` suffix to get the recording id.
+            stem = bp.stem
+            core = (stem[: -len("_blankmotion")]
+                    if stem.endswith("_blankmotion") else stem)
+            if core in existing_ids:
+                skipped_duplicate += 1
+                continue
+            existing_ids.add(core)
+            # Expected output paths post-migration.
+            parent_dir = bp.parent
+            clean_out = parent_dir / f"{core}_clean.h5"
+            bad_out = parent_dir / f"{core}_bad.h5"
+            baseline_out = parent_dir / f"{core}_baseline.h5"
+            rec_type = ("stim_rec" if "_stim_rec" in core
+                        else "baseline" if "_bl_" in core
+                        else "baseline")
+            self._per_animal_extras.append({
+                "recording_id": core,
+                "source_path": str(source.resolve()),
+                "blankmotion_path": str(bp.resolve()),
+                "splitter_clean_path": str(clean_out.resolve()),
+                "splitter_bad_path": str(bad_out.resolve()),
+                "splitter_baseline_path": str(baseline_out.resolve()),
+                "rec_type": rec_type,
+                # Placeholders -- re-read from clean.h5 after migration.
+                "fs": 24414.0625,
+                "n_samples": 0,
+                "n_channels": 5,
+                "label_source": "human",
+                "added_by": "pyqt_ui_folder_add",
+                "notes": "pending migration from blankmotion",
+                "model_version_last_trained_on": None,
+                "held_out": False,
+                "animal": extract_animal_letter(core),
+                "extra": True,
+                "pending_migration": True,
+            })
+            added_pending += 1
+
+        if (added_now or added_pending or
+                skipped_duplicate or skipped_no_source):
+            self._refresh_per_animal_tab()
+            # Summary popup so the user knows what happened.
+            lines = [f"Scanned folder: {folder}"]
+            lines.append(f"  blankmotion files found: {len(found)}")
+            if added_now:
+                lines.append(
+                    f"  added (already migrated): {added_now}"
+                )
+            if added_pending:
+                lines.append(
+                    f"  added (pending migration): {added_pending}"
+                )
+                lines.append(
+                    "    -> these batch-migrate in parallel right "
+                    "before training starts"
+                )
+            if skipped_duplicate:
+                lines.append(
+                    f"  skipped (already in table): {skipped_duplicate}"
+                )
+            if skipped_no_source:
+                lines.append(
+                    f"  skipped (no source .mat sibling): "
+                    f"{skipped_no_source}"
+                )
+            QMessageBox.information(
+                self, "Folder scan complete", "\n".join(lines),
+            )
+
     def _on_per_animal_clear_extras(self) -> None:
         if not self._per_animal_extras:
             return
@@ -1528,6 +1685,20 @@ class TrainingWindow(QMainWindow):
                 "column to group recordings, or add more recordings "
                 "for the existing animals first.",
             )
+            return
+        # If there are pending-migration extras, batch-migrate them
+        # FIRST before kicking off training. Defers the per-file
+        # blankmotion -> splitter step to here so the user doesn't
+        # have to wait at add-time.
+        pending = [
+            x for x in self._per_animal_extras
+            if x.get("pending_migration")
+        ]
+        if pending:
+            self._run_pre_train_migration(pending)
+            # Migration runs async; when it finishes,
+            # `_on_pre_train_migration_done` re-enters this method
+            # via `_continue_per_animal_train_after_migration`.
             return
         # If the user added 'extra' files, those aren't in the manifest
         # we're going to pass to retrain_per_animal -- the orchestrator
@@ -1612,6 +1783,172 @@ class TrainingWindow(QMainWindow):
         self._per_animal_progress.setValue(0)
         self._btn_pa_train.setEnabled(False)
         self._per_animal_thread.start()
+
+    # ------------------------------------------------------------------
+    # Pre-train migration of pending-blankmotion extras
+    # ------------------------------------------------------------------
+    #
+    # When the user adds a folder of `_blankmotion.mat` files via
+    # "📁 Add folder...", any file without splitter siblings becomes
+    # a "pending" extra. We batch-migrate them in parallel right
+    # before training so the user doesn't sit through one prompt per
+    # file at add-time. This is a two-stage chain:
+    #
+    #   click Train -> migration worker runs -> on finish: re-resolve
+    #   extras, then start the actual per-animal training worker.
+
+    def _run_pre_train_migration(
+        self, pending: list[dict],
+    ) -> None:
+        """Kick off BlankmotionMigrationWorker on the pending extras'
+        blankmotion_path entries. On completion, calls
+        _on_pre_train_migration_done which re-resolves the pending
+        records and then re-enters _on_per_animal_train."""
+        from ui.workers.blankmotion_migration_worker import (
+            BlankmotionMigrationWorker,
+        )
+
+        blankmotion_paths = [
+            Path(p["blankmotion_path"]) for p in pending
+            if p.get("blankmotion_path")
+        ]
+        if not blankmotion_paths:
+            # Nothing actually migrate-able; treat as done.
+            self._on_pre_train_migration_done({})
+            return
+
+        self._pre_train_pending_extras = pending
+        self._pre_train_worker = BlankmotionMigrationWorker(
+            blankmotion_paths,
+            force=False,    # respect skip-existing
+            n_workers=None,  # auto
+        )
+        self._pre_train_thread = QThread()
+        self._pre_train_worker.moveToThread(self._pre_train_thread)
+        self._pre_train_thread.started.connect(
+            self._pre_train_worker.run
+        )
+        self._pre_train_worker.progress.connect(
+            self._on_pre_train_migration_progress
+        )
+        self._pre_train_worker.finished.connect(
+            self._on_pre_train_migration_done
+        )
+        self._pre_train_worker.error.connect(
+            self._on_pre_train_migration_error
+        )
+        self._pre_train_worker.finished.connect(
+            self._pre_train_thread.quit
+        )
+        self._pre_train_worker.error.connect(
+            self._pre_train_thread.quit
+        )
+        self._pre_train_thread.finished.connect(
+            self._pre_train_worker.deleteLater
+        )
+        self._pre_train_thread.finished.connect(
+            self._pre_train_thread.deleteLater
+        )
+        self._pre_train_progress = QProgressDialog(
+            f"Migrating {len(blankmotion_paths)} blankmotion file(s) "
+            "to splitter format (this happens once, then training "
+            "starts)…",
+            "Cancel", 0, len(blankmotion_paths), self,
+        )
+        self._pre_train_progress.setWindowTitle(
+            "Pre-train: migrating blankmotion files"
+        )
+        self._pre_train_progress.setWindowModality(Qt.WindowModal)
+        self._pre_train_progress.setMinimumDuration(0)
+        self._pre_train_progress.canceled.connect(
+            self._on_pre_train_migration_cancel
+        )
+        self._btn_pa_train.setEnabled(False)
+        self._pre_train_thread.start()
+
+    def _on_pre_train_migration_progress(
+        self, n_done: int, n_total: int, res: dict,
+    ) -> None:
+        if self._pre_train_progress is None:
+            return
+        self._pre_train_progress.setValue(n_done)
+        bp_name = Path(res.get("blankmotion_path", "?")).name
+        st = res.get("status", "?")
+        self._pre_train_progress.setLabelText(
+            f"[{n_done}/{n_total}] {bp_name}  -> {st}\n\n"
+            "Training will start automatically when all migrations "
+            "finish."
+        )
+
+    def _on_pre_train_migration_done(self, summary: dict) -> None:
+        """Migration finished. Re-resolve each pending extra to fill
+        in real fs/n_samples/etc from the freshly-created clean.h5,
+        then proceed to per-animal training."""
+        if self._pre_train_progress is not None:
+            self._pre_train_progress.close()
+            self._pre_train_progress = None
+        # Re-resolve each pending extra. If the migration succeeded,
+        # the splitter siblings now exist and the resolver returns a
+        # full record. If migration failed for some, drop those.
+        n_resolved = 0
+        n_dropped = 0
+        new_extras: list[dict] = []
+        for extra in self._per_animal_extras:
+            if not extra.get("pending_migration"):
+                new_extras.append(extra)
+                continue
+            # Re-resolve from the (now-existing) clean.h5 sibling.
+            clean_path = extra.get("splitter_clean_path")
+            if not clean_path or not Path(clean_path).exists():
+                n_dropped += 1
+                continue
+            resolved = resolve_record_from_picked_file(
+                Path(clean_path),
+                parent_widget=None,
+                auto_migrate_blankmotion=False,
+            )
+            if resolved is None:
+                n_dropped += 1
+                continue
+            # Preserve the original `animal` if the user had edited it,
+            # otherwise use the auto-detect from the re-resolve.
+            if extra.get("animal"):
+                resolved["animal"] = extra["animal"]
+            resolved["extra"] = True
+            new_extras.append(resolved)
+            n_resolved += 1
+        self._per_animal_extras = new_extras
+        self._refresh_per_animal_tab()
+        # Brief status
+        if summary and (summary.get("n_error", 0) > 0 or n_dropped > 0):
+            QMessageBox.warning(
+                self, "Some migrations failed",
+                f"Migrated {n_resolved} file(s); dropped {n_dropped} "
+                f"(migration failed or splitter files missing).\n\n"
+                "Training will still start with the successfully-"
+                "migrated files.",
+            )
+        # Re-enter the training launcher. The pending check will now
+        # find nothing and proceed to start the train worker.
+        self._on_per_animal_train()
+
+    def _on_pre_train_migration_error(self, msg: str) -> None:
+        if self._pre_train_progress is not None:
+            self._pre_train_progress.close()
+            self._pre_train_progress = None
+        self._btn_pa_train.setEnabled(True)
+        QMessageBox.critical(
+            self, "Pre-train migration failed",
+            f"{msg}\n\nNo training will run.",
+        )
+
+    def _on_pre_train_migration_cancel(self) -> None:
+        if hasattr(self, "_pre_train_worker") and self._pre_train_worker:
+            try:
+                self._pre_train_worker.request_cancel()
+            except Exception:
+                pass
+        self._btn_pa_train.setEnabled(True)
 
     def _on_per_animal_progress(self, idx: int, total: int,
                                   animal: str, status: str) -> None:
