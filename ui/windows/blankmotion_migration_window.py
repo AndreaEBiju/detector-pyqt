@@ -136,6 +136,20 @@ class BlankmotionMigrationWindow(QMainWindow):
             "this to overwrite them."
         )
         opt_row.addWidget(self._force_cb)
+        # NEW: also add each successfully-migrated recording to the
+        # training manifest. Default OFF -- manifest changes are
+        # consequential (every retrain uses the manifest), so users
+        # should explicitly opt in.
+        self._add_to_manifest_cb = QCheckBox(
+            "Also add to training manifest"
+        )
+        self._add_to_manifest_cb.setToolTip(
+            "After each successful migration, register the recording "
+            "in the training manifest (~/.detector/training_manifest.json) "
+            "so it participates in the next retrain. Default OFF -- "
+            "review the migration outputs first if you're unsure."
+        )
+        opt_row.addWidget(self._add_to_manifest_cb)
         opt_row.addStretch(1)
         opt_row.addWidget(QLabel("Workers:"))
         self._workers_spin = QSpinBox()
@@ -371,6 +385,24 @@ class BlankmotionMigrationWindow(QMainWindow):
         """One file just finished -- update its row + the progress bar."""
         bp = res.get("blankmotion_path")
         row = self._row_for_path(bp)
+        # Tally how many got added to manifest this run so we can
+        # report it in the final summary.
+        manifest_status = None
+        if (res["status"] in ("ok", "skipped_existing")
+                and self._add_to_manifest_cb.isChecked()
+                and res.get("source_path")):
+            manifest_status = self._add_to_manifest(res)
+            # Track counts on `self` for the finished-summary dialog.
+            self._n_manifest_added = getattr(
+                self, "_n_manifest_added", 0,
+            ) + (1 if manifest_status == "added" else 0)
+            self._n_manifest_dup = getattr(
+                self, "_n_manifest_dup", 0,
+            ) + (1 if manifest_status == "duplicate" else 0)
+            self._n_manifest_fail = getattr(
+                self, "_n_manifest_fail", 0,
+            ) + (1 if manifest_status not in ("added", "duplicate")
+                 else 0)
         if row is not None:
             status_item = QTableWidgetItem(res.get("status", "?"))
             notes_text = ""
@@ -385,11 +417,57 @@ class BlankmotionMigrationWindow(QMainWindow):
             elif res["status"] == "error":
                 status_item.setForeground(QColor("#d62728"))
                 notes_text = res.get("error", "?")
+            # Append manifest-add status to the notes column so the
+            # user sees per-row what happened in the manifest step.
+            if manifest_status == "added":
+                notes_text += "  · +manifest"
+            elif manifest_status == "duplicate":
+                notes_text += "  · manifest already has it"
+            elif manifest_status not in (None, "ok"):
+                notes_text += f"  · manifest add FAILED: {manifest_status}"
             self._table.setItem(row, COL_STATUS, status_item)
             self._table.setItem(row, COL_NOTES,
                                   QTableWidgetItem(notes_text))
         self._progress.setValue(n_done)
         self._progress.setFormat(f"{n_done} / {n_total}")
+
+    def _add_to_manifest(self, res: dict) -> str:
+        """Register the just-migrated recording in the training
+        manifest. Returns one of: 'added', 'duplicate', or an error
+        string. Reuses `resolve_record_from_picked_file` so the field
+        population matches what the Training Management add-recording
+        flow uses."""
+        try:
+            from ui.windows.training_window import (
+                resolve_record_from_picked_file,
+            )
+            from detector.manifest import Manifest
+            from detector import paths as detector_paths
+
+            source_path = res.get("source_path")
+            if not source_path:
+                return "no source_path in result"
+            record = resolve_record_from_picked_file(
+                Path(source_path),
+                parent_widget=None,           # no prompts in bulk mode
+                auto_migrate_blankmotion=False,
+            )
+            if record is None:
+                return "could not resolve record fields"
+
+            manifest_path = detector_paths.get_manifest_path()
+            if not manifest_path.exists():
+                return f"manifest not found at {manifest_path}"
+            m = Manifest.load(manifest_path)
+            # Duplicate check
+            if any(r["recording_id"] == record["recording_id"]
+                   for r in m.recordings):
+                return "duplicate"
+            m.add_recording(record, by="blankmotion_migration_ui")
+            m.save(manifest_path)
+            return "added"
+        except Exception as e:
+            return f"{type(e).__name__}: {e}"
 
     def _row_for_path(self, bp: Optional[str]) -> Optional[int]:
         if not bp:
@@ -412,6 +490,22 @@ class BlankmotionMigrationWindow(QMainWindow):
             f"  errors:             {summary['n_error']}\n"
             f"  elapsed:            {summary['elapsed_s']:.1f}s"
         )
+        # If manifest-add was enabled, append those counts to the
+        # summary so the user sees what landed in the manifest.
+        if self._add_to_manifest_cb.isChecked():
+            n_added = getattr(self, "_n_manifest_added", 0)
+            n_dup = getattr(self, "_n_manifest_dup", 0)
+            n_fail = getattr(self, "_n_manifest_fail", 0)
+            msg += (
+                f"\n\nManifest:\n"
+                f"  added:              {n_added}\n"
+                f"  already present:    {n_dup}\n"
+                f"  failed to add:      {n_fail}"
+            )
+            # Reset counters for the next run.
+            self._n_manifest_added = 0
+            self._n_manifest_dup = 0
+            self._n_manifest_fail = 0
         if summary["n_error"] > 0:
             QMessageBox.warning(self, "Migration complete (with errors)",
                                   msg)

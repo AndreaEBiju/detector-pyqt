@@ -2899,14 +2899,41 @@ def _hp_n_trials_for(label: str) -> str:
 
 class AddRecordingDialog(QDialog):
     """Form for adding a new recording to the manifest. Pre-fills
-    fields from the picked clean.h5 + bad.h5 paths where possible."""
+    fields from any of clean.h5 / blankmotion.mat / source.mat
+    via the shared `resolve_record_from_picked_file` helper."""
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.setWindowTitle("Add recording")
-        self.resize(640, 360)
+        self.resize(680, 420)
 
-        form = QFormLayout(self)
+        outer = QVBoxLayout(self)
+
+        # Banner explaining the wider input scope. Without this, users
+        # who only ever see "clean.h5" labels won't know they can pick
+        # a `_blankmotion.mat` and get everything auto-filled (with
+        # an inline migration prompt if the splitter files don't
+        # exist yet).
+        banner = QLabel(
+            "<b>Quick fill:</b> click the <code>…</code> next to "
+            "<i>clean.h5</i> and pick ANY of "
+            "<code>*_clean.h5</code>, <code>*_blankmotion.mat</code>, "
+            "or source <code>*.mat</code> -- all other fields "
+            "auto-fill from siblings. For legacy "
+            "<code>_blankmotion.mat</code> files with no splitter "
+            "siblings, you'll be prompted to migrate inline."
+        )
+        banner.setTextFormat(Qt.RichText)
+        banner.setWordWrap(True)
+        banner.setStyleSheet(
+            "padding: 6px; background-color: #eef5ff; "
+            "border-left: 3px solid #2a7fff;"
+        )
+        outer.addWidget(banner)
+
+        form_widget = QWidget()
+        form = QFormLayout(form_widget)
+        outer.addWidget(form_widget)
         self._rid_edit = QLineEdit()
         form.addRow("recording_id", self._rid_edit)
         self._source_edit = QLineEdit()
@@ -2920,9 +2947,14 @@ class AddRecordingDialog(QDialog):
         clean_row = QHBoxLayout()
         clean_row.addWidget(self._clean_edit)
         btn_clean = QPushButton("…")
+        btn_clean.setToolTip(
+            "Pick clean.h5, blankmotion.mat, OR source .mat. "
+            "Every other field on the form auto-fills from the "
+            "siblings discovered alongside the picked file."
+        )
         btn_clean.clicked.connect(self._pick_clean)
         clean_row.addWidget(btn_clean)
-        form.addRow("clean.h5", clean_row)
+        form.addRow("clean.h5 (or any input file)", clean_row)
         self._bad_edit = QLineEdit()
         bad_row = QHBoxLayout()
         bad_row.addWidget(self._bad_edit)
