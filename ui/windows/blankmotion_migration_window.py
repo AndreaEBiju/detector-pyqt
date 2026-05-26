@@ -181,21 +181,37 @@ class BlankmotionMigrationWindow(QMainWindow):
     # Queue management
     # ------------------------------------------------------------------
 
+    def _last_dir(self) -> str:
+        """Default directory for the file/folder pickers. Remembers
+        the most recent picked location so the user doesn't have to
+        re-navigate from C:\\ every time. Falls back to the user's
+        home dir. Passing a real path (not '') also dodges Qt's
+        Windows-only 'Unhandled scheme: data' warning from
+        QWindowsNativeFileDialogBase when the dialog's default is
+        ambiguous."""
+        return getattr(self, "_remembered_dir", None) or str(Path.home())
+
+    def _remember_dir(self, path: Path) -> None:
+        self._remembered_dir = str(path.parent if path.is_file() else path)
+
     def _on_add_files(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(
             self,
             "Pick legacy _blankmotion.mat files",
-            "",
+            self._last_dir(),
             "Blankmotion (*_blankmotion.mat);;All MAT files (*.mat);;All files (*)",
         )
         if paths:
+            self._remember_dir(Path(paths[0]))
             self._add_files([Path(p) for p in paths])
 
     def _on_add_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(
-            self, "Pick folder to scan for _blankmotion.mat (recursive)"
+            self, "Pick folder to scan for _blankmotion.mat (recursive)",
+            self._last_dir(),
         )
         if folder:
+            self._remember_dir(Path(folder))
             found = find_blankmotion_files(Path(folder), recursive=True)
             if not found:
                 QMessageBox.information(
@@ -415,7 +431,14 @@ class BlankmotionMigrationWindow(QMainWindow):
         self._btn_cancel.setEnabled(False)
 
     def closeEvent(self, event) -> None:
-        if self._worker is not None:
+        # If a migration is in flight, ask the user, then WAIT for the
+        # thread to actually exit before letting the window close.
+        # Without the wait, the Python QThread reference drops while
+        # the underlying C++ thread is still running -- Qt prints:
+        #   QThread: Destroyed while thread '' is still running
+        # The warning is benign in our case (Pool workers self-clean),
+        # but it's confusing and looks alarming in the terminal.
+        if self._worker is not None and self._thread is not None:
             resp = QMessageBox.question(
                 self, "Migration in progress",
                 "A migration is still running. Cancel it and close?",
@@ -423,5 +446,10 @@ class BlankmotionMigrationWindow(QMainWindow):
             if resp != QMessageBox.Yes:
                 event.ignore()
                 return
-            self._on_cancel()
+            self._worker.request_cancel()
+            self._thread.quit()
+            # Wait up to 30s for the thread loop to exit cleanly.
+            # imap_unordered will keep returning results from already-
+            # in-flight Pool workers; once they finish, the loop ends.
+            self._thread.wait(30_000)
         super().closeEvent(event)
