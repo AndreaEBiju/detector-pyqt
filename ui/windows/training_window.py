@@ -28,12 +28,13 @@ import pandas as pd
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QAction, QBrush, QColor, QKeySequence, QTextCursor
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView,
-    QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
-    QProgressBar, QProgressDialog, QPushButton, QSpinBox, QSplitter,
-    QTabWidget, QTableWidget, QTableWidgetItem, QTextEdit, QToolBar,
-    QVBoxLayout, QWidget, QDoubleSpinBox,
+    QAbstractItemView, QButtonGroup, QCheckBox, QComboBox, QDialog,
+    QDialogButtonBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox,
+    QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow,
+    QMessageBox, QPlainTextEdit, QProgressBar, QProgressDialog, QPushButton,
+    QRadioButton, QSizePolicy, QSpinBox, QSplitter, QTabWidget, QTableWidget,
+    QTableWidgetItem, QTextEdit, QToolBar, QVBoxLayout, QWidget,
+    QDoubleSpinBox,
 )
 
 _repo_root = Path(__file__).resolve().parent.parent.parent
@@ -51,6 +52,10 @@ from detector.preprocessing import profiles as detector_profiles
 from ui.data import settings as ui_settings
 from ui.widgets.per_animal_table import (
     PerAnimalTable, normalize_animal_letter,
+)
+from ui.dialogs.hyperopt_plots_dialog import HyperoptPlotsDialog
+from ui.workers.hyperopt_worker import (
+    HyperoptWorker, scan_completed_studies,
 )
 from ui.workers.per_animal_train_worker import PerAnimalTrainWorker
 from ui.workers.retrain_worker import (
@@ -87,11 +92,22 @@ class TrainingWindow(QMainWindow):
         # window open; not persisted.
         self._per_animal_extras: list[dict] = []
 
+        # Hyperopt state. Same shape as per-animal: a QThread + worker
+        # that live until the optimization finishes (1-6 hours), with
+        # a "running, don't close" banner during the run.
+        self._hyperopt_thread: Optional[QThread] = None
+        self._hyperopt_worker: Optional[HyperoptWorker] = None
+        # Per-scope tracking populated as the worker streams results.
+        # Combined: single entry under key "combined". Per-animal:
+        # one entry per animal letter as soon as its study spins up.
+        self._hyperopt_results: dict[str, dict] = {}
+
         self._tabs = QTabWidget()
         self._tab_manifest = self._build_manifest_tab()
         self._tab_versions = self._build_versions_tab()
         self._tab_retrain = self._build_retrain_tab()
         self._tab_per_animal = self._build_per_animal_tab()
+        self._tab_hyperopt = self._build_hyperopt_tab()
         self._tab_convergence = self._build_convergence_tab()
         self._tab_preprocessing = self._build_preprocessing_tab()
         self._tab_settings = self._build_settings_tab()
@@ -99,6 +115,7 @@ class TrainingWindow(QMainWindow):
         self._tabs.addTab(self._tab_versions, "Versions")
         self._tabs.addTab(self._tab_retrain, "Retrain")
         self._tabs.addTab(self._tab_per_animal, "Per-animal training")
+        self._tabs.addTab(self._tab_hyperopt, "Hyperopt")
         self._tabs.addTab(self._tab_convergence, "Convergence")
         self._tabs.addTab(self._tab_preprocessing, "Preprocessing")
         self._tabs.addTab(self._tab_settings, "Settings")
@@ -1450,6 +1467,694 @@ class TrainingWindow(QMainWindow):
                 self._pa_results_table.setItem(i, col, item)
 
     # ==================================================================
+    # Hyperopt tab
+    # ==================================================================
+
+    def _build_hyperopt_tab(self) -> QWidget:
+        """Hyperparameter optimization for the active-learning weights.
+
+        Wraps `detector.hyperopt.optimize_combined` (one study over the
+        full manifest) or `optimize_per_animal` (one study per animal
+        letter). Each trial trains one LightGBM booster -- 1-3 min --
+        so a 30-trial combined study lands at ~1-2 hours and a per-
+        animal sweep across N animals at ~N x 20 x 2 min.
+
+        UI shape: scope radio at the top, a config form, run/cancel
+        row, live progress section, then a results table with buttons
+        to view plots and apply best params to the next retrain.
+        """
+        w = QWidget()
+        layout = QVBoxLayout(w)
+
+        # ----- Scope picker --------------------------------------------
+        scope_box = QGroupBox("Scope")
+        scope_row = QHBoxLayout(scope_box)
+        self._hp_scope_combined = QRadioButton("Combined model")
+        self._hp_scope_combined.setChecked(True)
+        self._hp_scope_per_animal = QRadioButton("Per-animal models")
+        self._hp_scope_group = QButtonGroup(self)
+        self._hp_scope_group.addButton(self._hp_scope_combined)
+        self._hp_scope_group.addButton(self._hp_scope_per_animal)
+        self._hp_scope_combined.toggled.connect(self._on_hp_scope_toggled)
+        scope_row.addWidget(self._hp_scope_combined)
+        scope_row.addWidget(self._hp_scope_per_animal)
+        scope_row.addStretch(1)
+        layout.addWidget(scope_box)
+
+        # ----- Settings form -------------------------------------------
+        cfg_box = QGroupBox("Hyperopt settings")
+        form = QFormLayout(cfg_box)
+
+        self._hp_n_trials_spin = QSpinBox()
+        self._hp_n_trials_spin.setRange(2, 500)
+        self._hp_n_trials_spin.setValue(30)
+        self._hp_n_trials_spin.setToolTip(
+            "Number of Optuna trials. Each trial trains one LightGBM "
+            "booster (~1-3 min). 30 is a reasonable default for the "
+            "combined model; per-animal studies use 20 by default to "
+            "stay within Andrea's overnight window."
+        )
+        form.addRow("n_trials", self._hp_n_trials_spin)
+
+        self._hp_beta_spin = QDoubleSpinBox()
+        self._hp_beta_spin.setRange(0.5, 4.0)
+        self._hp_beta_spin.setSingleStep(0.1)
+        self._hp_beta_spin.setDecimals(2)
+        self._hp_beta_spin.setValue(2.0)
+        self._hp_beta_spin.setToolTip(
+            "F-beta objective weight. beta=1 is balanced F1; beta=2 "
+            "(default) penalizes false negatives 4x more than false "
+            "positives -- matches the 'missed artifacts hurt "
+            "downstream' bias."
+        )
+        form.addRow("beta (F-beta)", self._hp_beta_spin)
+
+        self._hp_seed_spin = QSpinBox()
+        self._hp_seed_spin.setRange(0, 100_000)
+        self._hp_seed_spin.setValue(42)
+        form.addRow("seed", self._hp_seed_spin)
+
+        self._hp_review_dir_edit = QLineEdit()
+        self._hp_review_dir_edit.setPlaceholderText(
+            "(optional) path to a review/ folder -- e.g. "
+            "<artifacts>/model_v0.2.0/review"
+        )
+        self._hp_review_dir_edit.setToolTip(
+            "Same active-learning loop as the Retrain tab: if you "
+            "have a previous model's review/ folder, point at it so "
+            "every trial trains with the FP/FN judgments folded in. "
+            "Blank = no review feedback."
+        )
+        review_row = QHBoxLayout()
+        review_row.addWidget(self._hp_review_dir_edit)
+        btn_pick_review = QPushButton("...")
+        btn_pick_review.clicked.connect(self._on_hp_pick_review_dir)
+        review_row.addWidget(btn_pick_review)
+        form.addRow("review feedback dir", review_row)
+
+        # Per-animal-only widgets. Gated by `_on_hp_scope_toggled`.
+        self._hp_min_recs_spin = QSpinBox()
+        self._hp_min_recs_spin.setRange(2, 50)
+        self._hp_min_recs_spin.setValue(4)
+        self._hp_min_recs_spin.setEnabled(False)
+        self._hp_min_recs_spin.setToolTip(
+            "Animals with fewer than this many training recordings "
+            "are skipped -- not enough rows for a meaningful "
+            "train/val split."
+        )
+        form.addRow("min recordings per animal", self._hp_min_recs_spin)
+
+        # "Only animals" picker -- a grid of checkboxes inside a group
+        # box. Populated lazily from the manifest in
+        # `_refresh_hyperopt_animal_checks` each time the tab is
+        # refreshed or scope flips to per-animal.
+        self._hp_only_box = QGroupBox(
+            "Only animals (leave all unchecked = all eligible)"
+        )
+        self._hp_only_grid = QGridLayout(self._hp_only_box)
+        self._hp_only_grid.setHorizontalSpacing(12)
+        self._hp_animal_checks: dict[str, QCheckBox] = {}
+        self._hp_only_hint = QLabel(
+            "<i>(per-animal scope only)</i>"
+        )
+        self._hp_only_hint.setStyleSheet("color: #888;")
+        self._hp_only_grid.addWidget(self._hp_only_hint, 0, 0)
+        self._hp_only_box.setEnabled(False)
+        form.addRow(self._hp_only_box)
+
+        layout.addWidget(cfg_box)
+
+        # ----- Action row ----------------------------------------------
+        action_row = QHBoxLayout()
+        self._btn_hp_run = QPushButton("▶ Run hyperopt")
+        self._btn_hp_run.clicked.connect(self._on_run_hyperopt)
+        action_row.addWidget(self._btn_hp_run)
+        self._hp_running_banner = QLabel("")
+        self._hp_running_banner.setStyleSheet(
+            "color: #c84; font-weight: bold; padding: 4px;"
+        )
+        action_row.addWidget(self._hp_running_banner)
+        action_row.addStretch(1)
+        layout.addLayout(action_row)
+
+        # ----- Progress display ----------------------------------------
+        prog_box = QGroupBox("Progress")
+        prog_layout = QVBoxLayout(prog_box)
+        self._hp_phase_label = QLabel("idle")
+        self._hp_phase_label.setStyleSheet(
+            "font-family: monospace; font-size: 12px;"
+        )
+        prog_layout.addWidget(self._hp_phase_label)
+        self._hp_progress = QProgressBar()
+        self._hp_progress.setRange(0, 100)
+        prog_layout.addWidget(self._hp_progress)
+        self._hp_log = QPlainTextEdit()
+        self._hp_log.setReadOnly(True)
+        self._hp_log.setMaximumBlockCount(2000)
+        self._hp_log.setStyleSheet(
+            "font-family: monospace; font-size: 11px; "
+            "background: #1a1a1a; color: #ddd;"
+        )
+        self._hp_log.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Expanding,
+        )
+        prog_layout.addWidget(self._hp_log, stretch=1)
+        layout.addWidget(prog_box, stretch=1)
+
+        # ----- Results table -------------------------------------------
+        results_box = QGroupBox("Results (per study)")
+        results_layout = QVBoxLayout(results_box)
+        self._hp_results_summary = QLabel("(no hyperopt run yet)")
+        self._hp_results_summary.setStyleSheet("color: #aaa; padding: 2px;")
+        results_layout.addWidget(self._hp_results_summary)
+        self._hp_results_table = QTableWidget(0, 6)
+        self._hp_results_table.setHorizontalHeaderLabels([
+            "Study", "Trials", "w_neg", "fp_weight", "fn_weight",
+            "Best objective",
+        ])
+        self._hp_results_table.setSelectionBehavior(
+            QAbstractItemView.SelectRows,
+        )
+        self._hp_results_table.setSelectionMode(
+            QAbstractItemView.SingleSelection,
+        )
+        self._hp_results_table.setEditTriggers(
+            QAbstractItemView.NoEditTriggers,
+        )
+        self._hp_results_table.setAlternatingRowColors(True)
+        rhdr = self._hp_results_table.horizontalHeader()
+        rhdr.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        for c in range(1, 6):
+            rhdr.setSectionResizeMode(c, QHeaderView.Stretch)
+        results_layout.addWidget(self._hp_results_table)
+
+        # Action buttons for the selected row.
+        res_actions = QHBoxLayout()
+        self._btn_hp_open_plots = QPushButton("Open plots folder")
+        self._btn_hp_open_plots.setToolTip(
+            "Reveal the selected study's plots/ directory and open "
+            "the four optimization PNGs in a tabbed viewer."
+        )
+        self._btn_hp_open_plots.clicked.connect(self._on_hp_open_plots)
+        self._btn_hp_apply = QPushButton(
+            "Apply these params to next retrain"
+        )
+        self._btn_hp_apply.setToolTip(
+            "Copy the selected row's best w_neg / fp_weight / fn_weight "
+            "into the Retrain tab's spinboxes so the next retrain uses "
+            "the tuned weights."
+        )
+        self._btn_hp_apply.clicked.connect(self._on_hp_apply_to_retrain)
+        self._btn_hp_refresh_results = QPushButton(
+            "↻ Reload from disk"
+        )
+        self._btn_hp_refresh_results.setToolTip(
+            "Re-scan <artifacts>/hyperopt_*/ for completed studies and "
+            "repopulate the table. Useful when a CLI run finished "
+            "while the UI wasn't open."
+        )
+        self._btn_hp_refresh_results.clicked.connect(
+            self._refresh_hyperopt_results_table,
+        )
+        res_actions.addWidget(self._btn_hp_open_plots)
+        res_actions.addWidget(self._btn_hp_apply)
+        res_actions.addStretch(1)
+        res_actions.addWidget(self._btn_hp_refresh_results)
+        results_layout.addLayout(res_actions)
+        layout.addWidget(results_box, stretch=1)
+
+        return w
+
+    # ------------------------------------------------------------------
+    # Hyperopt-tab helpers
+    # ------------------------------------------------------------------
+
+    def _on_hp_scope_toggled(self, _checked: bool) -> None:
+        """Per-animal scope toggles the only-animals / min-recordings
+        controls and bumps the default n_trials per the CLI defaults
+        (30 combined / 20 per-animal). Only nudges the value if the
+        user hasn't changed it."""
+        per_animal = self._hp_scope_per_animal.isChecked()
+        self._hp_min_recs_spin.setEnabled(per_animal)
+        self._hp_only_box.setEnabled(per_animal)
+        # Default n_trials adjustment -- only if the field still holds
+        # the previous scope's default, so we don't overwrite a value
+        # the user already tuned.
+        cur = self._hp_n_trials_spin.value()
+        if per_animal and cur == 30:
+            self._hp_n_trials_spin.setValue(20)
+        elif not per_animal and cur == 20:
+            self._hp_n_trials_spin.setValue(30)
+        if per_animal:
+            self._refresh_hyperopt_animal_checks()
+
+    def _refresh_hyperopt_animal_checks(self) -> None:
+        """Repopulate the per-animal checkbox grid from the current
+        manifest. Called when the tab is refreshed and when the user
+        toggles to the per-animal scope."""
+        # Wipe existing checkboxes (keep the hint label managed
+        # separately).
+        for cb in self._hp_animal_checks.values():
+            self._hp_only_grid.removeWidget(cb)
+            cb.deleteLater()
+        self._hp_animal_checks.clear()
+        # Remove the placeholder hint if present.
+        if self._hp_only_hint is not None:
+            self._hp_only_grid.removeWidget(self._hp_only_hint)
+            self._hp_only_hint.setParent(None)
+            self._hp_only_hint = None
+
+        try:
+            from detector.animal_id import group_recordings_by_animal
+            manifest_path = detector_paths.get_manifest_path()
+            if not manifest_path.exists():
+                self._hp_only_hint = QLabel(
+                    "<i>(no manifest yet -- create one to enable "
+                    "per-animal scope)</i>"
+                )
+                self._hp_only_hint.setStyleSheet("color: #888;")
+                self._hp_only_grid.addWidget(self._hp_only_hint, 0, 0)
+                return
+            m = Manifest.load(manifest_path)
+            groups = group_recordings_by_animal(m.list_recordings())
+        except Exception as exc:
+            self._hp_only_hint = QLabel(f"<i>(error: {exc})</i>")
+            self._hp_only_hint.setStyleSheet("color: #c44;")
+            self._hp_only_grid.addWidget(self._hp_only_hint, 0, 0)
+            return
+
+        # Drop the None bucket (animals without an auto-detected letter).
+        letters = sorted(a for a in groups.keys() if a is not None)
+        if not letters:
+            self._hp_only_hint = QLabel(
+                "<i>(no animal letters detected -- edit the Animal "
+                "column on the Per-animal tab to assign letters)</i>"
+            )
+            self._hp_only_hint.setStyleSheet("color: #888;")
+            self._hp_only_grid.addWidget(self._hp_only_hint, 0, 0)
+            return
+        # Layout: max 6 checkboxes per row, label includes the count.
+        cols = 6
+        for i, letter in enumerate(letters):
+            n = len(groups[letter])
+            cb = QCheckBox(f"{letter} ({n})")
+            cb.setToolTip(
+                f"Include animal {letter} (n={n} recordings) in the "
+                "per-animal hyperopt run."
+            )
+            self._hp_animal_checks[letter] = cb
+            self._hp_only_grid.addWidget(cb, i // cols, i % cols)
+
+    def _on_hp_pick_review_dir(self) -> None:
+        start_dir = (
+            self._hp_review_dir_edit.text().strip() or str(Path.home())
+        )
+        path = QFileDialog.getExistingDirectory(
+            self, "Pick previous model's review/ folder", start_dir,
+        )
+        if path:
+            self._hp_review_dir_edit.setText(path)
+
+    def _on_run_hyperopt(self) -> None:
+        """Kick off the worker. Disables the run button + shows a
+        running banner; the user can keep using other tabs."""
+        if (self._hyperopt_thread is not None
+                and self._hyperopt_thread.isRunning()):
+            QMessageBox.information(
+                self, "Already running",
+                "A hyperopt run is already in progress.",
+            )
+            return
+        manifest_path = detector_paths.get_manifest_path()
+        if not manifest_path.exists():
+            QMessageBox.warning(
+                self, "No manifest",
+                f"No training manifest at {manifest_path}. Create one "
+                "via `detector init` or the Manifest tab.",
+            )
+            return
+        artifacts_dir = detector_paths.get_artifacts_dir()
+        scope = ("per_animal" if self._hp_scope_per_animal.isChecked()
+                 else "combined")
+        review_text = self._hp_review_dir_edit.text().strip()
+        review_dir = Path(review_text) if review_text else None
+        if review_dir is not None and not review_dir.exists():
+            resp = QMessageBox.question(
+                self, "Review dir not found",
+                f"The review feedback dir {review_dir} doesn't exist. "
+                "Run anyway without review feedback?",
+            )
+            if resp != QMessageBox.Yes:
+                return
+            review_dir = None
+
+        only_animals: Optional[list[str]] = None
+        if scope == "per_animal":
+            picked = [
+                letter for letter, cb in self._hp_animal_checks.items()
+                if cb.isChecked()
+            ]
+            only_animals = picked if picked else None
+
+        # Warn about the time cost so the user doesn't kick this off
+        # accidentally.
+        n_trials = int(self._hp_n_trials_spin.value())
+        rough_hours = (n_trials * 2) / 60.0
+        scope_label = ("per-animal" if scope == "per_animal" else "combined")
+        resp = QMessageBox.question(
+            self, "Run hyperopt?",
+            f"This will run a {scope_label} hyperopt with "
+            f"{n_trials} trials per study.\n\n"
+            f"Each trial trains one LightGBM booster (~1-3 min), so a "
+            f"single study takes roughly {rough_hours:.1f} hours. "
+            f"Per-animal scope multiplies that by the number of "
+            f"eligible animals.\n\n"
+            f"The UI stays responsive -- you can keep using other "
+            f"tabs. Don't close the application until the run "
+            f"finishes.\n\nContinue?",
+        )
+        if resp != QMessageBox.Yes:
+            return
+
+        try:
+            self._hyperopt_worker = HyperoptWorker(
+                scope=scope,
+                manifest_path=manifest_path,
+                artifacts_dir=artifacts_dir,
+                n_trials=n_trials,
+                beta=float(self._hp_beta_spin.value()),
+                seed=int(self._hp_seed_spin.value()),
+                review_dir=review_dir,
+                only_animals=only_animals,
+                min_recordings_per_animal=int(self._hp_min_recs_spin.value()),
+            )
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Could not start hyperopt", str(exc),
+            )
+            return
+
+        self._hyperopt_thread = QThread()
+        self._hyperopt_worker.moveToThread(self._hyperopt_thread)
+        self._hyperopt_thread.started.connect(self._hyperopt_worker.run)
+        self._hyperopt_worker.progress.connect(self._on_hp_progress)
+        self._hyperopt_worker.animal_started.connect(self._on_hp_animal_started)
+        self._hyperopt_worker.animal_finished.connect(
+            self._on_hp_animal_finished
+        )
+        self._hyperopt_worker.finished.connect(self._on_hp_finished)
+        self._hyperopt_worker.error.connect(self._on_hp_error)
+        self._hyperopt_worker.finished.connect(self._hyperopt_thread.quit)
+        self._hyperopt_worker.error.connect(self._hyperopt_thread.quit)
+        self._hyperopt_thread.finished.connect(
+            self._hyperopt_worker.deleteLater
+        )
+        self._hyperopt_thread.finished.connect(
+            self._hyperopt_thread.deleteLater
+        )
+
+        self._btn_hp_run.setEnabled(False)
+        self._hp_running_banner.setText(
+            "● Running -- do not close the application"
+        )
+        self._hp_phase_label.setText(
+            f"starting {scope_label} hyperopt ({n_trials} trials)…"
+        )
+        self._hp_progress.setRange(0, 100)
+        self._hp_progress.setValue(0)
+        self._hp_log.clear()
+        self._hp_log.appendPlainText(
+            f"[hyperopt] starting {scope_label} run, n_trials={n_trials}, "
+            f"beta={self._hp_beta_spin.value()}, "
+            f"seed={self._hp_seed_spin.value()}"
+        )
+        if review_dir is not None:
+            self._hp_log.appendPlainText(
+                f"[hyperopt] using review feedback at {review_dir}"
+            )
+        # Reset per-scope tracking.
+        self._hyperopt_results = {}
+        self._hyperopt_thread.start()
+
+    def _on_hp_progress(
+        self, scope: str, trial_num: int, total: int, objective: float,
+    ) -> None:
+        """One trial just landed. Update the progress bar (per-current-
+        study) + append a log line."""
+        if total > 0:
+            pct = int(min(100, max(0, 100 * trial_num / total)))
+        else:
+            pct = 0
+        self._hp_progress.setValue(pct)
+        self._hp_phase_label.setText(
+            f"{scope} -- trial {trial_num}/{total}"
+        )
+        obj_txt = (f"{objective:.4f}"
+                   if objective == objective         # NaN check
+                   else "n/a")
+        self._hp_log.appendPlainText(
+            f"[{scope}] trial {trial_num}/{total} -- objective={obj_txt}"
+        )
+
+    def _on_hp_animal_started(self, animal: str) -> None:
+        self._hp_log.appendPlainText(
+            f"[hyperopt] -- animal {animal} started --"
+        )
+        self._hp_phase_label.setText(f"animal {animal} -- starting…")
+        self._hp_progress.setValue(0)
+
+    def _on_hp_animal_finished(
+        self, animal: str, best_params: dict,
+    ) -> None:
+        bp = best_params.get("best_params", {}) if best_params else {}
+        bo = best_params.get("best_objective") if best_params else None
+        # Cache the result so the results table picks it up even before
+        # `finished` fires (e.g. mid-run when N-1 animals are done).
+        self._hyperopt_results[animal] = {
+            "best_params": bp,
+            "best_objective": bo,
+        }
+        self._hp_log.appendPlainText(
+            f"[hyperopt] -- animal {animal} done: "
+            f"best_objective={bo}, params={bp} --"
+        )
+        # Live-update the results table.
+        self._refresh_hyperopt_results_table()
+
+    def _on_hp_finished(self, results: dict) -> None:
+        self._hyperopt_worker = None
+        self._hyperopt_thread = None
+        self._btn_hp_run.setEnabled(True)
+        self._hp_running_banner.setText("")
+        self._hp_phase_label.setText("done")
+        self._hp_progress.setValue(100)
+        # The full results envelope shape differs between scopes:
+        #   combined  -> single scope_result_dict
+        #   per_animal-> {animal: scope_result_dict, ...}
+        # The results table reads best_params.json from disk via
+        # scan_completed_studies(), so we just trigger a reload.
+        self._hp_log.appendPlainText(
+            "[hyperopt] run finished -- reloading results table"
+        )
+        self._refresh_hyperopt_results_table()
+
+    def _on_hp_error(self, message: str) -> None:
+        self._hyperopt_worker = None
+        self._hyperopt_thread = None
+        self._btn_hp_run.setEnabled(True)
+        self._hp_running_banner.setText("")
+        self._hp_phase_label.setText("FAILED")
+        self._hp_log.appendPlainText(
+            f"[hyperopt] FAILED: {message}"
+        )
+        QMessageBox.critical(
+            self, "Hyperopt failed",
+            f"The hyperopt orchestrator crashed:\n\n{message}",
+        )
+
+    def _refresh_hyperopt_results_table(self) -> None:
+        """Re-scan the artifacts dir for completed studies and rebuild
+        the results table. Called on tab refresh, after each animal
+        finishes, and on demand via the Reload button."""
+        try:
+            artifacts_dir = detector_paths.get_artifacts_dir()
+            studies = scan_completed_studies(artifacts_dir)
+        except Exception as exc:
+            self._hp_results_summary.setText(
+                f"<span style='color:#c44'>Error scanning artifacts: "
+                f"{exc}</span>"
+            )
+            return
+
+        # Build rows: ("combined", payload) first if present, then
+        # one row per animal in alphabetical order.
+        rows: list[tuple[str, dict]] = []
+        if studies.get("combined"):
+            rows.append(("combined", studies["combined"]))
+        for animal in sorted(studies.get("per_animal", {}).keys()):
+            rows.append((animal, studies["per_animal"][animal]))
+
+        if not rows:
+            self._hp_results_summary.setText(
+                "(no hyperopt run yet -- launch one above, or run "
+                "`detector hyperopt` from the CLI)"
+            )
+            self._hp_results_table.setRowCount(0)
+            return
+
+        self._hp_results_summary.setText(
+            f"<b>{len(rows)}</b> completed study(ies)"
+        )
+        self._hp_results_table.setRowCount(len(rows))
+        for i, (label, payload) in enumerate(rows):
+            bp = payload.get("best_params", {}) or {}
+            bo = payload.get("best_objective")
+            # holdout_rids isn't shown but it's load-bearing for the
+            # apply-button to remember which study a row came from.
+            cells = [
+                label,
+                # We don't have n_trials per row on disk in
+                # best_params.json -- read from trial_log.json if
+                # cheaply available, else "—".
+                _hp_n_trials_for(label),
+                _fmt(bp.get("w_neg"), 4),
+                _fmt(bp.get("fp_weight"), 3),
+                _fmt(bp.get("fn_weight"), 3),
+                _fmt(bo, 4),
+            ]
+            for col, text in enumerate(cells):
+                item = QTableWidgetItem(str(text))
+                self._hp_results_table.setItem(i, col, item)
+        # Auto-select the first row so the apply/plots buttons act on
+        # something meaningful by default.
+        self._hp_results_table.selectRow(0)
+
+    def _selected_hyperopt_study(self) -> Optional[tuple[str, Path]]:
+        """Return (study_label, study_workdir) for the currently-
+        selected row, or None if nothing is selected."""
+        row = self._hp_results_table.currentRow()
+        if row < 0:
+            return None
+        label_item = self._hp_results_table.item(row, 0)
+        if label_item is None:
+            return None
+        label = label_item.text()
+        artifacts_dir = detector_paths.get_artifacts_dir()
+        if label == "combined":
+            return label, artifacts_dir / "hyperopt_combined"
+        return label, artifacts_dir / "hyperopt_per_animal" / label
+
+    def _on_hp_open_plots(self) -> None:
+        sel = self._selected_hyperopt_study()
+        if sel is None:
+            QMessageBox.information(
+                self, "Pick a study",
+                "Select a row in the results table first.",
+            )
+            return
+        label, workdir = sel
+        plots_dir = workdir / "hyperopt" / "plots"
+        if not plots_dir.exists():
+            QMessageBox.warning(
+                self, "Plots not found",
+                f"Expected plots dir at {plots_dir} but it doesn't "
+                "exist. The backend's plot step may have failed -- "
+                "check the run log.",
+            )
+            return
+        dlg = HyperoptPlotsDialog(
+            plots_dir, study_label=label, parent=self,
+        )
+        dlg.exec()
+
+    def _on_hp_apply_to_retrain(self) -> None:
+        """Copy the selected study's best params into the Retrain tab's
+        spinboxes (w_neg, review FP weight, review FN weight) and
+        switch to that tab so the user sees the values landed."""
+        sel = self._selected_hyperopt_study()
+        if sel is None:
+            QMessageBox.information(
+                self, "Pick a study",
+                "Select a row in the results table first.",
+            )
+            return
+        label, workdir = sel
+        bp_path = workdir / "hyperopt" / "best_params.json"
+        if not bp_path.exists():
+            QMessageBox.warning(
+                self, "No best_params.json",
+                f"Expected {bp_path} but the file is missing. The "
+                "study may not have finished.",
+            )
+            return
+        try:
+            data = json.loads(bp_path.read_text())
+            params = data.get("best_params", {})
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Could not read best_params.json",
+                f"{exc}",
+            )
+            return
+
+        w_neg = params.get("w_neg")
+        fp_weight = params.get("fp_weight")
+        fn_weight = params.get("fn_weight")
+        # Spinboxes clamp to their configured ranges, so out-of-range
+        # values just get pinned (and we tell the user).
+        clamped_notes: list[str] = []
+        if w_neg is not None:
+            target = float(w_neg)
+            lo, hi = self._w_neg_spin.minimum(), self._w_neg_spin.maximum()
+            if target < lo or target > hi:
+                clamped_notes.append(
+                    f"w_neg {target:.4f} clamped to [{lo}, {hi}]"
+                )
+            self._w_neg_spin.setValue(max(lo, min(hi, target)))
+        if fp_weight is not None:
+            target = float(fp_weight)
+            lo = self._review_fp_weight_spin.minimum()
+            hi = self._review_fp_weight_spin.maximum()
+            if target < lo or target > hi:
+                clamped_notes.append(
+                    f"fp_weight {target:.3f} clamped to [{lo}, {hi}]"
+                )
+            self._review_fp_weight_spin.setValue(max(lo, min(hi, target)))
+        if fn_weight is not None:
+            target = float(fn_weight)
+            lo = self._review_fn_weight_spin.minimum()
+            hi = self._review_fn_weight_spin.maximum()
+            if target < lo or target > hi:
+                clamped_notes.append(
+                    f"fn_weight {target:.3f} clamped to [{lo}, {hi}]"
+                )
+            self._review_fn_weight_spin.setValue(max(lo, min(hi, target)))
+
+        clamp_msg = (
+            "\n\nNote: " + "; ".join(clamped_notes)
+            if clamped_notes else ""
+        )
+        QMessageBox.information(
+            self, "Applied",
+            f"Best params from '{label}' applied to the Retrain tab:\n"
+            f"  w_neg = {w_neg}\n"
+            f"  review FP weight = {fp_weight}\n"
+            f"  review FN weight = {fn_weight}"
+            f"{clamp_msg}",
+        )
+        self._tabs.setCurrentWidget(self._tab_retrain)
+
+    def _refresh_hyperopt_tab(self) -> None:
+        """Tab-level refresh: rebuilds the animal-letter checkboxes (in
+        case the manifest changed) and reloads the results table from
+        disk."""
+        # Only rebuild the animal checks if we're showing the per-
+        # animal scope; otherwise it's wasted work.
+        if self._hp_scope_per_animal.isChecked():
+            self._refresh_hyperopt_animal_checks()
+        self._refresh_hyperopt_results_table()
+
+    # ==================================================================
     # Convergence tab
     # ==================================================================
 
@@ -1915,6 +2620,10 @@ class TrainingWindow(QMainWindow):
         self._refresh_versions_tab()
         self._refresh_retrain_tab()
         self._refresh_per_animal_tab()
+        try:
+            self._refresh_hyperopt_tab()
+        except Exception:
+            pass
         # The convergence-tab dropdown is keyed off list_versions(),
         # which changes after a retrain. Repopulating here picks up
         # the newly trained model automatically.
@@ -1932,6 +2641,28 @@ def _fmt(v, decimals: int) -> str:
         return f"{float(v):.{decimals}f}"
     except Exception:
         return str(v)
+
+
+def _hp_n_trials_for(label: str) -> str:
+    """Count completed trials for a hyperopt study label by reading
+    its trial_log.json (cheap; ~10 KB for a 30-trial study). Falls
+    back to '—' if the log is missing -- best_params.json can be
+    present without a trial_log if the user did some manual surgery,
+    but typically the two land together.
+    """
+    artifacts_dir = detector_paths.get_artifacts_dir()
+    if label == "combined":
+        log = (artifacts_dir / "hyperopt_combined" / "hyperopt"
+               / "trial_log.json")
+    else:
+        log = (artifacts_dir / "hyperopt_per_animal" / label / "hyperopt"
+               / "trial_log.json")
+    if not log.exists():
+        return "—"
+    try:
+        return str(len(json.loads(log.read_text())))
+    except Exception:
+        return "—"
 
 
 # ----------------------------------------------------------------------
