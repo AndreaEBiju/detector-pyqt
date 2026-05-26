@@ -63,6 +63,185 @@ from ui.workers.retrain_worker import (
 )
 
 
+# ----------------------------------------------------------------------
+# Shared record resolver
+# ----------------------------------------------------------------------
+
+def _strip_known_suffix(stem: str) -> tuple[str, str]:
+    """Strip known training-pipeline suffixes from a filename stem.
+    Returns (core_stem, which_suffix_was_stripped). Suffix order matters:
+    longer matches first so `_blankmotion_stim` isn't mis-stripped to
+    just `_blankmotion`."""
+    for sfx in ("_blankmotion_recovery", "_blankmotion_stim",
+                "_blankmotion", "_clean", "_notched", "_notchblanked"):
+        if stem.endswith(sfx):
+            return stem[: -len(sfx)], sfx
+    return stem, ""
+
+
+def resolve_record_from_picked_file(
+    picked: Path,
+    *,
+    parent_widget=None,
+    auto_migrate_blankmotion: bool = True,
+) -> Optional[dict]:
+    """Given any of these file types, resolve a complete manifest
+    record (source_path, splitter_clean_path, splitter_bad_path,
+    splitter_baseline_path, fs, n_samples, n_channels, rec_type,
+    animal):
+
+      - `<base>_clean.h5` (splitter clean output -- preferred)
+      - `<base>.mat` / `<base>_notched.mat` (source recording)
+      - `<base>_blankmotion.mat` (legacy MATLAB labels)
+
+    Behavior:
+      1. Determine the core stem (strip known suffixes).
+      2. Look for sibling clean.h5 / bad.h5 / baseline.h5.
+      3. If all splitter files exist: use them. Read fs/n_samples
+         from the clean.h5.
+      4. If clean.h5 is missing BUT a `_blankmotion.mat` sibling
+         exists and `auto_migrate_blankmotion=True`: prompt the user
+         to migrate it inline, then use the freshly-created files.
+      5. If no source .mat sibling exists either: return None and
+         tell the user (we need the source signal for training).
+
+    Returns a fully-populated dict suitable for
+    Manifest.add_recording, or None if resolution failed / user
+    cancelled the migration prompt.
+    """
+    from detector.animal_id import extract_animal_letter
+    parent_dir = picked.parent
+    stem = picked.stem
+    core, _suffix = _strip_known_suffix(stem)
+    # When the user picks a path like "<base>.mat" with NO suffix to
+    # strip, core == stem. That's fine -- siblings live at <core>_clean.h5 etc.
+
+    # Candidate paths (priority order)
+    cand_source = [
+        parent_dir / f"{core}_notched.mat",
+        parent_dir / f"{core}.mat",
+    ]
+    cand_clean = parent_dir / f"{core}_clean.h5"
+    cand_bad = parent_dir / f"{core}_bad.h5"
+    cand_baseline = parent_dir / f"{core}_baseline.h5"
+    cand_blankmotion = parent_dir / f"{core}_blankmotion.mat"
+
+    source_path = next((c for c in cand_source if c.exists()), None)
+
+    # Splitter files missing -> offer to migrate from blankmotion.
+    if (not cand_clean.exists() or not cand_bad.exists()):
+        if (auto_migrate_blankmotion and cand_blankmotion.exists()
+                and source_path is not None):
+            do_migrate = True
+            if parent_widget is not None:
+                resp = QMessageBox.question(
+                    parent_widget,
+                    "Migrate legacy blankmotion?",
+                    f"{cand_blankmotion.name} found, but no splitter "
+                    f"`_clean.h5` / `_bad.h5` siblings.\n\n"
+                    f"Migrate the legacy MATLAB labels now? This will:\n"
+                    f"  1. Read the bad intervals from "
+                    f"{cand_blankmotion.name}\n"
+                    f"  2. Apply them to {source_path.name}\n"
+                    f"  3. Write {cand_clean.name} + "
+                    f"{cand_bad.name} + {cand_baseline.name}\n\n"
+                    f"Takes ~10-30 s per file. Same operation as the "
+                    f"Tools -> Migrate blankmotion bulk window, just "
+                    f"for this one recording.",
+                )
+                do_migrate = (resp == QMessageBox.Yes)
+            if not do_migrate:
+                return None
+            # Run the migration inline (single-file path).
+            from detector.migrate_blankmotion import migrate_one_blankmotion
+            res = migrate_one_blankmotion(
+                str(cand_blankmotion), force=False,
+            )
+            if res["status"] != "ok":
+                if parent_widget is not None:
+                    QMessageBox.critical(
+                        parent_widget, "Migration failed",
+                        f"Could not migrate "
+                        f"{cand_blankmotion.name}:\n\n"
+                        f"{res.get('error', 'unknown error')}",
+                    )
+                return None
+            # Migration succeeded; clean.h5 + bad.h5 + baseline.h5
+            # now exist on disk.
+
+    # Final check: do we have what we need?
+    if not cand_clean.exists() or not cand_bad.exists():
+        if parent_widget is not None:
+            QMessageBox.warning(
+                parent_widget, "Missing splitter files",
+                f"No `{core}_clean.h5` / `{core}_bad.h5` siblings "
+                f"found next to {picked.name}.\n\n"
+                f"To label this recording, use File -> Open in the "
+                f"main window, mark bad regions, then Save. That "
+                f"produces the splitter files.",
+            )
+        return None
+    if source_path is None:
+        if parent_widget is not None:
+            QMessageBox.warning(
+                parent_widget, "Missing source recording",
+                f"No `{core}.mat` or `{core}_notched.mat` sibling "
+                f"found. The source recording is required to "
+                f"re-extract features at training time.",
+            )
+        return None
+
+    # Read fs / n_samples / n_channels from the clean.h5.
+    fs = 24414.0625
+    n_samples = 0
+    n_channels = 5
+    try:
+        import h5py
+        with h5py.File(str(cand_clean), "r") as f:
+            fs = float(f.attrs.get("fs", fs))
+            max_end = 0
+            first_n_ch = None
+            for k in f:
+                if k.startswith("chunk_"):
+                    max_end = max(max_end, int(f[k]["end_idx"][()]))
+                    if first_n_ch is None:
+                        first_n_ch = int(f[k]["data"].shape[1])
+            if max_end > 0:
+                n_samples = max_end
+            if first_n_ch:
+                n_channels = first_n_ch
+    except Exception:
+        pass
+
+    # rec_type from filename convention
+    if "_stim_rec" in core:
+        rec_type = "stim_rec"
+    elif "_bl_" in core or core.endswith("_bl"):
+        rec_type = "baseline"
+    else:
+        rec_type = "baseline"
+
+    return {
+        "recording_id": core,
+        "source_path": str(source_path.resolve()),
+        "splitter_clean_path": str(cand_clean.resolve()),
+        "splitter_bad_path": str(cand_bad.resolve()),
+        "splitter_baseline_path": (
+            str(cand_baseline.resolve()) if cand_baseline.exists() else None
+        ),
+        "rec_type": rec_type,
+        "fs": float(fs),
+        "n_samples": int(n_samples),
+        "n_channels": int(n_channels),
+        "label_source": "human",
+        "added_by": "pyqt_ui",
+        "notes": "",
+        "model_version_last_trained_on": None,
+        "held_out": False,
+        "animal": extract_animal_letter(core),
+    }
+
+
 class TrainingWindow(QMainWindow):
     """4-tab training management window."""
 
@@ -1234,47 +1413,96 @@ class TrainingWindow(QMainWindow):
 
     def _on_per_animal_add_files(self) -> None:
         """File-picker for additional recordings to fold into the
-        per-animal pool. Each file is auto-tagged with its detected
-        animal letter and added with extra=True."""
-        from detector.animal_id import extract_animal_letter
+        per-animal pool. Accepts ANY of:
+          - `<base>_clean.h5` (splitter clean output, preferred)
+          - `<base>_blankmotion.mat` (legacy MATLAB labels)
+          - `<base>.mat` / `<base>_notched.mat` (source recording)
+
+        For each picked file, the shared `resolve_record_from_picked_file`
+        helper:
+          - Finds the splitter siblings (clean.h5 / bad.h5 / baseline.h5)
+          - Reads fs / n_samples / n_channels from the clean.h5
+          - Auto-detects rec_type + animal letter from the recording_id
+          - For legacy blankmotion files with no splitter siblings,
+            offers to migrate inline (uses the same logic as Tools ->
+            Migrate legacy blankmotion files).
+
+        The resulting record has every field the per-animal training
+        pipeline needs to load the recording during Phase 1. Without
+        these, training would crash trying to read `source_path`.
+        """
         paths, _ = QFileDialog.getOpenFileNames(
-            self, "Pick additional recordings to fold into per-animal "
-            "training (clean.h5 files)",
-            "", "Splitter clean.h5 (*_clean.h5);;HDF5 (*.h5);;"
-                "All files (*)",
+            self,
+            "Pick recordings to add to per-animal training "
+            "(clean.h5 / blankmotion.mat / source.mat)",
+            "",
+            "Recordings + labels (*_clean.h5 *_blankmotion.mat *.mat);;"
+            "Splitter clean.h5 (*_clean.h5);;"
+            "Legacy blankmotion (*_blankmotion.mat);;"
+            "Source MAT (*.mat);;"
+            "All files (*)",
         )
         if not paths:
             return
-        # Build a set of existing IDs so we don't double-add.
+
         existing_ids = {
             r.get("recording_id") for r in self._pa_table.recordings()
         }
         added = 0
+        skipped_duplicate = 0
+        failed: list[str] = []
         for p in paths:
-            stem = Path(p).stem
-            # Strip the conventional "_clean" suffix to get the rid.
-            rid = stem[:-len("_clean")] if stem.endswith("_clean") else stem
-            if rid in existing_ids:
+            picked = Path(p)
+            record = resolve_record_from_picked_file(
+                picked, parent_widget=self,
+            )
+            if record is None:
+                # resolve_record_from_picked_file already showed any
+                # user-facing message (missing siblings, migration
+                # cancelled, etc). Just note the path for the summary.
+                failed.append(picked.name)
                 continue
-            existing_ids.add(rid)
-            self._per_animal_extras.append({
-                "recording_id": rid,
-                "rec_type": ("stim_rec" if "_stim_rec" in rid
-                              else "baseline" if "_bl" in rid
-                              else "unknown"),
-                "held_out": False,
-                "animal": extract_animal_letter(rid),
-                "extra": True,
-                "splitter_clean_path": str(p),
-            })
+            if record["recording_id"] in existing_ids:
+                skipped_duplicate += 1
+                continue
+            existing_ids.add(record["recording_id"])
+            # Mark as `extra` so the table can show a 📎 indicator
+            # and the per-animal pipeline knows not to fold it into
+            # the main training manifest.
+            record["extra"] = True
+            self._per_animal_extras.append(record)
             added += 1
-        if added == 0:
+
+        if added == 0 and skipped_duplicate == 0 and failed:
+            # All-failure case: no need for the "nothing to add" toast.
+            return
+        if added == 0 and skipped_duplicate > 0:
             QMessageBox.information(
                 self, "Nothing to add",
-                "All picked files are already in the table.",
+                f"All {skipped_duplicate} picked file(s) were "
+                "already in the table.",
             )
             return
         self._refresh_per_animal_tab()
+        # Surface skipped/failed counts so the user knows what
+        # happened. Avoid a popup for the all-success path.
+        if skipped_duplicate or failed:
+            details = []
+            if skipped_duplicate:
+                details.append(
+                    f"{skipped_duplicate} already in the table"
+                )
+            if failed:
+                details.append(
+                    f"{len(failed)} couldn't be resolved "
+                    f"(missing siblings or migration cancelled)"
+                )
+            QMessageBox.information(
+                self, f"Added {added} recording(s)",
+                "Added " + str(added) + " new recording(s) "
+                "to the per-animal pool.\n\n"
+                "Also: " + "; ".join(details) + ".",
+            )
 
     def _on_per_animal_clear_extras(self) -> None:
         if not self._per_animal_extras:
@@ -2768,14 +2996,46 @@ class AddRecordingDialog(QDialog):
             self._maybe_autofill_from_clean_h5()
 
     def _pick_clean(self) -> None:
+        """File-picker that accepts clean.h5 / blankmotion.mat / source.mat
+        and uses the shared `resolve_record_from_picked_file` helper to
+        populate every field in the dialog.
+
+        For legacy `_blankmotion.mat` files with no splitter siblings,
+        the resolver prompts to run migrate_one_blankmotion inline -- so
+        you can add legacy MATLAB-labeled recordings to the manifest
+        without manually running the bulk migration tool first."""
         path, _ = QFileDialog.getOpenFileName(
-            self, "Pick clean.h5", "",
-            "Splitter clean.h5 (*_clean.h5);;HDF5 (*.h5);;All files (*)",
+            self, "Pick recording or labels file", "",
+            "Recordings + labels (*_clean.h5 *_blankmotion.mat *.mat);;"
+            "Splitter clean.h5 (*_clean.h5);;"
+            "Legacy blankmotion (*_blankmotion.mat);;"
+            "Source MAT (*.mat);;"
+            "All files (*)",
         )
-        if path:
+        if not path:
+            return
+        record = resolve_record_from_picked_file(
+            Path(path), parent_widget=self,
+        )
+        if record is None:
+            # Resolver already showed a message about what was missing.
+            # Fall back to the legacy behavior so the user can still
+            # fill fields manually.
             self._clean_edit.setText(path)
-            # Try to auto-fill bad.h5 sibling, fs, n_samples
             self._maybe_autofill_from_clean_h5()
+            return
+        # Populate every field from the resolver's record.
+        if not self._rid_edit.text().strip():
+            self._rid_edit.setText(record["recording_id"])
+        self._source_edit.setText(record["source_path"])
+        self._clean_edit.setText(record["splitter_clean_path"])
+        self._bad_edit.setText(record["splitter_bad_path"])
+        if record.get("splitter_baseline_path"):
+            self._baseline_edit.setText(record["splitter_baseline_path"])
+        self._fs_spin.setValue(float(record["fs"]))
+        self._n_samples_spin.setValue(int(record["n_samples"]))
+        self._n_ch_spin.setValue(int(record["n_channels"]))
+        self._rec_type_combo.setCurrentText(record["rec_type"])
 
     def _pick_bad(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
