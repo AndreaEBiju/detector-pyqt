@@ -104,7 +104,11 @@ class PerAnimalTable(QTableWidget):
         super().__init__(0, len(COLUMNS), parent)
         self.setHorizontalHeaderLabels(COLUMNS)
         self.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.setSelectionMode(QAbstractItemView.SingleSelection)
+        # Extended selection so the user can Shift/Ctrl-click multiple
+        # rows to remove (or any future bulk operation). Single
+        # selection was overly restrictive once "Remove selected"
+        # landed.
+        self.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.setAlternatingRowColors(True)
         # Only the Animal column is editable. The default trigger is
         # NoEditTriggers (set globally), but we re-enable double-click +
@@ -181,6 +185,19 @@ class PerAnimalTable(QTableWidget):
     def recordings(self) -> list[dict]:
         """Return the current recordings list (sorted by display order)."""
         return list(self._recordings)
+
+    def selected_recording_ids(self) -> list[str]:
+        """Return the recording_ids of currently-selected rows.
+        Used by the parent training-window when implementing
+        "Remove selected" actions."""
+        rows = sorted({idx.row() for idx in self.selectionModel().selectedRows()})
+        out: list[str] = []
+        for r in rows:
+            if 0 <= r < len(self._recordings):
+                rid = self._recordings[r].get("recording_id")
+                if rid:
+                    out.append(str(rid))
+        return out
 
     def summary(self) -> dict:
         """Stats computed from current in-table state -- not the

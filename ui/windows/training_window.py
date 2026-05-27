@@ -1283,6 +1283,24 @@ class TrainingWindow(QMainWindow):
         self._btn_pa_add_folder.clicked.connect(
             self._on_per_animal_add_folder
         )
+        # Remove the rows the user has selected in the table. Extras
+        # (added via Add files / Add folder) drop out of the per-animal
+        # pool. Manifest rows are NOT removable from this UI -- those
+        # are core training corpus and have to be removed via the
+        # Manifest tab (which is wired to the audited Manifest.remove
+        # path). We warn rather than silently no-op.
+        self._btn_pa_remove_selected = QPushButton("➖ Remove selected")
+        self._btn_pa_remove_selected.setToolTip(
+            "Drop the selected row(s) from the per-animal pool. "
+            "Only EXTRA rows (those added here via 'Add files' / "
+            "'Add folder') can be removed -- recordings from the "
+            "main training manifest stay put; manage those via the "
+            "Manifest tab.\n\n"
+            "Shift- or Ctrl-click to select multiple rows."
+        )
+        self._btn_pa_remove_selected.clicked.connect(
+            self._on_per_animal_remove_selected
+        )
         self._btn_pa_clear_extras = QPushButton("Clear extras")
         self._btn_pa_clear_extras.clicked.connect(
             self._on_per_animal_clear_extras
@@ -1295,6 +1313,7 @@ class TrainingWindow(QMainWindow):
         self._btn_pa_refresh.clicked.connect(self._refresh_per_animal_tab)
         action_row.addWidget(self._btn_pa_add_files)
         action_row.addWidget(self._btn_pa_add_folder)
+        action_row.addWidget(self._btn_pa_remove_selected)
         action_row.addWidget(self._btn_pa_clear_extras)
         action_row.addStretch(1)
         action_row.addWidget(self._btn_pa_refresh)
@@ -1660,6 +1679,79 @@ class TrainingWindow(QMainWindow):
             QMessageBox.information(
                 self, "Folder scan complete", "\n".join(lines),
             )
+
+    def _on_per_animal_remove_selected(self) -> None:
+        """Drop the user-selected rows from the per-animal pool.
+
+        Only `extra` rows (those added via Add files / Add folder)
+        can be removed. Manifest-driven rows stay -- removing those
+        belongs to the Manifest tab where the removal is audited
+        through Manifest.remove + history. Surfaces a clear count
+        of what got removed vs what was protected."""
+        selected_ids = set(self._pa_table.selected_recording_ids())
+        if not selected_ids:
+            QMessageBox.information(
+                self, "Nothing selected",
+                "Pick one or more rows in the table first.\n\n"
+                "Tip: Shift- or Ctrl-click to select multiple rows.",
+            )
+            return
+
+        # Partition: which selected ids are extras vs manifest-driven.
+        extras_to_drop = []
+        manifest_protected = []
+        extras_ids = {
+            r.get("recording_id") for r in self._per_animal_extras
+        }
+        for rid in selected_ids:
+            if rid in extras_ids:
+                extras_to_drop.append(rid)
+            else:
+                manifest_protected.append(rid)
+
+        if not extras_to_drop:
+            # All selected rows are manifest-driven -- nothing to do here.
+            QMessageBox.information(
+                self, "Nothing removable",
+                f"All {len(manifest_protected)} selected row(s) are "
+                "in the training manifest (not extras added via this "
+                "tab).\n\n"
+                "To remove a recording from the training manifest, "
+                "switch to the Manifest tab and use Remove recording "
+                "there -- that path is audited in the manifest "
+                "history.",
+            )
+            return
+
+        # Confirm
+        plural = "s" if len(extras_to_drop) != 1 else ""
+        protected_note = (
+            f"\n\n{len(manifest_protected)} other selected row(s) are "
+            f"in the main manifest and will NOT be removed -- use the "
+            f"Manifest tab for those."
+            if manifest_protected else ""
+        )
+        resp = QMessageBox.question(
+            self, f"Remove {len(extras_to_drop)} extra recording{plural}?",
+            f"Drop {len(extras_to_drop)} extra recording{plural} from "
+            f"the per-animal pool:\n\n  " +
+            "\n  ".join(extras_to_drop[:10]) +
+            (f"\n  ... ({len(extras_to_drop) - 10} more)"
+             if len(extras_to_drop) > 10 else "") +
+            "\n\nThis only removes them from the per-animal table -- "
+            "files on disk and the training manifest are untouched." +
+            protected_note,
+        )
+        if resp != QMessageBox.Yes:
+            return
+
+        # Apply
+        drop_set = set(extras_to_drop)
+        self._per_animal_extras = [
+            r for r in self._per_animal_extras
+            if r.get("recording_id") not in drop_set
+        ]
+        self._refresh_per_animal_tab()
 
     def _on_per_animal_clear_extras(self) -> None:
         if not self._per_animal_extras:
