@@ -4,16 +4,29 @@ to each recording in the training manifest.
 Rows are training-manifest recordings (plus optionally a few "extra"
 files added via the per-animal tab's file-picker). Columns:
 
-    Animal | Recording ID | rec_type | held_out | extra
+    Animal | Recording ID | Source file | rec_type | held_out | extra
 
-Only the Animal column is editable. Edits emit
-`animal_edited(recording_id, new_letter)` so the parent
-(training_window) can persist them back to the manifest.
+Editable columns:
+  - **Animal**: free-text first letter (normalized to uppercase)
+  - **held_out**: clickable checkbox; on/off persists to the manifest
+    (or to the in-memory extras dict for non-manifest rows)
+
+Edits emit:
+  - `animal_edited(recording_id, new_letter)`
+  - `held_out_changed(recording_id, new_bool)`
+so the parent (training_window) can persist them.
+
+The "Source file" column shows the basename of whichever file the user
+picked when adding the recording -- helpful for verifying whether a
+folder-scan correctly identified `_blankmotion.mat` files vs picking
+up e.g. `_clean.h5` or a raw `.mat` source. For manifest rows that
+predate this field we fall back to whichever sibling path is the most
+informative (blankmotion > source > clean.h5).
 
 The widget holds NO authoritative state -- it's a view over the
 recordings list owned by the training window. Call `set_recordings()`
 after the parent's data changes (e.g. after the user re-loads the
-manifest or after an animal edit triggers a re-save).
+manifest or after an edit triggers a re-save).
 
 Summary stats (eligible vs skipped animal count) are computed live
 from the current table contents, NOT from the original manifest,
@@ -23,6 +36,7 @@ exposed via `summary()` so the parent can put it in a QLabel.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import Qt, Signal
@@ -32,12 +46,16 @@ from PySide6.QtWidgets import (
 )
 
 
-COLUMNS = ("Animal", "Recording ID", "rec_type", "held_out", "extra")
+COLUMNS = (
+    "Animal", "Recording ID", "Source file",
+    "rec_type", "held_out", "extra",
+)
 ANIMAL_COL = 0
 RID_COL = 1
-RECTYPE_COL = 2
-HELDOUT_COL = 3
-EXTRA_COL = 4
+SOURCE_FILE_COL = 2
+RECTYPE_COL = 3
+HELDOUT_COL = 4
+EXTRA_COL = 5
 
 
 def normalize_animal_letter(text: str) -> Optional[str]:
@@ -50,6 +68,41 @@ def normalize_animal_letter(text: str) -> Optional[str]:
     if not first.isalpha():
         return None
     return first.upper()
+
+
+def describe_source_file(r: dict) -> tuple[str, str]:
+    """Pick the best basename + full path to display in the Source
+    file column for a recording dict. Returns (basename, full_path).
+
+    Priority:
+      1. `source_file_basename` (set when the user actively picked a
+         file via Add files / Add folder) -- this is what the user
+         actually chose, so it's most informative for verifying
+         folder-scan detection.
+      2. `blankmotion_path` (set on folder-added records that came
+         from a `_blankmotion.mat` scan).
+      3. `source_path` (raw recording, e.g. `_notched.mat`).
+      4. `splitter_clean_path` (post-splitter clean H5).
+
+    Manifest rows added before this field existed will fall through
+    to (3) or (4)."""
+    # Explicit picked-file label (set by training_window on add).
+    picked = r.get("source_file_basename")
+    if picked:
+        # source_file_path is the optional companion full-path; we
+        # don't require it (basename alone is enough for the table).
+        full = r.get("source_file_path") or picked
+        return str(picked), str(full)
+    bp = r.get("blankmotion_path")
+    if bp:
+        return Path(str(bp)).name, str(bp)
+    sp = r.get("source_path")
+    if sp:
+        return Path(str(sp)).name, str(sp)
+    cp = r.get("splitter_clean_path")
+    if cp:
+        return Path(str(cp)).name, str(cp)
+    return "", ""
 
 
 def compute_summary(
@@ -90,7 +143,12 @@ def compute_summary(
 class PerAnimalTable(QTableWidget):
     """Editable grouping table for per-animal training.
 
-    Only the Animal column accepts edits; the rest are read-only.
+    Editable cells:
+      - Animal column (free-text first letter, normalized)
+      - held_out column (clickable checkbox)
+
+    Other columns are read-only display.
+
     A row whose `recording_id` was passed in via the `extra` list
     gets the 'extra' column ticked, which the training window uses
     to keep those files out of the combined manifest.
@@ -99,6 +157,10 @@ class PerAnimalTable(QTableWidget):
     # (recording_id, new_letter_or_None). Fires when the user finishes
     # editing the Animal column for a row.
     animal_edited = Signal(str, object)
+
+    # (recording_id, new_held_out_bool). Fires when the user toggles
+    # the held_out checkbox for a row.
+    held_out_changed = Signal(str, bool)
 
     def __init__(self, parent=None):
         super().__init__(0, len(COLUMNS), parent)
@@ -110,10 +172,12 @@ class PerAnimalTable(QTableWidget):
         # landed.
         self.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.setAlternatingRowColors(True)
-        # Only the Animal column is editable. The default trigger is
-        # NoEditTriggers (set globally), but we re-enable double-click +
-        # Enter editing per-item by clearing the non-editable flag on
-        # just that cell. See `_set_animal_cell`.
+        # Only the Animal column is editable via text. The default
+        # trigger is NoEditTriggers (set globally), but we re-enable
+        # double-click + Enter editing per-item by clearing the
+        # non-editable flag on just that cell. See `_set_animal_cell`.
+        # The held_out column uses CheckState role and is toggled by
+        # a single click on the checkbox itself.
         self.setEditTriggers(
             QAbstractItemView.DoubleClicked
             | QAbstractItemView.EditKeyPressed
@@ -122,6 +186,7 @@ class PerAnimalTable(QTableWidget):
         hdr = self.horizontalHeader()
         hdr.setSectionResizeMode(ANIMAL_COL, QHeaderView.ResizeToContents)
         hdr.setSectionResizeMode(RID_COL, QHeaderView.Stretch)
+        hdr.setSectionResizeMode(SOURCE_FILE_COL, QHeaderView.Stretch)
         hdr.setSectionResizeMode(RECTYPE_COL, QHeaderView.ResizeToContents)
         hdr.setSectionResizeMode(HELDOUT_COL, QHeaderView.ResizeToContents)
         hdr.setSectionResizeMode(EXTRA_COL, QHeaderView.ResizeToContents)
@@ -168,14 +233,23 @@ class PerAnimalTable(QTableWidget):
             for i, r in enumerate(self._recordings):
                 self._set_animal_cell(i, str(r.get("animal") or ""))
                 self._set_readonly(i, RID_COL, str(r.get("recording_id", "")))
+                src_basename, src_full = describe_source_file(r)
+                self._set_readonly(
+                    i, SOURCE_FILE_COL, src_basename, tooltip=src_full,
+                )
                 self._set_readonly(i, RECTYPE_COL, str(r.get("rec_type", "")))
                 held = bool(r.get("held_out", False))
-                self._set_readonly(i, HELDOUT_COL, "✓" if held else "")
+                self._set_held_out_cell(i, held)
                 extra = bool(r.get("extra", False))
                 self._set_readonly(i, EXTRA_COL, "✓" if extra else "")
                 if held or extra:
                     # Slight visual distinction for non-training rows.
+                    # Skip HELDOUT_COL so the checkbox stays clearly
+                    # readable (it gets its own subtle dim from the
+                    # check state itself).
                     for col in range(self.columnCount()):
+                        if col == HELDOUT_COL:
+                            continue
                         it = self.item(i, col)
                         if it is not None:
                             it.setForeground(QBrush(QColor("#888")))
@@ -217,21 +291,55 @@ class PerAnimalTable(QTableWidget):
         # editable -- the default for QTableWidgetItem
         self.setItem(row, ANIMAL_COL, item)
 
-    def _set_readonly(self, row: int, col: int, text: str) -> None:
+    def _set_readonly(
+        self, row: int, col: int, text: str, *, tooltip: str = "",
+    ) -> None:
         item = QTableWidgetItem(text)
         item.setFlags(item.flags() & ~Qt.ItemIsEditable)
-        if col != RID_COL:
+        if col != RID_COL and col != SOURCE_FILE_COL:
             item.setTextAlignment(Qt.AlignCenter)
+        if tooltip:
+            item.setToolTip(tooltip)
         self.setItem(row, col, item)
+
+    def _set_held_out_cell(self, row: int, held: bool) -> None:
+        """Render the held_out column as a clickable checkbox.
+
+        We keep the cell text empty so only the checkbox renders --
+        users on every platform get a familiar toggle, and the cell
+        clearly differs from the read-only '✓' string in the extra
+        column."""
+        item = QTableWidgetItem("")
+        # Make the cell user-checkable but NOT text-editable: the
+        # double-click edit triggers would otherwise pop a text editor
+        # over the checkbox.
+        item.setFlags(
+            (item.flags() | Qt.ItemIsUserCheckable) & ~Qt.ItemIsEditable
+        )
+        item.setCheckState(Qt.Checked if held else Qt.Unchecked)
+        item.setTextAlignment(Qt.AlignCenter)
+        item.setToolTip(
+            "Toggle whether this recording is held out from training. "
+            "Held-out recordings stay visible here but never enter the "
+            "training corpus."
+        )
+        self.setItem(row, HELDOUT_COL, item)
 
     def _on_item_changed(self, item: QTableWidgetItem) -> None:
         if self._populating:
             return
-        if item.column() != ANIMAL_COL:
-            return
+        col = item.column()
         row = item.row()
         if row < 0 or row >= len(self._recordings):
             return
+        if col == ANIMAL_COL:
+            self._handle_animal_edit(item, row)
+        elif col == HELDOUT_COL:
+            self._handle_held_out_toggle(item, row)
+
+    def _handle_animal_edit(
+        self, item: QTableWidgetItem, row: int,
+    ) -> None:
         new_letter = normalize_animal_letter(item.text())
         # Snap displayed value to the normalized form so the user sees
         # what got saved (e.g. "jel" -> "J", "  L " -> "L").
@@ -245,3 +353,15 @@ class PerAnimalTable(QTableWidget):
         rid = str(self._recordings[row].get("recording_id", ""))
         self._recordings[row]["animal"] = new_letter
         self.animal_edited.emit(rid, new_letter)
+
+    def _handle_held_out_toggle(
+        self, item: QTableWidgetItem, row: int,
+    ) -> None:
+        new_held = item.checkState() == Qt.Checked
+        rid = str(self._recordings[row].get("recording_id", ""))
+        prev = bool(self._recordings[row].get("held_out", False))
+        if new_held == prev:
+            # No-op (e.g. re-render with same value firing itemChanged).
+            return
+        self._recordings[row]["held_out"] = new_held
+        self.held_out_changed.emit(rid, new_held)

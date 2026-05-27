@@ -239,6 +239,11 @@ def resolve_record_from_picked_file(
         "model_version_last_trained_on": None,
         "held_out": False,
         "animal": extract_animal_letter(core),
+        # Filename the user actually picked. Surfaced in the per-animal
+        # table's "Source file" column so Andrea can verify whether a
+        # folder-scan grabbed the `_blankmotion.mat` or something else.
+        "source_file_basename": picked.name,
+        "source_file_path": str(picked.resolve()),
     }
 
 
@@ -1255,6 +1260,9 @@ class TrainingWindow(QMainWindow):
         self._pa_table = PerAnimalTable()
         self._pa_table.set_min_recordings_per_animal(3)
         self._pa_table.animal_edited.connect(self._on_per_animal_animal_edited)
+        self._pa_table.held_out_changed.connect(
+            self._on_per_animal_held_out_edited
+        )
         layout.addWidget(self._pa_table, stretch=1)
 
         # Action row
@@ -1453,6 +1461,47 @@ class TrainingWindow(QMainWindow):
         # Notify other tabs / the main window.
         self.manifest_or_versions_changed.emit()
 
+    def _on_per_animal_held_out_edited(
+        self, recording_id: str, new_held: bool,
+    ) -> None:
+        """User toggled the held_out checkbox in the table. For extras,
+        update the in-memory dict; for manifest rows, persist to the
+        manifest JSON. Then refresh the tab so the dimming + summary
+        counts reflect the change."""
+        # Extras path: just update the in-memory dict.
+        for extra in self._per_animal_extras:
+            if extra.get("recording_id") == recording_id:
+                extra["held_out"] = bool(new_held)
+                self._refresh_per_animal_tab()
+                return
+        # Manifest path: load, mutate, save -- same pattern as the
+        # animal edit handler above.
+        manifest_path = detector_paths.get_manifest_path()
+        try:
+            m = Manifest.load(manifest_path)
+            hit = False
+            for r in m.recordings:
+                if r.get("recording_id") == recording_id:
+                    r["held_out"] = bool(new_held)
+                    hit = True
+                    break
+            if not hit:
+                # Stale row -- refresh to resync.
+                self._refresh_per_animal_tab()
+                return
+            m.save(manifest_path)
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Save failed",
+                f"Could not save held_out toggle to manifest:\n{exc}",
+            )
+            self._refresh_per_animal_tab()
+            return
+        self._refresh_per_animal_tab()
+        # Other tabs (Manifest, Versions) depend on held_out state for
+        # their counts/eligibility logic, so notify.
+        self.manifest_or_versions_changed.emit()
+
     def _on_per_animal_add_files(self) -> None:
         """File-picker for additional recordings to fold into the
         per-animal pool. Accepts ANY of:
@@ -1646,6 +1695,12 @@ class TrainingWindow(QMainWindow):
                 "animal": extract_animal_letter(core),
                 "extra": True,
                 "pending_migration": True,
+                # Show the blankmotion filename in the Source file
+                # column so the user can confirm folder detection
+                # actually picked up `_blankmotion.mat` (vs e.g.
+                # silently grabbing a `_clean.h5` or `.mat`).
+                "source_file_basename": bp.name,
+                "source_file_path": str(bp.resolve()),
             })
             added_pending += 1
 
@@ -2007,6 +2062,22 @@ class TrainingWindow(QMainWindow):
             if extra.get("animal"):
                 resolved["animal"] = extra["animal"]
             resolved["extra"] = True
+            # Preserve the original picked-file label (the blankmotion
+            # filename the folder-scan found) so the Source file column
+            # keeps showing what the user actually added, not the
+            # post-migration clean.h5.
+            if extra.get("source_file_basename"):
+                resolved["source_file_basename"] = (
+                    extra["source_file_basename"]
+                )
+            if extra.get("source_file_path"):
+                resolved["source_file_path"] = extra["source_file_path"]
+            if extra.get("blankmotion_path"):
+                resolved["blankmotion_path"] = extra["blankmotion_path"]
+            # Preserve any held_out toggle the user made while the
+            # row was pending.
+            if extra.get("held_out"):
+                resolved["held_out"] = True
             new_extras.append(resolved)
             n_resolved += 1
         self._per_animal_extras = new_extras
