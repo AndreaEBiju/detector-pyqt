@@ -65,6 +65,16 @@ class BlankmotionMigrationWorker(QObject):
 
     @Slot()
     def run(self) -> None:
+        # h5py-on-CloudStorage locking workaround. Must be set in this
+        # process BEFORE any transitive import pulls h5py in -- the
+        # migration path opens v7.3 `_blankmotion.mat` files + writes
+        # `_clean.h5` / `_bad.h5` / `_baseline.h5`, and every open
+        # hits HDF5's locking layer. Without this env var, Drive-
+        # hosted files raise "unable to open file synchronously" on
+        # the first open and the worker burns retries.
+        import os as _os
+        _os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
+
         try:
             from detector.migrate_blankmotion import migrate_files
         except Exception as e:
