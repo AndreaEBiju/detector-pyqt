@@ -2224,15 +2224,37 @@ class TrainingWindow(QMainWindow):
     def _on_pre_train_migration_done(self, summary: dict) -> None:
         """Migration finished. Re-resolve each pending extra to fill
         in real fs/n_samples/etc from the freshly-created clean.h5,
-        then proceed to per-animal training."""
+        then proceed to either the manifest promotion flow or the
+        per-animal training launcher.
+
+        Hardened in two ways after Andrea hit a partial-failure case:
+          1. Messaging is promote-aware (not stuck on "Training will
+             still start" copy).
+          2. If no successfully-migrated extras remain, stop here
+             instead of falling through to launch training/promote
+             on an empty corpus -- that previously left the user
+             clicking through a stale 'Continue anyway?' prompt and
+             starting a no-op training run.
+          3. Routing to the next step is wrapped so an exception
+             surfaces as a dialog instead of silently terminating
+             the app.
+        """
+        promote_mode = bool(getattr(self, "_post_migration_promote", False))
+        # Clear the routing flag as soon as we've captured it, so any
+        # downstream exception can't cause the flag to bleed into a
+        # later re-entry.
+        self._post_migration_promote = False
+
         if self._pre_train_progress is not None:
             self._pre_train_progress.close()
             self._pre_train_progress = None
+
         # Re-resolve each pending extra. If the migration succeeded,
         # the splitter siblings now exist and the resolver returns a
         # full record. If migration failed for some, drop those.
         n_resolved = 0
         n_dropped = 0
+        dropped_examples: list[str] = []
         new_extras: list[dict] = []
         for extra in self._per_animal_extras:
             if not extra.get("pending_migration"):
@@ -2240,8 +2262,13 @@ class TrainingWindow(QMainWindow):
                 continue
             # Re-resolve from the (now-existing) clean.h5 sibling.
             clean_path = extra.get("splitter_clean_path")
+            rid = extra.get("recording_id", "?")
             if not clean_path or not Path(clean_path).exists():
                 n_dropped += 1
+                if len(dropped_examples) < 5:
+                    dropped_examples.append(
+                        f"{rid}: no clean.h5 produced"
+                    )
                 continue
             resolved = resolve_record_from_picked_file(
                 Path(clean_path),
@@ -2250,6 +2277,10 @@ class TrainingWindow(QMainWindow):
             )
             if resolved is None:
                 n_dropped += 1
+                if len(dropped_examples) < 5:
+                    dropped_examples.append(
+                        f"{rid}: resolver couldn't read splitter siblings"
+                    )
                 continue
             # Preserve the original `animal` if the user had edited it,
             # otherwise use the auto-detect from the re-resolve.
@@ -2276,24 +2307,86 @@ class TrainingWindow(QMainWindow):
             n_resolved += 1
         self._per_animal_extras = new_extras
         self._refresh_per_animal_tab()
-        # Brief status
-        if summary and (summary.get("n_error", 0) > 0 or n_dropped > 0):
+
+        # Surface failures with actual reasons drawn from the worker's
+        # summary, not just the count. The worker returns a per-file
+        # results list with status + error fields.
+        n_summary_errors = int(summary.get("n_error", 0)) if summary else 0
+        per_file_errors: list[tuple[str, str]] = []
+        for r in (summary or {}).get("results", []):
+            if r.get("status") == "error":
+                bp = Path(str(r.get("blankmotion_path", "?"))).name
+                err = str(r.get("error", "unknown error"))
+                per_file_errors.append((bp, err))
+        # Promote-aware partial-failure dialog. Uses an OK button only --
+        # the user has already consented to the operation; this is just
+        # an FYI before the next step kicks off.
+        if n_summary_errors > 0 or n_dropped > 0:
+            next_step = "Manifest write" if promote_mode else "Training"
+            lines = [
+                f"Migrated {n_resolved} file(s); "
+                f"{n_summary_errors} migration error(s); "
+                f"{n_dropped} extras dropped post-migration.",
+            ]
+            if per_file_errors:
+                lines.append("")
+                lines.append("Sample migration errors:")
+                for bp, err in per_file_errors[:5]:
+                    lines.append(f"  - {bp}: {err}")
+                if len(per_file_errors) > 5:
+                    lines.append(
+                        f"  ... and {len(per_file_errors) - 5} more"
+                    )
+            if dropped_examples:
+                lines.append("")
+                lines.append("Sample dropped-extras reasons:")
+                for d in dropped_examples:
+                    lines.append(f"  - {d}")
+                if n_dropped > len(dropped_examples):
+                    lines.append(
+                        f"  ... and {n_dropped - len(dropped_examples)} more"
+                    )
+            lines.append("")
+            if n_resolved > 0:
+                lines.append(
+                    f"{next_step} will proceed with the "
+                    f"{n_resolved} successfully-migrated file(s)."
+                )
+            else:
+                lines.append(
+                    f"{next_step} will NOT run -- nothing migrated "
+                    "successfully."
+                )
             QMessageBox.warning(
-                self, "Some migrations failed",
-                f"Migrated {n_resolved} file(s); dropped {n_dropped} "
-                f"(migration failed or splitter files missing).\n\n"
-                "Training will still start with the successfully-"
-                "migrated files.",
+                self, "Some migrations failed", "\n".join(lines),
             )
-        # Branch on what initiated the migration. If the user clicked
-        # Promote, write to manifest now. Otherwise re-enter the
-        # training launcher (the pending check finds nothing and
-        # proceeds to start the train worker).
-        if getattr(self, "_post_migration_promote", False):
-            self._post_migration_promote = False
-            self._finalize_promote_extras_to_manifest()
+
+        # Bail out cleanly if nothing migrated. We don't want to
+        # launch promote/train on a corpus that lost everything --
+        # that's the silent crash path Andrea hit.
+        if n_resolved == 0:
+            self._btn_pa_train.setEnabled(True)
             return
-        self._on_per_animal_train()
+
+        # Route to next step inside a try/except so a crash there
+        # becomes a dialog, not a silent process exit.
+        try:
+            if promote_mode:
+                self._finalize_promote_extras_to_manifest()
+            else:
+                self._on_per_animal_train()
+        except Exception as exc:
+            import traceback
+            tb = traceback.format_exc()
+            QMessageBox.critical(
+                self,
+                ("Promote failed after migration" if promote_mode
+                 else "Training launch failed after migration"),
+                f"Migration finished but the next step raised:\n\n"
+                f"{type(exc).__name__}: {exc}\n\n"
+                f"Traceback:\n{tb[-1500:]}",
+            )
+            self._btn_pa_train.setEnabled(True)
 
     def _on_pre_train_migration_error(self, msg: str) -> None:
         if self._pre_train_progress is not None:
