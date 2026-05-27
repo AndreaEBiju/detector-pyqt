@@ -3688,8 +3688,199 @@ class TrainingWindow(QMainWindow):
         paths_layout.addRow("Manifest:",
                               QLabel(str(detector_paths.get_manifest_path())))
         layout.addWidget(paths_group)
+
+        # Cross-machine path remap (Drive mount points differ between
+        # computers; manifest paths get translated transparently on
+        # load). Auto-detect handles the common case but the user can
+        # add explicit prefix rules here.
+        remap_group = QGroupBox("Cross-machine path remap")
+        remap_layout = QVBoxLayout(remap_group)
+        remap_intro = QLabel(
+            "<i>The training manifest stores absolute paths to "
+            "recordings on Google Drive. Mount points differ between "
+            "computers (e.g. <code>G:\\Shared drives\\...</code> on "
+            "Windows vs <code>~/Library/CloudStorage/GoogleDrive-.../"
+            "Shared drives/...</code> on macOS). Auto-detection "
+            "searches common Drive roots for the same subpath; for "
+            "edge cases, add explicit prefix rules in the JSON file "
+            "below.</i>"
+        )
+        remap_intro.setWordWrap(True)
+        remap_intro.setStyleSheet("color: #aaa; padding-bottom: 4px;")
+        remap_layout.addWidget(remap_intro)
+
+        try:
+            from detector.path_remap import (
+                CONFIG_PATH as _remap_cfg_path,
+                is_auto_detect_enabled,
+                set_auto_detect_enabled,
+                get_remap_rules,
+            )
+            self._remap_auto_cb = QCheckBox(
+                "Auto-detect Drive mounts (try candidate roots when "
+                "the stored path doesn't exist)"
+            )
+            self._remap_auto_cb.setChecked(is_auto_detect_enabled())
+            self._remap_auto_cb.toggled.connect(
+                lambda v: set_auto_detect_enabled(v)
+            )
+            remap_layout.addWidget(self._remap_auto_cb)
+            rules = get_remap_rules()
+            self._remap_status_lbl = QLabel(
+                f"<b>{len(rules)}</b> explicit rule(s) configured. "
+                f"Config file: <code>{_remap_cfg_path}</code>"
+            )
+            self._remap_status_lbl.setStyleSheet(
+                "font-family: monospace; font-size: 11px;"
+            )
+            self._remap_status_lbl.setTextInteractionFlags(
+                Qt.TextSelectableByMouse
+            )
+            remap_layout.addWidget(self._remap_status_lbl)
+            btn_row = QHBoxLayout()
+            self._btn_open_remap_cfg = QPushButton(
+                "Open remap config file"
+            )
+            self._btn_open_remap_cfg.setToolTip(
+                f"Open {_remap_cfg_path} in the system editor. Edit "
+                "the JSON to add explicit prefix-replacement rules "
+                "when auto-detect can't find the right mount. "
+                "Schema: { \"auto_detect\": true, \"remap_rules\": "
+                "[{\"match\": \"<old_prefix>\", \"replace\": "
+                "\"<local_prefix>\"}] }"
+            )
+            self._btn_open_remap_cfg.clicked.connect(
+                self._on_open_remap_config
+            )
+            self._btn_test_remap = QPushButton(
+                "Test path resolution…"
+            )
+            self._btn_test_remap.setToolTip(
+                "Paste a manifest path and see whether the remap "
+                "layer can resolve it on this machine."
+            )
+            self._btn_test_remap.clicked.connect(
+                self._on_test_remap_path
+            )
+            btn_row.addWidget(self._btn_open_remap_cfg)
+            btn_row.addWidget(self._btn_test_remap)
+            btn_row.addStretch(1)
+            remap_layout.addLayout(btn_row)
+        except Exception as e:
+            err_lbl = QLabel(
+                f"<i>(path remap module unavailable: {e})</i>"
+            )
+            err_lbl.setStyleSheet("color: #c44;")
+            remap_layout.addWidget(err_lbl)
+        layout.addWidget(remap_group)
+
         layout.addStretch(1)
         return w
+
+    # ------------------------------------------------------------------
+    # Path-remap settings handlers
+    # ------------------------------------------------------------------
+
+    def _on_open_remap_config(self) -> None:
+        """Open the path-remap JSON config in the system's default
+        editor. If the file doesn't exist yet, create a stub with the
+        current auto-detect state so the user has something to edit."""
+        from detector.path_remap import CONFIG_PATH
+        if not CONFIG_PATH.exists():
+            CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            CONFIG_PATH.write_text(json.dumps({
+                "auto_detect": True,
+                "remap_rules": [
+                    {
+                        "match": "<old_prefix e.g. G:\\Shared drives>",
+                        "replace": "<local_prefix e.g. /Volumes/GoogleDrive/Shared drives>",
+                    },
+                ],
+                "extra_roots": [],
+            }, indent=2))
+        # Open in the system editor.
+        import subprocess
+        import sys as _sys
+        try:
+            if _sys.platform == "darwin":
+                subprocess.Popen(["open", str(CONFIG_PATH)])
+            elif _sys.platform == "win32":
+                os.startfile(str(CONFIG_PATH))  # type: ignore[attr-defined]
+            else:
+                subprocess.Popen(["xdg-open", str(CONFIG_PATH)])
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Couldn't open config",
+                f"Edit it manually at:\n{CONFIG_PATH}\n\nError: {e}",
+            )
+
+    def _on_test_remap_path(self) -> None:
+        """Pop a dialog to paste a path and see whether the remap
+        layer can resolve it. Useful for debugging cross-machine
+        manifests."""
+        from detector.path_remap import (
+            remap_path, format_remap_diagnostic,
+            learn_rule_from_resolution, set_remap_rules,
+            get_remap_rules,
+        )
+        path_text, ok = QInputDialog.getText(
+            self, "Test path resolution",
+            "Paste a manifest path to test:",
+        )
+        if not ok or not path_text.strip():
+            return
+        stored = path_text.strip()
+        resolved = remap_path(stored)
+        if resolved == stored and not Path(stored).exists():
+            QMessageBox.warning(
+                self, "Could not resolve",
+                format_remap_diagnostic(stored),
+            )
+            return
+        if resolved == stored:
+            QMessageBox.information(
+                self, "Resolved",
+                f"Path exists as-is on this machine:\n\n{stored}",
+            )
+            return
+        # Different path -- auto-detect resolved it. Offer to save
+        # the inferred rule for next time.
+        rule = learn_rule_from_resolution(stored, resolved)
+        msg = (
+            f"Stored path:\n  {stored}\n\n"
+            f"Resolved to:\n  {resolved}\n\n"
+        )
+        if rule:
+            msg += (
+                f"Inferred remap rule:\n"
+                f"  match:   {rule['match']}\n"
+                f"  replace: {rule['replace']}\n\n"
+                "Save this rule so future resolutions skip the auto-"
+                "detect search?"
+            )
+            resp = QMessageBox.question(
+                self, "Save remap rule?", msg,
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if resp == QMessageBox.Yes:
+                rules = get_remap_rules()
+                # Avoid duplicate rules.
+                if not any(r.get("match") == rule["match"]
+                           and r.get("replace") == rule["replace"]
+                           for r in rules):
+                    rules.append(rule)
+                    set_remap_rules(rules)
+                # Refresh status label.
+                if hasattr(self, "_remap_status_lbl"):
+                    from detector.path_remap import (
+                        CONFIG_PATH as _cfg,
+                    )
+                    self._remap_status_lbl.setText(
+                        f"<b>{len(rules)}</b> explicit rule(s) "
+                        f"configured. Config file: <code>{_cfg}</code>"
+                    )
+        else:
+            QMessageBox.information(self, "Resolved", msg)
 
     # ==================================================================
     # Auto-retrain trigger (M4.4)
@@ -3750,28 +3941,71 @@ class TrainingWindow(QMainWindow):
         Qt destroys this window.
 
         Without this, closing the training window (or the entire app)
-        while a long-running operation is active -- per-animal
-        training, hyperopt (1-6 hours), or pre-train blankmotion
-        migration -- destroys the underlying QThread C++ object while
-        its native worker is still executing. Qt prints
-        `QThread: Destroyed while thread '' is still running` and
-        kills the process. This is the crash Andrea hit mid-Phase 2
-        during a per-animal hyperopt: the program closed silently and
-        her hours of accumulated training-data prep were lost.
+        while a long-running operation is active destroys the
+        underlying QThread C++ object while its native worker is
+        still executing. Qt prints `QThread: Destroyed while thread
+        '' is still running` and kills the process.
 
-        For each running thread:
-          1. Ask the worker politely to cancel (best-effort; some
-             workers can't be interrupted mid-iteration).
-          2. Call `thread.quit()` to nudge the event loop to exit.
-          3. Block on `thread.wait(timeout)` so the OS thread has
-             time to actually finish before the QThread C++ object
-             is destroyed. Long timeout because hyperopt's Pool
-             workers can be holding GB-sized parquet writes.
-
-        If the user really wants to bail without waiting, they can
-        force-quit the python process from Task Manager / Activity
-        Monitor -- but at least the process won't crash by itself.
+        Two-stage handling:
+          1. If a long-running op is active, prompt the user with
+             explicit Yes/No -- close AND lose the in-progress trial
+             / file / fold, OR cancel the close and keep the run
+             alive. Completed work (trials in study.db, files in
+             clean.h5, etc.) is always safe; only the
+             currently-executing item is lost.
+          2. If the user confirms close, drain each running thread
+             via request_cancel + quit + wait(timeout) so the OS
+             thread finishes before Qt tears down the QThread C++
+             object.
         """
+        # Detect running threads BEFORE prompting.
+        running_ops: list[tuple[str, str]] = []
+        if (self._hyperopt_thread is not None
+                and self._hyperopt_thread.isRunning()):
+            running_ops.append((
+                "Hyperopt",
+                "Completed trials are flushed to study.db after "
+                "each one finishes -- you can resume by clicking "
+                "Run hyperopt again. Only the currently-running "
+                "trial is lost.",
+            ))
+        if (self._per_animal_thread is not None
+                and self._per_animal_thread.isRunning()):
+            running_ops.append((
+                "Per-animal training",
+                "Animals already finished have their model_v* "
+                "directories written. Only the currently-training "
+                "animal is lost; the others stay.",
+            ))
+        if (self._pre_train_thread is not None
+                and self._pre_train_thread.isRunning()):
+            running_ops.append((
+                "Blankmotion migration",
+                "Files already migrated have their _clean.h5 / "
+                "_bad.h5 on disk -- re-running the migration will "
+                "skip them. Only the currently-migrating file is "
+                "interrupted.",
+            ))
+
+        if running_ops:
+            op_names = ", ".join(op for op, _ in running_ops)
+            details = "\n\n".join(
+                f"• {op}: {note}" for op, note in running_ops
+            )
+            resp = QMessageBox.question(
+                self,
+                "Long-running operation in progress",
+                f"<b>{op_names}</b> still running.\n\n"
+                "If you close now:\n\n"
+                f"{details}\n\n"
+                "Close anyway?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,    # default: cancel close
+            )
+            if resp != QMessageBox.Yes:
+                event.ignore()
+                return
+
         # ---- pre-train blankmotion migration ------------------------
         if (self._pre_train_thread is not None
                 and self._pre_train_thread.isRunning()):
