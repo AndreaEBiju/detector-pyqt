@@ -483,13 +483,31 @@ class BlankmotionMigrationWindow(QMainWindow):
         self._thread = None
         self._btn_cancel.setEnabled(False)
         self._refresh_summary()
+        n_conflicts = int(summary.get("n_skipped_conflict", 0))
+        warnings = list(summary.get("warnings", []))
         msg = (
             f"Done.\n\n"
             f"  ok:                 {summary['n_ok']}\n"
             f"  skipped (existing): {summary['n_skipped_existing']}\n"
+            f"  skipped (conflict): {n_conflicts}\n"
             f"  errors:             {summary['n_error']}\n"
             f"  elapsed:            {summary['elapsed_s']:.1f}s"
         )
+        # File-collision warnings happen when the user's folder has
+        # the full `_blankmotion.mat` AND its period-specific variants
+        # (`_stim_blankmotion.mat` / `_recovery_blankmotion.mat`), OR
+        # has multiple period variants without a full file. All
+        # variants target the same `_clean.h5` / `_bad.h5` output
+        # pair, so without the conflict pass the last writer would
+        # silently overwrite earlier outputs. Surface the warnings
+        # prominently -- this is the user's only signal that some
+        # intervals didn't make it into the migrated outputs.
+        if warnings:
+            msg += "\n\nFile-collision warnings:"
+            for w in warnings[:8]:
+                msg += f"\n  - {w}"
+            if len(warnings) > 8:
+                msg += f"\n  ... and {len(warnings) - 8} more"
         # If manifest-add was enabled, append those counts to the
         # summary so the user sees what landed in the manifest.
         if self._add_to_manifest_cb.isChecked():
@@ -506,9 +524,11 @@ class BlankmotionMigrationWindow(QMainWindow):
             self._n_manifest_added = 0
             self._n_manifest_dup = 0
             self._n_manifest_fail = 0
-        if summary["n_error"] > 0:
-            QMessageBox.warning(self, "Migration complete (with errors)",
-                                  msg)
+        if summary["n_error"] > 0 or warnings:
+            title = ("Migration complete (with errors)"
+                     if summary["n_error"] > 0 else
+                     "Migration complete (with conflict warnings)")
+            QMessageBox.warning(self, title, msg)
         else:
             QMessageBox.information(self, "Migration complete", msg)
 

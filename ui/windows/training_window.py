@@ -2312,22 +2312,57 @@ class TrainingWindow(QMainWindow):
         # summary, not just the count. The worker returns a per-file
         # results list with status + error fields.
         n_summary_errors = int(summary.get("n_error", 0)) if summary else 0
+        n_summary_conflicts = (
+            int(summary.get("n_skipped_conflict", 0)) if summary else 0
+        )
         per_file_errors: list[tuple[str, str]] = []
+        per_file_conflicts: list[tuple[str, str]] = []
         for r in (summary or {}).get("results", []):
-            if r.get("status") == "error":
+            st = r.get("status")
+            if st == "error":
                 bp = Path(str(r.get("blankmotion_path", "?"))).name
                 err = str(r.get("error", "unknown error"))
                 per_file_errors.append((bp, err))
+            elif st == "skipped_conflict":
+                bp = Path(str(r.get("blankmotion_path", "?"))).name
+                err = str(r.get("error", "skipped"))
+                per_file_conflicts.append((bp, err))
+        conflict_warnings: list[str] = list(
+            (summary or {}).get("warnings", [])
+        )
         # Promote-aware partial-failure dialog. Uses an OK button only --
         # the user has already consented to the operation; this is just
         # an FYI before the next step kicks off.
-        if n_summary_errors > 0 or n_dropped > 0:
+        if (n_summary_errors > 0 or n_dropped > 0
+                or n_summary_conflicts > 0 or conflict_warnings):
             next_step = "Manifest write" if promote_mode else "Training"
             lines = [
                 f"Migrated {n_resolved} file(s); "
                 f"{n_summary_errors} migration error(s); "
-                f"{n_dropped} extras dropped post-migration.",
+                f"{n_summary_conflicts} file(s) skipped (output "
+                f"collision); {n_dropped} extras dropped post-migration.",
             ]
+            if conflict_warnings:
+                # The collision warnings are the most important thing
+                # to surface -- they explain WHY some files were
+                # skipped and what the implication is for the outputs.
+                lines.append("")
+                lines.append("File-collision warnings:")
+                for w in conflict_warnings[:5]:
+                    lines.append(f"  - {w}")
+                if len(conflict_warnings) > 5:
+                    lines.append(
+                        f"  ... and {len(conflict_warnings) - 5} more"
+                    )
+            if per_file_conflicts:
+                lines.append("")
+                lines.append("Sample skipped-by-conflict files:")
+                for bp, err in per_file_conflicts[:5]:
+                    lines.append(f"  - {bp}: {err}")
+                if len(per_file_conflicts) > 5:
+                    lines.append(
+                        f"  ... and {len(per_file_conflicts) - 5} more"
+                    )
             if per_file_errors:
                 lines.append("")
                 lines.append("Sample migration errors:")
@@ -2358,7 +2393,7 @@ class TrainingWindow(QMainWindow):
                     "successfully."
                 )
             QMessageBox.warning(
-                self, "Some migrations failed", "\n".join(lines),
+                self, "Migration complete with notes", "\n".join(lines),
             )
 
         # Bail out cleanly if nothing migrated. We don't want to
