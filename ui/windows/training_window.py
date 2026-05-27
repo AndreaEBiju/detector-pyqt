@@ -1309,6 +1309,25 @@ class TrainingWindow(QMainWindow):
         self._btn_pa_remove_selected.clicked.connect(
             self._on_per_animal_remove_selected
         )
+        # Convert every extra to a real manifest entry in one click.
+        # Migrates any pending blankmotion entries first, then writes
+        # the result to the manifest. After this, the extras flow
+        # into hyperopt and per-animal training automatically -- those
+        # orchestrators only consume Manifest rows, never the in-memory
+        # extras list.
+        self._btn_pa_promote = QPushButton("⤴ Promote extras to manifest")
+        self._btn_pa_promote.setToolTip(
+            "Add every EXTRA row to the training manifest. Pending "
+            "blankmotion entries get batch-migrated to splitter "
+            "format first. After promotion, the rows appear under "
+            "Manifest and become visible to hyperopt + per-animal "
+            "training -- both orchestrators only see manifest "
+            "recordings, never the in-memory extras list."
+        )
+        self._btn_pa_promote.clicked.connect(
+            self._on_per_animal_promote_extras
+        )
+        self._btn_pa_promote.setEnabled(False)
         self._btn_pa_clear_extras = QPushButton("Clear extras")
         self._btn_pa_clear_extras.clicked.connect(
             self._on_per_animal_clear_extras
@@ -1322,6 +1341,7 @@ class TrainingWindow(QMainWindow):
         action_row.addWidget(self._btn_pa_add_files)
         action_row.addWidget(self._btn_pa_add_folder)
         action_row.addWidget(self._btn_pa_remove_selected)
+        action_row.addWidget(self._btn_pa_promote)
         action_row.addWidget(self._btn_pa_clear_extras)
         action_row.addStretch(1)
         action_row.addWidget(self._btn_pa_refresh)
@@ -1385,6 +1405,9 @@ class TrainingWindow(QMainWindow):
         combined = list(recs) + list(self._per_animal_extras)
         self._pa_table.set_recordings(combined)
         self._btn_pa_clear_extras.setEnabled(
+            len(self._per_animal_extras) > 0
+        )
+        self._btn_pa_promote.setEnabled(
             len(self._per_animal_extras) > 0
         )
         self._update_per_animal_summary()
@@ -1814,6 +1837,163 @@ class TrainingWindow(QMainWindow):
         self._per_animal_extras = []
         self._refresh_per_animal_tab()
 
+    # ------------------------------------------------------------------
+    # Promote extras to manifest
+    # ------------------------------------------------------------------
+    #
+    # The per-animal training + hyperopt orchestrators both consume
+    # Manifest entries only. "Extras" (added via Add files / Add folder
+    # on this tab) are an in-memory preview list, not a real corpus.
+    # This action moves them into the manifest so they actually count.
+    #
+    # Two-stage chain mirroring the pre-train migration:
+    #   click Promote -> migrate pending blankmotions -> on finish:
+    #   write each (now-resolved) extra to the manifest.
+
+    def _on_per_animal_promote_extras(self) -> None:
+        if not self._per_animal_extras:
+            QMessageBox.information(
+                self, "Nothing to promote",
+                "There are no extra recordings to promote. Add files "
+                "via 'Add additional files...' or scan a folder first.",
+            )
+            return
+        n_total = len(self._per_animal_extras)
+        n_pending = sum(
+            1 for x in self._per_animal_extras
+            if x.get("pending_migration")
+        )
+        msg_lines = [
+            f"Promote {n_total} extra recording(s) to the training "
+            "manifest?",
+            "",
+            "After promotion they appear as normal manifest rows and "
+            "become visible to hyperopt + per-animal training.",
+        ]
+        if n_pending:
+            msg_lines += [
+                "",
+                f"{n_pending} of them still need to be migrated from "
+                "legacy `_blankmotion.mat` to splitter format. That "
+                "happens automatically (parallel, ~10-30 s per file) "
+                "before the manifest write.",
+            ]
+        resp = QMessageBox.question(
+            self, "Promote extras to manifest?", "\n".join(msg_lines),
+        )
+        if resp != QMessageBox.Yes:
+            return
+
+        pending = [
+            x for x in self._per_animal_extras
+            if x.get("pending_migration")
+        ]
+        if pending:
+            # Re-use the pre-train migration worker, but redirect the
+            # completion callback to our promotion flow instead of
+            # restarting training. We flag the intent so the shared
+            # `_on_pre_train_migration_done` can route correctly.
+            self._post_migration_promote = True
+            self._run_pre_train_migration(pending)
+            return
+        # No migrations needed -- write straight to manifest.
+        self._finalize_promote_extras_to_manifest()
+
+    def _finalize_promote_extras_to_manifest(self) -> None:
+        """Write every extra in `self._per_animal_extras` to the
+        training manifest, then clear the extras list and refresh.
+
+        Skips duplicates (by recording_id) so re-clicking is safe.
+        Reports a per-file summary at the end so the user knows what
+        landed."""
+        if not self._per_animal_extras:
+            return
+        manifest_path = detector_paths.get_manifest_path()
+        try:
+            m = Manifest.load(manifest_path)
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Promote failed",
+                f"Could not load manifest:\n{exc}",
+            )
+            return
+        existing_ids = {
+            r.get("recording_id") for r in m.list_recordings(
+                include_held_out=True,
+            )
+        }
+        added: list[str] = []
+        skipped_duplicate: list[str] = []
+        failed: list[tuple[str, str]] = []
+        # Fields that are per-animal-tab bookkeeping and shouldn't
+        # bleed into the manifest schema. Everything else gets passed
+        # through verbatim.
+        STRIP = {"extra", "pending_migration"}
+        for extra in list(self._per_animal_extras):
+            rid = extra.get("recording_id") or ""
+            if not rid:
+                failed.append(("(no recording_id)", "missing recording_id"))
+                continue
+            if rid in existing_ids:
+                skipped_duplicate.append(rid)
+                continue
+            rec = {k: v for k, v in extra.items() if k not in STRIP}
+            try:
+                m.add_recording(rec, by="pyqt_promote_extras")
+                existing_ids.add(rid)
+                added.append(rid)
+            except ManifestError as exc:
+                failed.append((rid, str(exc)))
+            except Exception as exc:
+                failed.append((rid, repr(exc)))
+        # Save once at the end, only if we actually added anything.
+        if added:
+            try:
+                m.save(manifest_path)
+            except Exception as exc:
+                QMessageBox.critical(
+                    self, "Promote failed",
+                    f"Wrote {len(added)} record(s) to the manifest "
+                    f"object but the save failed:\n{exc}\n\n"
+                    "Extras list NOT cleared so you can retry.",
+                )
+                return
+        # Clear the promoted entries from extras (preserve ones that
+        # failed so the user can fix + retry).
+        added_set = set(added)
+        self._per_animal_extras = [
+            x for x in self._per_animal_extras
+            if x.get("recording_id") not in added_set
+        ]
+        self._refresh_all()
+        self.manifest_or_versions_changed.emit()
+        # Summary popup so the user sees what happened.
+        lines = [
+            f"Promoted {len(added)} recording(s) to the manifest.",
+        ]
+        if skipped_duplicate:
+            lines.append(
+                f"  Skipped {len(skipped_duplicate)} already in the "
+                "manifest."
+            )
+        if failed:
+            lines.append(
+                f"  {len(failed)} failed to add (kept in extras):"
+            )
+            for rid, err in failed[:5]:
+                lines.append(f"    - {rid}: {err}")
+            if len(failed) > 5:
+                lines.append(f"    ... and {len(failed) - 5} more")
+        if added:
+            lines.append("")
+            lines.append(
+                "They are now visible in the Manifest, Hyperopt, "
+                "and per-animal training flows."
+            )
+        QMessageBox.information(
+            self, "Promote complete", "\n".join(lines),
+        )
+
     def _on_per_animal_train(self) -> None:
         """Kick off retrain_per_animal in a background thread. Disables
         the train button + opens a progress dialog while it runs."""
@@ -2091,8 +2271,14 @@ class TrainingWindow(QMainWindow):
                 "Training will still start with the successfully-"
                 "migrated files.",
             )
-        # Re-enter the training launcher. The pending check will now
-        # find nothing and proceed to start the train worker.
+        # Branch on what initiated the migration. If the user clicked
+        # Promote, write to manifest now. Otherwise re-enter the
+        # training launcher (the pending check finds nothing and
+        # proceeds to start the train worker).
+        if getattr(self, "_post_migration_promote", False):
+            self._post_migration_promote = False
+            self._finalize_promote_extras_to_manifest()
+            return
         self._on_per_animal_train()
 
     def _on_pre_train_migration_error(self, msg: str) -> None:
@@ -2100,10 +2286,15 @@ class TrainingWindow(QMainWindow):
             self._pre_train_progress.close()
             self._pre_train_progress = None
         self._btn_pa_train.setEnabled(True)
-        QMessageBox.critical(
-            self, "Pre-train migration failed",
-            f"{msg}\n\nNo training will run.",
-        )
+        # Clear the promote-routing flag so a subsequent Train click
+        # doesn't get redirected to manifest promotion.
+        was_promote = getattr(self, "_post_migration_promote", False)
+        self._post_migration_promote = False
+        title = ("Promote migration failed" if was_promote
+                 else "Pre-train migration failed")
+        tail = ("\n\nNo extras were promoted." if was_promote
+                else "\n\nNo training will run.")
+        QMessageBox.critical(self, title, f"{msg}{tail}")
 
     def _on_pre_train_migration_cancel(self) -> None:
         if hasattr(self, "_pre_train_worker") and self._pre_train_worker:
@@ -2112,6 +2303,7 @@ class TrainingWindow(QMainWindow):
             except Exception:
                 pass
         self._btn_pa_train.setEnabled(True)
+        self._post_migration_promote = False
 
     def _on_per_animal_progress(self, idx: int, total: int,
                                   animal: str, status: str) -> None:
