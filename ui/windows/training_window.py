@@ -3741,6 +3741,107 @@ class TrainingWindow(QMainWindow):
         except Exception:
             pass
 
+    # ------------------------------------------------------------------
+    # Window-close handling
+    # ------------------------------------------------------------------
+
+    def closeEvent(self, event) -> None:
+        """Shut down any running background threads cleanly before
+        Qt destroys this window.
+
+        Without this, closing the training window (or the entire app)
+        while a long-running operation is active -- per-animal
+        training, hyperopt (1-6 hours), or pre-train blankmotion
+        migration -- destroys the underlying QThread C++ object while
+        its native worker is still executing. Qt prints
+        `QThread: Destroyed while thread '' is still running` and
+        kills the process. This is the crash Andrea hit mid-Phase 2
+        during a per-animal hyperopt: the program closed silently and
+        her hours of accumulated training-data prep were lost.
+
+        For each running thread:
+          1. Ask the worker politely to cancel (best-effort; some
+             workers can't be interrupted mid-iteration).
+          2. Call `thread.quit()` to nudge the event loop to exit.
+          3. Block on `thread.wait(timeout)` so the OS thread has
+             time to actually finish before the QThread C++ object
+             is destroyed. Long timeout because hyperopt's Pool
+             workers can be holding GB-sized parquet writes.
+
+        If the user really wants to bail without waiting, they can
+        force-quit the python process from Task Manager / Activity
+        Monitor -- but at least the process won't crash by itself.
+        """
+        # ---- pre-train blankmotion migration ------------------------
+        if (self._pre_train_thread is not None
+                and self._pre_train_thread.isRunning()):
+            try:
+                if (self._pre_train_worker is not None
+                        and hasattr(self._pre_train_worker,
+                                     "request_cancel")):
+                    self._pre_train_worker.request_cancel()
+            except Exception:
+                pass
+            try:
+                self._pre_train_thread.quit()
+                # 30 s for a small per-file migration to finish or
+                # cancel cleanly.
+                self._pre_train_thread.wait(30_000)
+            except Exception:
+                pass
+
+        # ---- per-animal training ------------------------------------
+        if (self._per_animal_thread is not None
+                and self._per_animal_thread.isRunning()):
+            try:
+                if (self._per_animal_worker is not None
+                        and hasattr(self._per_animal_worker,
+                                     "request_cancel")):
+                    self._per_animal_worker.request_cancel()
+            except Exception:
+                pass
+            try:
+                self._per_animal_thread.quit()
+                # 60 s -- the orchestrator may be mid-fold and can't
+                # be interrupted cleanly, but waiting lets it write
+                # its current partial artifact safely.
+                self._per_animal_thread.wait(60_000)
+            except Exception:
+                pass
+
+        # ---- hyperopt ------------------------------------------------
+        # This is the long-running one (1-6 hours). It runs through
+        # Pool workers internally that we can't easily signal, so the
+        # best we can do is quit() + wait() with a generous timeout.
+        # If wait() times out, we accept the crash risk and let Qt
+        # tear down -- the user has explicitly asked to close.
+        if (self._hyperopt_thread is not None
+                and self._hyperopt_thread.isRunning()):
+            try:
+                if (self._hyperopt_worker is not None
+                        and hasattr(self._hyperopt_worker,
+                                     "request_cancel")):
+                    self._hyperopt_worker.request_cancel()
+            except Exception:
+                pass
+            try:
+                self._hyperopt_thread.quit()
+                # 90 s -- enough to flush whatever the worker is
+                # writing (parquet checkpoints, trial logs) but not
+                # so long that the user gives up and force-quits.
+                # Internal Pool workers may still be running after
+                # this; we accept that for now -- their subprocesses
+                # are independent of this QThread and won't crash
+                # the GUI.
+                self._hyperopt_thread.wait(90_000)
+            except Exception:
+                pass
+
+        # Always accept the close -- we've done our best to clean up.
+        # Anything still running is the user's problem to monitor via
+        # the subprocess status file.
+        super().closeEvent(event)
+
 
 def _fmt(v, decimals: int) -> str:
     """Format a number safely for table display."""
