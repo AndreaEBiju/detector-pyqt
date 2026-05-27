@@ -2691,6 +2691,37 @@ class TrainingWindow(QMainWindow):
         self._hp_only_box.setEnabled(False)
         form.addRow(self._hp_only_box)
 
+        # Per-animal holdout picker -- one dropdown per animal letting
+        # the user choose which recording to use as the validation
+        # set for hyperopt trial scoring. Defaults to "(alphabetical
+        # default)" which lets the orchestrator pick. The default can
+        # produce F-β=0 for every trial when the picked recording
+        # has no positives in its windowed slice -- this UI is the
+        # fix for that.
+        self._hp_holdout_box = QGroupBox(
+            "Hyperopt validation holdout (per animal)"
+        )
+        self._hp_holdout_grid = QGridLayout(self._hp_holdout_box)
+        self._hp_holdout_grid.setHorizontalSpacing(8)
+        self._hp_holdout_grid.setVerticalSpacing(4)
+        # Maps animal letter -> QComboBox. Each combo has
+        # "(alphabetical default)" + one entry per recording_id of
+        # that animal. The currentData() is either None (default) or
+        # the picked recording_id string.
+        self._hp_holdout_combos: dict[str, "QComboBox"] = {}
+        self._hp_holdout_hint = QLabel(
+            "<i>(per-animal scope only -- pick the recording to use "
+            "as the validation set for each animal's hyperopt trials. "
+            "'(alphabetical default)' lets the orchestrator pick, but "
+            "that can pick a recording with no positives in the eval "
+            "slice, producing F-β=0 for every trial.)</i>"
+        )
+        self._hp_holdout_hint.setWordWrap(True)
+        self._hp_holdout_hint.setStyleSheet("color: #888; padding: 2px;")
+        self._hp_holdout_grid.addWidget(self._hp_holdout_hint, 0, 0, 1, 2)
+        self._hp_holdout_box.setEnabled(False)
+        form.addRow(self._hp_holdout_box)
+
         layout.addWidget(cfg_box)
 
         # ----- Action row ----------------------------------------------
@@ -2806,6 +2837,7 @@ class TrainingWindow(QMainWindow):
         per_animal = self._hp_scope_per_animal.isChecked()
         self._hp_min_recs_spin.setEnabled(per_animal)
         self._hp_only_box.setEnabled(per_animal)
+        self._hp_holdout_box.setEnabled(per_animal)
         # Default n_trials adjustment -- only if the field still holds
         # the previous scope's default, so we don't overwrite a value
         # the user already tuned.
@@ -2873,6 +2905,69 @@ class TrainingWindow(QMainWindow):
             )
             self._hp_animal_checks[letter] = cb
             self._hp_only_grid.addWidget(cb, i // cols, i % cols)
+        # Repopulate the per-animal HOLDOUT combos alongside the
+        # checkbox grid. One row per animal: "F:  [dropdown]"
+        self._refresh_hyperopt_holdout_combos(groups, letters)
+
+    def _refresh_hyperopt_holdout_combos(
+        self, groups: dict, letters: list[str],
+    ) -> None:
+        """Build / repopulate the per-animal validation-holdout
+        combos. Each animal gets a QComboBox listing
+        '(alphabetical default)' + every recording_id in that
+        animal's set. currentData() == None means use the
+        orchestrator's default; otherwise it's the recording_id
+        string to use as the holdout."""
+        # Wipe existing combo widgets (and their labels).
+        for w in list(self._hp_holdout_combos.values()):
+            self._hp_holdout_grid.removeWidget(w)
+            w.deleteLater()
+        # Wipe the row-label widgets too. We tagged them by storing
+        # them under "label::<letter>" so they're easy to find.
+        for letter in list(self._hp_holdout_combos.keys()):
+            for child in self._hp_holdout_box.findChildren(QLabel):
+                if child.objectName() == f"hp_holdout_label_{letter}":
+                    self._hp_holdout_grid.removeWidget(child)
+                    child.deleteLater()
+        self._hp_holdout_combos.clear()
+        # Re-add the placeholder hint at row 0 spanning both cols.
+        # (Already added at build time -- recreate it if it's gone.)
+        if self._hp_holdout_hint is None:
+            self._hp_holdout_hint = QLabel(
+                "<i>(per-animal scope only -- pick the recording to "
+                "use as the validation set for each animal's "
+                "hyperopt trials.)</i>"
+            )
+            self._hp_holdout_hint.setWordWrap(True)
+            self._hp_holdout_hint.setStyleSheet(
+                "color: #888; padding: 2px;"
+            )
+            self._hp_holdout_grid.addWidget(
+                self._hp_holdout_hint, 0, 0, 1, 2,
+            )
+        # Add one row per animal: "F: [combo]".
+        for i, letter in enumerate(letters, start=1):
+            recs = sorted(
+                r["recording_id"] for r in groups.get(letter, [])
+            )
+            row_label = QLabel(f"<b>{letter}</b>:")
+            row_label.setObjectName(f"hp_holdout_label_{letter}")
+            row_label.setMinimumWidth(40)
+            self._hp_holdout_grid.addWidget(row_label, i, 0)
+            combo = QComboBox()
+            combo.setToolTip(
+                f"Validation holdout for animal {letter}'s hyperopt "
+                "trials. '(alphabetical default)' lets the "
+                "orchestrator pick the last-sorted recording, which "
+                "can yield F-β=0 trials if the picked recording has "
+                "no positives in its eval slice. Pick a specific "
+                "recording when you know the default is failing."
+            )
+            combo.addItem("(alphabetical default)", None)
+            for rid in recs:
+                combo.addItem(rid, rid)
+            self._hp_holdout_combos[letter] = combo
+            self._hp_holdout_grid.addWidget(combo, i, 1)
 
     def _on_hp_pick_review_dir(self) -> None:
         start_dir = (
@@ -2918,12 +3013,22 @@ class TrainingWindow(QMainWindow):
             review_dir = None
 
         only_animals: Optional[list[str]] = None
+        holdout_rids_by_animal: dict[str, list[str]] = {}
         if scope == "per_animal":
             picked = [
                 letter for letter, cb in self._hp_animal_checks.items()
                 if cb.isChecked()
             ]
             only_animals = picked if picked else None
+            # Collect per-animal holdout choices. If the combo's
+            # current data is None ("(alphabetical default)"), we
+            # omit that animal -- the orchestrator falls back to its
+            # default selection. Otherwise we pass the picked
+            # recording_id.
+            for letter, combo in self._hp_holdout_combos.items():
+                picked_rid = combo.currentData()
+                if picked_rid:
+                    holdout_rids_by_animal[letter] = [str(picked_rid)]
 
         # Warn about the time cost so the user doesn't kick this off
         # accidentally.
@@ -2956,6 +3061,9 @@ class TrainingWindow(QMainWindow):
                 review_dir=review_dir,
                 only_animals=only_animals,
                 min_recordings_per_animal=int(self._hp_min_recs_spin.value()),
+                holdout_rids_by_animal=(
+                    holdout_rids_by_animal or None
+                ),
             )
         except Exception as exc:
             QMessageBox.critical(

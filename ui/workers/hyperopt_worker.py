@@ -152,6 +152,7 @@ class HyperoptWorker(QObject):
         review_dir: Optional[Path] = None,
         only_animals: Optional[Iterable[str]] = None,
         min_recordings_per_animal: int = 4,
+        holdout_rids_by_animal: Optional[dict] = None,
         parent: Optional[QObject] = None,
     ):
         super().__init__(parent)
@@ -171,6 +172,15 @@ class HyperoptWorker(QObject):
             if only_animals is not None else None
         )
         self._min_recordings_per_animal = int(min_recordings_per_animal)
+        # Per-animal holdout override: maps animal letter -> list of
+        # recording_ids to use as the validation holdout. None / empty
+        # falls through to the orchestrator's default (alphabetically-
+        # last recording for that animal).
+        self._holdout_rids_by_animal: dict[str, list[str]] = {
+            k.upper(): list(v)
+            for k, v in (holdout_rids_by_animal or {}).items()
+            if v
+        }
 
     # ------------------------------------------------------------------
     # Polling helpers
@@ -274,6 +284,8 @@ class HyperoptWorker(QObject):
                         only_animals=self._only_animals,
                         min_recordings_per_animal=
                             self._min_recordings_per_animal,
+                        holdout_rids_by_animal=
+                            self._holdout_rids_by_animal,
                     )
             except Exception as e:                  # pragma: no cover
                 error_holder["error"] = e
