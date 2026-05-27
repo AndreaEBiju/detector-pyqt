@@ -2176,14 +2176,22 @@ class TrainingWindow(QMainWindow):
         self._pre_train_thread.finished.connect(
             self._pre_train_thread.deleteLater
         )
+        # Tailor the dialog copy to what the user actually clicked.
+        # The same migration worker serves both "click Train" and
+        # "click Promote to manifest" -- the next-step messaging
+        # differs, so branch on the routing flag.
+        promote_mode = getattr(self, "_post_migration_promote", False)
+        next_step = ("manifest write" if promote_mode
+                     else "training")
         self._pre_train_progress = QProgressDialog(
             f"Migrating {len(blankmotion_paths)} blankmotion file(s) "
-            "to splitter format (this happens once, then training "
-            "starts)…",
+            f"to splitter format (this happens once, then "
+            f"{next_step} starts)…",
             "Cancel", 0, len(blankmotion_paths), self,
         )
         self._pre_train_progress.setWindowTitle(
-            "Pre-train: migrating blankmotion files"
+            "Promote: migrating blankmotion files" if promote_mode
+            else "Pre-train: migrating blankmotion files"
         )
         self._pre_train_progress.setWindowModality(Qt.WindowModal)
         self._pre_train_progress.setMinimumDuration(0)
@@ -2201,10 +2209,16 @@ class TrainingWindow(QMainWindow):
         self._pre_train_progress.setValue(n_done)
         bp_name = Path(res.get("blankmotion_path", "?")).name
         st = res.get("status", "?")
-        self._pre_train_progress.setLabelText(
-            f"[{n_done}/{n_total}] {bp_name}  -> {st}\n\n"
+        promote_mode = getattr(self, "_post_migration_promote", False)
+        follow_up = (
+            "Manifest write will happen automatically when all "
+            "migrations finish."
+            if promote_mode else
             "Training will start automatically when all migrations "
             "finish."
+        )
+        self._pre_train_progress.setLabelText(
+            f"[{n_done}/{n_total}] {bp_name}  -> {st}\n\n{follow_up}"
         )
 
     def _on_pre_train_migration_done(self, summary: dict) -> None:
