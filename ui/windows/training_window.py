@@ -1949,10 +1949,23 @@ class TrainingWindow(QMainWindow):
         added: list[str] = []
         skipped_duplicate: list[str] = []
         failed: list[tuple[str, str]] = []
-        # Fields that are per-animal-tab bookkeeping and shouldn't
-        # bleed into the manifest schema. Everything else gets passed
-        # through verbatim.
-        STRIP = {"extra", "pending_migration"}
+        # Fields that are per-animal-tab bookkeeping / UI display
+        # metadata and aren't part of the manifest schema. Strip
+        # before handing to Manifest.add_recording, which rejects
+        # unknown keys with "recording has unknown fields: [...]".
+        STRIP = {
+            "extra",
+            "pending_migration",
+            # Per-animal table's Source file column metadata --
+            # surface-only, no training-pipeline meaning.
+            "source_file_basename",
+            "source_file_path",
+            # Set on folder-added records so the pre-train migration
+            # worker knows which blankmotion file to migrate. Once
+            # promoted to the manifest the migration is already done
+            # and the field is no longer needed.
+            "blankmotion_path",
+        }
         for extra in list(self._per_animal_extras):
             rid = extra.get("recording_id") or ""
             if not rid:
