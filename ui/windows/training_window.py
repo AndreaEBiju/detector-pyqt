@@ -1682,16 +1682,40 @@ class TrainingWindow(QMainWindow):
             if source is None:
                 skipped_no_source += 1
                 continue
-            # Strip the `_blankmotion` suffix to get the recording id.
-            stem = bp.stem
-            core = (stem[: -len("_blankmotion")]
-                    if stem.endswith("_blankmotion") else stem)
+            # Derive the recording's CORE stem from the SOURCE filename
+            # (not the blankmotion's), so it matches the migration's
+            # output naming exactly. `_find_source_for_blankmotion`
+            # strips period suffixes -- so for both
+            # `<base>_blankmotion.mat` and `<base>_recovery_blankmotion.mat`
+            # the source is `<base>_notched.mat` and the core is
+            # `<base>`. This is what the migration writes outputs
+            # against (via `_output_paths_for_source`):
+            #     <base>_clean.h5 / <base>_bad.h5 / <base>_baseline.h5
+            # Previously we used `bp.stem[:-len("_blankmotion")]` which
+            # kept the period suffix and produced expected output
+            # paths like `<base>_recovery_clean.h5` that never get
+            # written. Every recovery extra would then drop with
+            # "no clean.h5 produced" even though migration succeeded.
+            source_stem = source.stem
+            if source_stem.endswith("_notched"):
+                core = source_stem[: -len("_notched")]
+            elif source_stem.endswith("_notchblanked"):
+                core = source_stem[: -len("_notchblanked")]
+            else:
+                core = source_stem
             if core in existing_ids:
+                # Multiple blankmotion variants for the same recording
+                # (full + period, or stim + recovery) collapse to one
+                # extra. The migration's conflict-detection picks
+                # which variant actually runs; we just need one entry
+                # in the per-animal table.
                 skipped_duplicate += 1
                 continue
             existing_ids.add(core)
-            # Expected output paths post-migration.
-            parent_dir = bp.parent
+            # Expected output paths post-migration -- live next to the
+            # source, named by the full-recording core (NOT the period-
+            # specific base). Matches `_output_paths_for_source`.
+            parent_dir = source.parent
             clean_out = parent_dir / f"{core}_clean.h5"
             bad_out = parent_dir / f"{core}_bad.h5"
             baseline_out = parent_dir / f"{core}_baseline.h5"
@@ -2315,6 +2339,10 @@ class TrainingWindow(QMainWindow):
         n_summary_conflicts = (
             int(summary.get("n_skipped_conflict", 0)) if summary else 0
         )
+        n_summary_skipped_existing = (
+            int(summary.get("n_skipped_existing", 0)) if summary else 0
+        )
+        n_summary_ok = int(summary.get("n_ok", 0)) if summary else 0
         per_file_errors: list[tuple[str, str]] = []
         per_file_conflicts: list[tuple[str, str]] = []
         for r in (summary or {}).get("results", []):
@@ -2337,10 +2365,16 @@ class TrainingWindow(QMainWindow):
                 or n_summary_conflicts > 0 or conflict_warnings):
             next_step = "Manifest write" if promote_mode else "Training"
             lines = [
-                f"Migrated {n_resolved} file(s); "
-                f"{n_summary_errors} migration error(s); "
-                f"{n_summary_conflicts} file(s) skipped (output "
-                f"collision); {n_dropped} extras dropped post-migration.",
+                f"Migration summary: "
+                f"{n_summary_ok} newly migrated, "
+                f"{n_summary_skipped_existing} skipped (outputs "
+                f"already on disk), "
+                f"{n_summary_conflicts} skipped (file collision), "
+                f"{n_summary_errors} errored.",
+                "",
+                f"Re-resolved {n_resolved} extra(s) post-migration; "
+                f"{n_dropped} dropped (couldn't find the expected "
+                f"clean.h5).",
             ]
             if conflict_warnings:
                 # The collision warnings are the most important thing
