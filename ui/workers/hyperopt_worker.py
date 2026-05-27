@@ -153,6 +153,9 @@ class HyperoptWorker(QObject):
         only_animals: Optional[Iterable[str]] = None,
         min_recordings_per_animal: int = 4,
         holdout_rids_by_animal: Optional[dict] = None,
+        w_neg_range: Optional[tuple] = None,
+        fp_weight_range: Optional[tuple] = None,
+        fn_weight_range: Optional[tuple] = None,
         parent: Optional[QObject] = None,
     ):
         super().__init__(parent)
@@ -181,6 +184,15 @@ class HyperoptWorker(QObject):
             for k, v in (holdout_rids_by_animal or {}).items()
             if v
         }
+        # Parameter-search ranges. None falls through to optimize_scope's
+        # defaults. Each tuple is (low, high) -- low must be < high
+        # (the UI validates this; the orchestrator does too).
+        self._w_neg_range = (tuple(w_neg_range)
+                             if w_neg_range else None)
+        self._fp_weight_range = (tuple(fp_weight_range)
+                                 if fp_weight_range else None)
+        self._fn_weight_range = (tuple(fn_weight_range)
+                                 if fn_weight_range else None)
 
     # ------------------------------------------------------------------
     # Polling helpers
@@ -262,6 +274,18 @@ class HyperoptWorker(QObject):
         result_holder: dict = {}
         error_holder: dict = {}
 
+        # Build the range kwargs once -- the orchestrator signatures
+        # accept them on both combined and per_animal entry points,
+        # but skip any that the UI didn't set (so the orchestrator
+        # default fires). All-None means no override.
+        range_kwargs: dict = {}
+        if self._w_neg_range is not None:
+            range_kwargs["w_neg_range"] = self._w_neg_range
+        if self._fp_weight_range is not None:
+            range_kwargs["fp_weight_range"] = self._fp_weight_range
+        if self._fn_weight_range is not None:
+            range_kwargs["fn_weight_range"] = self._fn_weight_range
+
         def _do_work():
             try:
                 if self._scope == "combined":
@@ -272,6 +296,7 @@ class HyperoptWorker(QObject):
                         review_dir=self._review_dir,
                         beta=self._beta,
                         seed=self._seed,
+                        **range_kwargs,
                     )
                 else:
                     result_holder["result"] = optimize_per_animal(
@@ -286,6 +311,7 @@ class HyperoptWorker(QObject):
                             self._min_recordings_per_animal,
                         holdout_rids_by_animal=
                             self._holdout_rids_by_animal,
+                        **range_kwargs,
                     )
             except Exception as e:                  # pragma: no cover
                 error_holder["error"] = e

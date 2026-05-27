@@ -2722,6 +2722,124 @@ class TrainingWindow(QMainWindow):
         self._hp_holdout_box.setEnabled(False)
         form.addRow(self._hp_holdout_box)
 
+        # Parameter ranges -- the search space Optuna's TPE sampler
+        # explores. Defaults match detector/hyperopt.py's defaults.
+        # Widening these is the right move when a previous run's best
+        # parameter sat right at the edge of the range (e.g. F's best
+        # w_neg=0.207 at the lower bound of [0.2, 1.5] -- the true
+        # optimum might be at 0.05). Narrowing is useful for
+        # exploitation runs after you've identified a promising
+        # neighborhood.
+        ranges_box = QGroupBox("Parameter ranges")
+        ranges_grid = QGridLayout(ranges_box)
+        ranges_grid.setHorizontalSpacing(12)
+        ranges_grid.setVerticalSpacing(4)
+        ranges_hint = QLabel(
+            "<i>Search bounds for each Optuna parameter. Widen a "
+            "bound when the previous best landed at it -- TPE can't "
+            "sample outside the range. Phase 1 + Phase 2 + baselines "
+            "are independent of these; changing ranges only costs "
+            "the trial loop (~20-60 min/animal).</i>"
+        )
+        ranges_hint.setWordWrap(True)
+        ranges_hint.setStyleSheet("color: #888; padding: 2px;")
+        ranges_grid.addWidget(ranges_hint, 0, 0, 1, 3)
+        # Header row.
+        ranges_grid.addWidget(QLabel("<b>Parameter</b>"), 1, 0)
+        ranges_grid.addWidget(QLabel("<b>Min</b>"), 1, 1)
+        ranges_grid.addWidget(QLabel("<b>Max</b>"), 1, 2)
+
+        # w_neg: log-sampled in [0.001, 100.0] gives ample headroom
+        # for both extremely-permissive and aggressive-negative-down-
+        # weighting configurations. Defaults match optimize_scope.
+        ranges_grid.addWidget(QLabel("w_neg"), 2, 0)
+        self._hp_w_neg_lo = QDoubleSpinBox()
+        self._hp_w_neg_lo.setRange(0.001, 100.0)
+        self._hp_w_neg_lo.setDecimals(3)
+        self._hp_w_neg_lo.setSingleStep(0.05)
+        self._hp_w_neg_lo.setValue(0.2)
+        self._hp_w_neg_lo.setToolTip(
+            "Lower bound for the negative-class sample weight. "
+            "Lower = model is less penalized for missing label=0 "
+            "samples. F's best at 0.207 hit this bound -- try "
+            "lowering to 0.05 or 0.01 to see if the true optimum "
+            "is below 0.2."
+        )
+        ranges_grid.addWidget(self._hp_w_neg_lo, 2, 1)
+        self._hp_w_neg_hi = QDoubleSpinBox()
+        self._hp_w_neg_hi.setRange(0.001, 100.0)
+        self._hp_w_neg_hi.setDecimals(3)
+        self._hp_w_neg_hi.setSingleStep(0.05)
+        self._hp_w_neg_hi.setValue(1.5)
+        self._hp_w_neg_hi.setToolTip(
+            "Upper bound for w_neg. Higher = stronger penalty for "
+            "FP."
+        )
+        ranges_grid.addWidget(self._hp_w_neg_hi, 2, 2)
+
+        # fp_weight: linear in [0.1, 50.0]
+        ranges_grid.addWidget(QLabel("fp_weight"), 3, 0)
+        self._hp_fp_weight_lo = QDoubleSpinBox()
+        self._hp_fp_weight_lo.setRange(0.1, 50.0)
+        self._hp_fp_weight_lo.setDecimals(2)
+        self._hp_fp_weight_lo.setSingleStep(0.5)
+        self._hp_fp_weight_lo.setValue(1.0)
+        self._hp_fp_weight_lo.setToolTip(
+            "Lower bound for the false-positive weight applied to "
+            "review-judged FPs (when a review_dir is given) or to "
+            "model-predicted FPs during retrain. 1.0 = standard "
+            "weight."
+        )
+        ranges_grid.addWidget(self._hp_fp_weight_lo, 3, 1)
+        self._hp_fp_weight_hi = QDoubleSpinBox()
+        self._hp_fp_weight_hi.setRange(0.1, 50.0)
+        self._hp_fp_weight_hi.setDecimals(2)
+        self._hp_fp_weight_hi.setSingleStep(0.5)
+        self._hp_fp_weight_hi.setValue(10.0)
+        self._hp_fp_weight_hi.setToolTip(
+            "Upper bound for fp_weight. F's optimum at ~8.0 sat "
+            "well inside this range -- raise only if you see best "
+            "values approaching 10."
+        )
+        ranges_grid.addWidget(self._hp_fp_weight_hi, 3, 2)
+
+        # fn_weight: linear in [0.1, 50.0]
+        ranges_grid.addWidget(QLabel("fn_weight"), 4, 0)
+        self._hp_fn_weight_lo = QDoubleSpinBox()
+        self._hp_fn_weight_lo.setRange(0.1, 50.0)
+        self._hp_fn_weight_lo.setDecimals(2)
+        self._hp_fn_weight_lo.setSingleStep(0.5)
+        self._hp_fn_weight_lo.setValue(1.0)
+        self._hp_fn_weight_lo.setToolTip(
+            "Lower bound for false-negative weight (true_artifact "
+            "judgments). F's best at 1.23 sat near this bound -- "
+            "try 0.5 to see if going lower helps."
+        )
+        ranges_grid.addWidget(self._hp_fn_weight_lo, 4, 1)
+        self._hp_fn_weight_hi = QDoubleSpinBox()
+        self._hp_fn_weight_hi.setRange(0.1, 50.0)
+        self._hp_fn_weight_hi.setDecimals(2)
+        self._hp_fn_weight_hi.setSingleStep(0.5)
+        self._hp_fn_weight_hi.setValue(10.0)
+        self._hp_fn_weight_hi.setToolTip(
+            "Upper bound for fn_weight."
+        )
+        ranges_grid.addWidget(self._hp_fn_weight_hi, 4, 2)
+
+        # Reset-to-defaults button so the user has an easy way back.
+        self._btn_hp_reset_ranges = QPushButton("Reset to defaults")
+        self._btn_hp_reset_ranges.setToolTip(
+            "Restore the original parameter ranges: w_neg ∈ "
+            "[0.2, 1.5], fp_weight ∈ [1.0, 10.0], fn_weight ∈ "
+            "[1.0, 10.0]."
+        )
+        self._btn_hp_reset_ranges.clicked.connect(
+            self._on_hp_reset_ranges
+        )
+        ranges_grid.addWidget(self._btn_hp_reset_ranges, 5, 0, 1, 3)
+
+        form.addRow(ranges_box)
+
         layout.addWidget(cfg_box)
 
         # ----- Action row ----------------------------------------------
@@ -2969,6 +3087,17 @@ class TrainingWindow(QMainWindow):
             self._hp_holdout_combos[letter] = combo
             self._hp_holdout_grid.addWidget(combo, i, 1)
 
+    def _on_hp_reset_ranges(self) -> None:
+        """Restore the default parameter ranges. The defaults match
+        detector/hyperopt.py's `optimize_scope` defaults so a reset
+        produces the same search space as a fresh install."""
+        self._hp_w_neg_lo.setValue(0.2)
+        self._hp_w_neg_hi.setValue(1.5)
+        self._hp_fp_weight_lo.setValue(1.0)
+        self._hp_fp_weight_hi.setValue(10.0)
+        self._hp_fn_weight_lo.setValue(1.0)
+        self._hp_fn_weight_hi.setValue(10.0)
+
     def _on_hp_pick_review_dir(self) -> None:
         start_dir = (
             self._hp_review_dir_edit.text().strip() or str(Path.home())
@@ -3011,6 +3140,32 @@ class TrainingWindow(QMainWindow):
             if resp != QMessageBox.Yes:
                 return
             review_dir = None
+
+        # Validate parameter ranges -- each low must be < its high.
+        # Optuna's TPESampler would raise mid-trial otherwise; catch
+        # it early with a useful message.
+        ranges_to_check = [
+            ("w_neg", self._hp_w_neg_lo.value(), self._hp_w_neg_hi.value()),
+            ("fp_weight",
+             self._hp_fp_weight_lo.value(), self._hp_fp_weight_hi.value()),
+            ("fn_weight",
+             self._hp_fn_weight_lo.value(), self._hp_fn_weight_hi.value()),
+        ]
+        for name, lo, hi in ranges_to_check:
+            if lo >= hi:
+                QMessageBox.critical(
+                    self, "Invalid parameter range",
+                    f"{name}: min ({lo}) must be strictly less than "
+                    f"max ({hi}). Fix the range in the Parameter "
+                    "ranges group before running.",
+                )
+                return
+        w_neg_range = (float(self._hp_w_neg_lo.value()),
+                       float(self._hp_w_neg_hi.value()))
+        fp_weight_range = (float(self._hp_fp_weight_lo.value()),
+                           float(self._hp_fp_weight_hi.value()))
+        fn_weight_range = (float(self._hp_fn_weight_lo.value()),
+                           float(self._hp_fn_weight_hi.value()))
 
         only_animals: Optional[list[str]] = None
         holdout_rids_by_animal: dict[str, list[str]] = {}
@@ -3064,6 +3219,9 @@ class TrainingWindow(QMainWindow):
                 holdout_rids_by_animal=(
                     holdout_rids_by_animal or None
                 ),
+                w_neg_range=w_neg_range,
+                fp_weight_range=fp_weight_range,
+                fn_weight_range=fn_weight_range,
             )
         except Exception as exc:
             QMessageBox.critical(
