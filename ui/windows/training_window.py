@@ -2334,22 +2334,40 @@ class TrainingWindow(QMainWindow):
     def _on_pre_train_migration_progress(
         self, n_done: int, n_total: int, res: dict,
     ) -> None:
-        if self._pre_train_progress is None:
+        # Take a LOCAL reference at the top -- the migration worker's
+        # progress signals can arrive after _on_pre_train_migration_done
+        # has already set self._pre_train_progress to None (cross-thread
+        # signals can queue, and Qt event-loop ordering doesn't
+        # guarantee strict before-after). Just an `is None` check at
+        # the top isn't enough; the slot can be mid-execution when
+        # the reference flips. Local reference avoids the race.
+        progress = self._pre_train_progress
+        if progress is None:
             return
-        self._pre_train_progress.setValue(n_done)
-        bp_name = Path(res.get("blankmotion_path", "?")).name
-        st = res.get("status", "?")
-        promote_mode = getattr(self, "_post_migration_promote", False)
-        follow_up = (
-            "Manifest write will happen automatically when all "
-            "migrations finish."
-            if promote_mode else
-            "Training will start automatically when all migrations "
-            "finish."
-        )
-        self._pre_train_progress.setLabelText(
-            f"[{n_done}/{n_total}] {bp_name}  -> {st}\n\n{follow_up}"
-        )
+        try:
+            progress.setValue(n_done)
+            bp_name = Path(res.get("blankmotion_path", "?")).name
+            st = res.get("status", "?")
+            promote_mode = getattr(
+                self, "_post_migration_promote", False,
+            )
+            follow_up = (
+                "Manifest write will happen automatically when all "
+                "migrations finish."
+                if promote_mode else
+                "Training will start automatically when all "
+                "migrations finish."
+            )
+            progress.setLabelText(
+                f"[{n_done}/{n_total}] {bp_name}  -> {st}\n\n"
+                f"{follow_up}"
+            )
+        except RuntimeError:
+            # QProgressDialog can throw RuntimeError if its C++
+            # object has been deleted by deleteLater between our
+            # local-ref grab and the actual method call. Harmless --
+            # the dialog is already closing.
+            pass
 
     def _on_pre_train_migration_done(self, summary: dict) -> None:
         """Migration finished. Re-resolve each pending extra to fill
