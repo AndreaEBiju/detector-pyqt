@@ -2606,11 +2606,44 @@ class TrainingWindow(QMainWindow):
                       f"({completed}/{total} done)")
         self._per_animal_progress.setLabelText(label)
 
+    def _drain_per_animal_thread(self) -> None:
+        """Explicitly quit + wait on the per-animal QThread before
+        dropping our Python references. Same rationale as
+        _drain_hyperopt_thread: avoids the
+        `QThread: Destroyed while thread '' is still running`
+        race where Python GC reclaims the QThread C++ object before
+        its OS thread terminates, which on Windows can abort the
+        process at the very end of a successful run.
+        """
+        thread = self._per_animal_thread
+        if thread is None:
+            return
+        try:
+            thread.quit()
+            # 30s is enough for the worker's run() to return after
+            # the orchestrator finishes -- it doesn't do any post-
+            # work past emit-finished.
+            if not thread.wait(30_000):
+                print(
+                    "[per_animal] WARNING: QThread didn't exit "
+                    "within 30s of quit() -- continuing anyway.",
+                    flush=True,
+                )
+        except RuntimeError:
+            # Thread already destroyed -- harmless.
+            pass
+
     def _on_per_animal_finished(self, results: dict) -> None:
+        # Drain the QThread BEFORE dropping refs. See
+        # `_drain_per_animal_thread` for the rationale -- without
+        # this, Andrea's run hits the same "QThread: Destroyed
+        # while thread '' is still running" warning at the end of
+        # an otherwise-successful per-animal training run.
         if self._per_animal_progress is not None:
             self._per_animal_progress.setValue(100)
             self._per_animal_progress.close()
             self._per_animal_progress = None
+        self._drain_per_animal_thread()
         self._per_animal_worker = None
         self._per_animal_thread = None
         self._render_per_animal_results(results)
@@ -2626,6 +2659,9 @@ class TrainingWindow(QMainWindow):
         if self._per_animal_progress is not None:
             self._per_animal_progress.close()
             self._per_animal_progress = None
+        # Same drain pattern as the success path -- the error path
+        # has the same QThread race.
+        self._drain_per_animal_thread()
         self._per_animal_worker = None
         self._per_animal_thread = None
         QMessageBox.critical(
