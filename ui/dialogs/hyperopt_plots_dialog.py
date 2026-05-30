@@ -163,11 +163,26 @@ class HyperoptPlotsDialog(QDialog):
         self._tabs = QTabWidget()
         layout.addWidget(self._tabs, stretch=1)
 
-        # Footer: open-in-Finder + close.
+        # Footer: open-in-Finder + regenerate + close.
         footer = QHBoxLayout()
         self._btn_open = QPushButton("Open plots folder")
         self._btn_open.clicked.connect(self._open_plots_folder)
         footer.addWidget(self._btn_open)
+        # Re-run _save_plots on the existing study without
+        # re-running any trials. Useful when a previous run's plot
+        # step failed silently (the new _save_plots writes
+        # `<plot>.error.txt` sidecars so the user can see why) or
+        # the plot code itself was updated post-run.
+        self._btn_regen = QPushButton("Regenerate plots")
+        self._btn_regen.setToolTip(
+            "Re-run the plot step on the currently-selected study's "
+            "existing trials. Does NOT run more trials -- only "
+            "regenerates the PNGs from the study.db that's already "
+            "on disk. Useful when a previous run's plots failed "
+            "silently."
+        )
+        self._btn_regen.clicked.connect(self._on_regenerate_plots)
+        footer.addWidget(self._btn_regen)
         footer.addStretch(1)
         bb = QDialogButtonBox(QDialogButtonBox.Close)
         bb.rejected.connect(self.reject)
@@ -244,17 +259,89 @@ class HyperoptPlotsDialog(QDialog):
             else:
                 inner.setPixmap(pix)
         else:
-            inner.setText(
-                f"No plot at {png_path.name} yet.\n\n"
-                "Either the study had too few trials for Optuna to "
-                "produce this diagnostic, or the run errored before "
-                "the plot step. See the per-plot caption above for "
-                "what this plot needs."
-            )
-            inner.setStyleSheet("color: #888;")
+            # Check for a sidecar error file written by _save_plots
+            # when a plot fails. Surfacing the actual exception
+            # message tells the user WHY the plot is missing
+            # (e.g. "all trials produced identical objectives" vs
+            # "tree fit failed numerically").
+            error_path = png_path.with_suffix(".error.txt")
+            if error_path.exists():
+                try:
+                    error_text = error_path.read_text()
+                except Exception:
+                    error_text = "(couldn't read error sidecar)"
+                inner.setText(
+                    f"<b>Plot generation failed</b> for "
+                    f"{png_path.name}\n\n"
+                    f"<pre>{error_text}</pre>\n"
+                    "Try the <b>Regenerate plots</b> button below "
+                    "to retry on the existing study (some failures "
+                    "are transient or were caused by older code). "
+                    "If it still fails, the study likely doesn't "
+                    "have the variance / trial count this plot "
+                    "needs -- see the caption above."
+                )
+                inner.setTextFormat(Qt.RichText)
+                inner.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+                inner.setWordWrap(True)
+                inner.setStyleSheet("color: #c84; padding: 8px;")
+            else:
+                inner.setText(
+                    f"No plot at {png_path.name} yet.\n\n"
+                    "Either the study had too few trials for "
+                    "Optuna to produce this diagnostic, or the run "
+                    "errored before the plot step. See the per-"
+                    "plot caption above for what this plot needs.\n\n"
+                    "Click <b>Regenerate plots</b> below to retry "
+                    "the plot step on the existing study without "
+                    "running more trials."
+                )
+                inner.setTextFormat(Qt.RichText)
+                inner.setStyleSheet("color: #888;")
         scroll.setWidget(inner)
         v.addWidget(scroll, stretch=1)
         return w
+
+    def _on_regenerate_plots(self) -> None:
+        """Call detector.hyperopt.regenerate_plots on the currently-
+        selected study, then reload the dialog's tabs."""
+        plots_dir = self._current_plots_dir()
+        # plots_dir is `.../hyperopt/plots` -- the study workdir is
+        # two levels up.
+        study_workdir = plots_dir.parent.parent
+        try:
+            from detector.hyperopt import regenerate_plots
+            result = regenerate_plots(study_workdir)
+        except Exception as e:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.critical(
+                self, "Regenerate failed",
+                f"Could not regenerate plots: "
+                f"{type(e).__name__}: {e}",
+            )
+            return
+        from PySide6.QtWidgets import QMessageBox
+        if result.get("status") == "error":
+            QMessageBox.warning(
+                self, "Regenerate failed",
+                f"Plot regeneration reported an error:\n\n"
+                f"{result.get('error', 'unknown')}\n\n"
+                "Check the study workdir for any error sidecars "
+                "(<plot>.error.txt files) that explain per-plot "
+                "failure reasons."
+            )
+        else:
+            n = result.get("n_trials", "?")
+            QMessageBox.information(
+                self, "Plots regenerated",
+                f"Re-ran plot generation on {n} trial(s) from\n\n"
+                f"  {study_workdir}\n\n"
+                "Per-plot sidecar errors (<plot>.error.txt) will "
+                "appear in the plots folder for any plots that "
+                "still fail. The dialog has been refreshed."
+            )
+        # Reload the tabs so the user sees the new state.
+        self._reload_for_current_study()
 
     # ------------------------------------------------------------------
     # File-manager open
