@@ -288,6 +288,16 @@ class TrainingWindow(QMainWindow):
         # a "running, don't close" banner during the run.
         self._hyperopt_thread: Optional[QThread] = None
         self._hyperopt_worker: Optional[HyperoptWorker] = None
+        # Per-animal hyperopt weight overrides. Populated by the
+        # "Use all best params for per-animal training" button on the
+        # Hyperopt tab. When the user clicks "Train per-animal
+        # models", this dict (if non-empty) is passed to the
+        # PerAnimalTrainWorker so each animal trains with its OWN
+        # hyperopt-found optimum instead of a global scalar.
+        # Format: {"F": {"w_neg": 0.21, "fp_weight": 8.0,
+        # "fn_weight": 1.2}, "J": {...}, ...}
+        # Reset on window open; not persisted.
+        self._per_animal_hyperopt_weights: dict = {}
         # Per-scope tracking populated as the worker streams results.
         # Combined: single entry under key "combined". Per-animal:
         # one entry per animal letter as soon as its study spins up.
@@ -1256,6 +1266,33 @@ class TrainingWindow(QMainWindow):
         self._pa_counts.setWordWrap(True)
         layout.addWidget(self._pa_counts)
 
+        # Hyperopt-override status: shown when the user has loaded
+        # per-animal hyperopt weights via the "Use all best params"
+        # button on the Hyperopt tab. Hidden when no override is
+        # active so the row doesn't take up space.
+        override_row = QHBoxLayout()
+        self._pa_hp_override_label = QLabel("")
+        self._pa_hp_override_label.setWordWrap(True)
+        self._pa_hp_override_label.setStyleSheet(
+            "color: #4c72b0; font-style: italic; padding: 2px;"
+        )
+        self._btn_pa_clear_hp_override = QPushButton(
+            "Clear hyperopt override"
+        )
+        self._btn_pa_clear_hp_override.setToolTip(
+            "Discard the per-animal hyperopt weights loaded from "
+            "the Hyperopt tab. The next training run will use the "
+            "scalar w_neg / FP weight / FN weight from the Retrain "
+            "tab instead."
+        )
+        self._btn_pa_clear_hp_override.clicked.connect(
+            self._on_pa_clear_hp_override,
+        )
+        self._btn_pa_clear_hp_override.setVisible(False)
+        override_row.addWidget(self._pa_hp_override_label, stretch=1)
+        override_row.addWidget(self._btn_pa_clear_hp_override)
+        layout.addLayout(override_row)
+
         # The grouping table.
         self._pa_table = PerAnimalTable()
         self._pa_table.set_min_recordings_per_animal(3)
@@ -1410,6 +1447,7 @@ class TrainingWindow(QMainWindow):
         self._btn_pa_promote.setEnabled(
             len(self._per_animal_extras) > 0
         )
+        self._refresh_per_animal_hp_override_label()
         self._update_per_animal_summary()
 
     def _update_per_animal_summary(self) -> None:
@@ -1861,6 +1899,41 @@ class TrainingWindow(QMainWindow):
         self._per_animal_extras = []
         self._refresh_per_animal_tab()
 
+    def _refresh_per_animal_hp_override_label(self) -> None:
+        """Show the loaded per-animal hyperopt weights in a status
+        label above the table so the user can see that the next
+        Train click will use overridden weights (not the Retrain
+        tab's scalars)."""
+        weights = self._per_animal_hyperopt_weights
+        if not weights:
+            self._pa_hp_override_label.setText("")
+            self._pa_hp_override_label.setVisible(False)
+            self._btn_pa_clear_hp_override.setVisible(False)
+            return
+        lines = [
+            f"<b>Hyperopt override active</b> "
+            f"({len(weights)} animal(s)): next training run will "
+            f"use the loaded per-animal weights."
+        ]
+        for animal in sorted(weights.keys()):
+            wts = weights[animal]
+            lines.append(
+                f"&nbsp;&nbsp;{animal}: "
+                f"w_neg={wts.get('w_neg', '—'):.4g}, "
+                f"fp={wts.get('fp_weight', '—'):.4g}, "
+                f"fn={wts.get('fn_weight', '—'):.4g}"
+            )
+        self._pa_hp_override_label.setText("<br>".join(lines))
+        self._pa_hp_override_label.setVisible(True)
+        self._btn_pa_clear_hp_override.setVisible(True)
+
+    def _on_pa_clear_hp_override(self) -> None:
+        """Discard the loaded per-animal hyperopt weights."""
+        if not self._per_animal_hyperopt_weights:
+            return
+        self._per_animal_hyperopt_weights = {}
+        self._refresh_per_animal_hp_override_label()
+
     # ------------------------------------------------------------------
     # Promote extras to manifest
     # ------------------------------------------------------------------
@@ -2090,13 +2163,33 @@ class TrainingWindow(QMainWindow):
                 artifacts_dir=artifacts_dir,
                 only_animals=None,
                 min_recordings_per_animal=3,
+                # Scalar fallbacks -- used when the per-animal
+                # hyperopt override doesn't supply a value for a
+                # given animal, OR when no override is loaded.
                 w_neg=float(self._w_neg_spin.value()),
                 seed=int(self._seed_spin.value()),
+                review_fp_weight=float(
+                    self._review_fp_weight_spin.value()
+                ),
+                review_fn_weight=float(
+                    self._review_fn_weight_spin.value()
+                ),
                 rebuild_dataset=True,
                 rebuild_phase2=True,
                 rebuild_loro=True,
                 skip_phase2_check=True,
                 skip_review=bool(self._skip_review_cb.isChecked()),
+                # Per-animal hyperopt override: when populated via
+                # the Hyperopt tab's "Use all best params for per-
+                # animal training" button, each animal trains with
+                # its OWN tuned (w_neg, fp_weight, fn_weight). When
+                # empty (default), every animal uses the scalar
+                # fallbacks above. Mixed case is also supported --
+                # an animal not in the dict uses the scalar.
+                weights_by_animal=(
+                    dict(self._per_animal_hyperopt_weights)
+                    if self._per_animal_hyperopt_weights else None
+                ),
             )
         except Exception as exc:
             QMessageBox.critical(
@@ -2915,14 +3008,34 @@ class TrainingWindow(QMainWindow):
         )
         self._btn_hp_open_plots.clicked.connect(self._on_hp_open_plots)
         self._btn_hp_apply = QPushButton(
-            "Apply these params to next retrain"
+            "Apply to combined retrain"
         )
         self._btn_hp_apply.setToolTip(
             "Copy the selected row's best w_neg / fp_weight / fn_weight "
-            "into the Retrain tab's spinboxes so the next retrain uses "
-            "the tuned weights."
+            "into the Retrain tab's spinboxes so the next COMBINED "
+            "retrain uses the tuned weights. Use the button next to "
+            "this one if you want per-animal training with each "
+            "animal's own optimum."
         )
         self._btn_hp_apply.clicked.connect(self._on_hp_apply_to_retrain)
+        # New: separate button for per-animal training. Reads ALL
+        # per-animal studies' best_params.json and stores them in
+        # self._per_animal_hyperopt_weights so each animal's
+        # subsequent retrain uses its OWN optimum (not a global
+        # scalar). Switches to the Per-animal training tab.
+        self._btn_hp_apply_per_animal = QPushButton(
+            "Use all best params for per-animal training"
+        )
+        self._btn_hp_apply_per_animal.setToolTip(
+            "Load EVERY animal's best params from disk and store "
+            "them as overrides for the next per-animal training run. "
+            "Each animal gets its OWN w_neg / fp_weight / fn_weight "
+            "based on its own hyperopt study, instead of all animals "
+            "sharing a single set. Switches to the Per-animal tab."
+        )
+        self._btn_hp_apply_per_animal.clicked.connect(
+            self._on_hp_apply_per_animal,
+        )
         self._btn_hp_refresh_results = QPushButton(
             "↻ Reload from disk"
         )
@@ -2936,6 +3049,7 @@ class TrainingWindow(QMainWindow):
         )
         res_actions.addWidget(self._btn_hp_open_plots)
         res_actions.addWidget(self._btn_hp_apply)
+        res_actions.addWidget(self._btn_hp_apply_per_animal)
         res_actions.addStretch(1)
         res_actions.addWidget(self._btn_hp_refresh_results)
         results_layout.addLayout(res_actions)
@@ -3605,6 +3719,96 @@ class TrainingWindow(QMainWindow):
             f"{clamp_msg}",
         )
         self._tabs.setCurrentWidget(self._tab_retrain)
+
+    def _on_hp_apply_per_animal(self) -> None:
+        """Load every per-animal study's best_params.json on disk
+        and store them as overrides for the next per-animal training
+        run. Each animal gets its OWN tuned w_neg / fp_weight /
+        fn_weight from its own hyperopt study, instead of all
+        animals sharing one global set."""
+        artifacts_dir = detector_paths.get_artifacts_dir()
+        per_animal_root = artifacts_dir / "hyperopt_per_animal"
+        if not per_animal_root.exists():
+            QMessageBox.warning(
+                self, "No per-animal studies",
+                f"No hyperopt_per_animal/ folder under "
+                f"{artifacts_dir}. Run per-animal hyperopt first.",
+            )
+            return
+
+        loaded: dict[str, dict] = {}
+        missing: list[str] = []
+        for animal_dir in sorted(per_animal_root.iterdir()):
+            if not animal_dir.is_dir():
+                continue
+            animal = animal_dir.name
+            bp_path = animal_dir / "hyperopt" / "best_params.json"
+            if not bp_path.exists():
+                missing.append(animal)
+                continue
+            try:
+                data = json.loads(bp_path.read_text())
+                params = data.get("best_params") or {}
+                # Keep only the keys that meaningfully tune training.
+                tuned = {
+                    k: float(v) for k, v in params.items()
+                    if k in ("w_neg", "fp_weight", "fn_weight")
+                    and isinstance(v, (int, float))
+                }
+                if tuned:
+                    loaded[animal] = tuned
+                else:
+                    missing.append(f"{animal} (best_params empty)")
+            except Exception as e:
+                missing.append(f"{animal} ({type(e).__name__}: {e})")
+
+        if not loaded:
+            QMessageBox.warning(
+                self, "Nothing to apply",
+                f"No per-animal best_params.json files found under "
+                f"{per_animal_root}.\n\n"
+                + (
+                    "Issues: " + "; ".join(missing)
+                    if missing else ""
+                )
+            )
+            return
+
+        self._per_animal_hyperopt_weights = loaded
+        # Update the per-animal tab's status label so the user can
+        # see the override is loaded.
+        if hasattr(self, "_pa_hp_override_label"):
+            self._refresh_per_animal_hp_override_label()
+
+        summary_lines = [
+            f"Loaded per-animal best params for {len(loaded)} animal(s):",
+            "",
+        ]
+        for animal in sorted(loaded.keys()):
+            wts = loaded[animal]
+            summary_lines.append(
+                f"  {animal}: "
+                f"w_neg={wts.get('w_neg', '—'):.4g}, "
+                f"fp_weight={wts.get('fp_weight', '—'):.4g}, "
+                f"fn_weight={wts.get('fn_weight', '—'):.4g}"
+            )
+        if missing:
+            summary_lines.append("")
+            summary_lines.append("Skipped (no usable best_params):")
+            for m in missing:
+                summary_lines.append(f"  {m}")
+        summary_lines.append("")
+        summary_lines.append(
+            "Switching to the Per-animal training tab. The next "
+            "click of '▶ Train per-animal models' will use these "
+            "per-animal weights."
+        )
+        QMessageBox.information(
+            self,
+            "Per-animal hyperopt params loaded",
+            "\n".join(summary_lines),
+        )
+        self._tabs.setCurrentWidget(self._tab_per_animal)
 
     def _refresh_hyperopt_tab(self) -> None:
         """Tab-level refresh: rebuilds the animal-letter checkboxes (in

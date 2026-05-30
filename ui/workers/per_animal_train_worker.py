@@ -64,6 +64,9 @@ class PerAnimalTrainWorker(QObject):
         rebuild_loro: bool = True,
         skip_phase2_check: bool = True,
         skip_review: bool = False,
+        review_fp_weight: float = 3.0,
+        review_fn_weight: float = 3.0,
+        weights_by_animal: Optional[dict] = None,
         parent: Optional[QObject] = None,
     ):
         super().__init__(parent)
@@ -80,6 +83,17 @@ class PerAnimalTrainWorker(QObject):
         self._rebuild_loro = bool(rebuild_loro)
         self._skip_phase2_check = bool(skip_phase2_check)
         self._skip_review = bool(skip_review)
+        self._review_fp_weight = float(review_fp_weight)
+        self._review_fn_weight = float(review_fn_weight)
+        # Per-animal hyperopt overrides. None / empty means every
+        # animal uses the scalar w_neg / fp_weight / fn_weight above.
+        # Format: {"F": {"w_neg": ..., "fp_weight": ..., "fn_weight":
+        # ...}, ...}
+        self._weights_by_animal: dict = {
+            str(k).upper(): dict(v)
+            for k, v in (weights_by_animal or {}).items()
+            if v
+        }
 
     @Slot()
     def run(self) -> None:
@@ -103,6 +117,9 @@ class PerAnimalTrainWorker(QObject):
                 rebuild_loro=self._rebuild_loro,
                 skip_phase2_check=self._skip_phase2_check,
                 skip_review=self._skip_review,
+                review_fp_weight=self._review_fp_weight,
+                review_fn_weight=self._review_fn_weight,
+                weights_by_animal=self._weights_by_animal,
             )
             self.finished.emit(results)
         except Exception as e:                       # pragma: no cover -- UI error path
