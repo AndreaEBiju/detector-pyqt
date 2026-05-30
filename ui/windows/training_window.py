@@ -3316,7 +3316,46 @@ class TrainingWindow(QMainWindow):
         # Live-update the results table.
         self._refresh_hyperopt_results_table()
 
+    def _drain_hyperopt_thread(self) -> None:
+        """Explicitly quit + wait on the hyperopt QThread before we
+        drop our Python references. Without this, Qt's runtime races
+        between the worker.finished signal triggering thread.quit
+        (async) and Python's GC reclaiming the QThread object --
+        when the C++ destructor runs while the OS thread hasn't
+        terminated yet, Qt prints "QThread: Destroyed while thread
+        '' is still running" and (on Windows) sometimes kills the
+        process.
+
+        Calling quit() + wait() here from the main thread ensures
+        the worker thread's event loop has exited and the OS thread
+        has joined before any deleteLater can fire. Safe to call
+        even if the thread has already finished (quit + wait become
+        no-ops).
+        """
+        thread = self._hyperopt_thread
+        if thread is None:
+            return
+        try:
+            thread.quit()
+            # 10s should be plenty -- worker.run() already returned
+            # by the time we're here; we're just waiting for the
+            # event loop's exec_() to unwind. Anything longer than a
+            # few ms means something is genuinely stuck.
+            if not thread.wait(10_000):
+                self._hp_log.appendPlainText(
+                    "[hyperopt] WARNING: QThread didn't exit within "
+                    "10s of quit() -- continuing anyway."
+                )
+        except RuntimeError:
+            # Thread already destroyed (e.g. deleteLater fired
+            # before this slot). Harmless.
+            pass
+
     def _on_hp_finished(self, results: dict) -> None:
+        # Drain the QThread BEFORE dropping refs. See
+        # `_drain_hyperopt_thread` for the rationale -- this is the
+        # fix for the "auto-close at end of every hyperopt run" bug.
+        self._drain_hyperopt_thread()
         self._hyperopt_worker = None
         self._hyperopt_thread = None
         self._btn_hp_run.setEnabled(True)
@@ -3334,6 +3373,9 @@ class TrainingWindow(QMainWindow):
         self._refresh_hyperopt_results_table()
 
     def _on_hp_error(self, message: str) -> None:
+        # Same drain pattern as _on_hp_finished -- the error path
+        # has the same QThread race.
+        self._drain_hyperopt_thread()
         self._hyperopt_worker = None
         self._hyperopt_thread = None
         self._btn_hp_run.setEnabled(True)
@@ -3420,6 +3462,11 @@ class TrainingWindow(QMainWindow):
         return label, artifacts_dir / "hyperopt_per_animal" / label
 
     def _on_hp_open_plots(self) -> None:
+        """Open the plots dialog. For per-animal hyperopt, includes
+        a dropdown at the top to switch between all animals' studies
+        without closing the dialog. The currently-selected row in
+        the results table determines which animal opens first.
+        """
         sel = self._selected_hyperopt_study()
         if sel is None:
             QMessageBox.information(
@@ -3427,18 +3474,58 @@ class TrainingWindow(QMainWindow):
                 "Select a row in the results table first.",
             )
             return
-        label, workdir = sel
-        plots_dir = workdir / "hyperopt" / "plots"
-        if not plots_dir.exists():
+        sel_label, sel_workdir = sel
+        artifacts_dir = detector_paths.get_artifacts_dir()
+
+        # Build the full list of studies available on disk so the
+        # dialog's switcher covers every animal -- not just the row
+        # the user clicked. Order: combined first, then per-animal
+        # alphabetically, matching the results-table order.
+        studies: list[tuple[str, Path]] = []
+        combined_plots = (
+            artifacts_dir / "hyperopt_combined" / "hyperopt" / "plots"
+        )
+        if combined_plots.parent.parent.exists():
+            studies.append(("combined", combined_plots))
+        per_animal_root = artifacts_dir / "hyperopt_per_animal"
+        if per_animal_root.exists():
+            for entry in sorted(per_animal_root.iterdir()):
+                if entry.is_dir():
+                    studies.append(
+                        (entry.name, entry / "hyperopt" / "plots"),
+                    )
+
+        if not studies:
             QMessageBox.warning(
-                self, "Plots not found",
-                f"Expected plots dir at {plots_dir} but it doesn't "
-                "exist. The backend's plot step may have failed -- "
-                "check the run log.",
+                self, "No studies found",
+                f"No hyperopt study folders under {artifacts_dir}. "
+                "Run hyperopt first.",
             )
             return
+
+        # If the currently-selected row's plots dir doesn't exist,
+        # warn the user rather than silently opening with whatever's
+        # available -- they specifically asked to view THAT study's
+        # plots.
+        if not sel_workdir.joinpath("hyperopt", "plots").exists():
+            resp = QMessageBox.warning(
+                self,
+                "Selected study has no plots",
+                f"The plots folder for `{sel_label}` doesn't exist "
+                f"({sel_workdir / 'hyperopt' / 'plots'}). The "
+                "study's plot step may have failed -- check the run "
+                "log.\n\n"
+                "Open the dialog anyway to view other studies' "
+                "plots?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if resp != QMessageBox.Yes:
+                return
         dlg = HyperoptPlotsDialog(
-            plots_dir, study_label=label, parent=self,
+            studies=studies,
+            initial_study_label=sel_label,
+            parent=self,
         )
         dlg.exec()
 
