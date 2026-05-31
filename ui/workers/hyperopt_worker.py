@@ -369,6 +369,30 @@ class HyperoptWorker(QObject):
 # Filesystem-only helpers (for re-attaching to a finished CLI run)
 # ----------------------------------------------------------------------
 
+def _read_text_with_timeout(path: Path, timeout_s: float = 2.0):
+    """Hard-timeout file read via daemon thread. Drive's
+    Files-On-Demand layer can take 100+ seconds to fail on a single
+    .read_text() call; the timeout bounds that to 2s.
+
+    Returns the file's text on success, None on timeout/error.
+    """
+    import threading
+    result_box: list = []
+    def _do_read():
+        try:
+            result_box.append(path.read_text())
+        except Exception as e:
+            result_box.append(e)
+    t = threading.Thread(target=_do_read, daemon=True)
+    t.start()
+    t.join(timeout=timeout_s)
+    if t.is_alive():
+        return None
+    if result_box and isinstance(result_box[0], str):
+        return result_box[0]
+    return None
+
+
 def scan_completed_studies(artifacts_dir: Path) -> dict:
     """Walk artifacts_dir/hyperopt_combined and hyperopt_per_animal/*
     and return a dict of any studies that have best_params.json on
@@ -400,22 +424,18 @@ def scan_completed_studies(artifacts_dir: Path) -> dict:
     combined_bp = (
         artifacts_dir / "hyperopt_combined" / "hyperopt" / "best_params.json"
     )
-    try:
-        combined_exists = combined_bp.exists()
-    except OSError as e:
-        print(
-            f"[hyperopt-scan] couldn't probe {combined_bp.name}: "
-            f"{type(e).__name__}: {e}",
-            file=_sys.stderr, flush=True,
-        )
-        combined_exists = False
-    if combined_exists:
+    # Use the timeout-bounded reader directly (skip the .exists()
+    # probe -- that itself can hang on Drive). If the file doesn't
+    # exist, the timeout reader returns None just like for a slow
+    # read.
+    text = _read_text_with_timeout(combined_bp, timeout_s=2.0)
+    if text is not None:
         try:
-            out["combined"] = json.loads(combined_bp.read_text())
-        except (OSError, ValueError) as e:
+            out["combined"] = json.loads(text)
+        except ValueError as e:
             print(
-                f"[hyperopt-scan] couldn't read combined "
-                f"best_params: {type(e).__name__}: {e}",
+                f"[hyperopt-scan] couldn't parse combined "
+                f"best_params JSON: {type(e).__name__}: {e}",
                 file=_sys.stderr, flush=True,
             )
 
@@ -447,25 +467,18 @@ def scan_completed_studies(artifacts_dir: Path) -> dict:
             except OSError:
                 continue
             bp = sub / "hyperopt" / "best_params.json"
-            try:
-                bp_exists = bp.exists()
-            except OSError as e:
-                print(
-                    f"[hyperopt-scan] couldn't probe {bp.name} for "
-                    f"{sub.name}: {type(e).__name__}: {e}",
-                    file=_sys.stderr, flush=True,
-                )
-                continue
-            if not bp_exists:
+            # Skip .exists() entirely -- use the timeout-bounded
+            # read which handles "doesn't exist" and "exists but
+            # slow on Drive" the same way (returns None).
+            text = _read_text_with_timeout(bp, timeout_s=2.0)
+            if text is None:
                 continue
             try:
-                out["per_animal"][sub.name] = json.loads(
-                    bp.read_text()
-                )
-            except (OSError, ValueError) as e:
+                out["per_animal"][sub.name] = json.loads(text)
+            except ValueError as e:
                 print(
-                    f"[hyperopt-scan] couldn't read best_params for "
-                    f"{sub.name}: {type(e).__name__}: {e}",
+                    f"[hyperopt-scan] couldn't parse best_params "
+                    f"JSON for {sub.name}: {type(e).__name__}: {e}",
                     file=_sys.stderr, flush=True,
                 )
     return out
