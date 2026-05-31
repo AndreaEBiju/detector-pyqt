@@ -156,6 +156,7 @@ class HyperoptWorker(QObject):
         w_neg_range: Optional[tuple] = None,
         fp_weight_range: Optional[tuple] = None,
         fn_weight_range: Optional[tuple] = None,
+        force_fresh: bool = False,
         parent: Optional[QObject] = None,
     ):
         super().__init__(parent)
@@ -193,6 +194,11 @@ class HyperoptWorker(QObject):
                                  if fp_weight_range else None)
         self._fn_weight_range = (tuple(fn_weight_range)
                                  if fn_weight_range else None)
+        # When True, the orchestrator archives any previous study
+        # artifacts for each scope before running -- useful when
+        # the user wants to start with a clean slate even though
+        # the holdout hasn't changed.
+        self._force_fresh = bool(force_fresh)
 
     # ------------------------------------------------------------------
     # Polling helpers
@@ -285,6 +291,7 @@ class HyperoptWorker(QObject):
             range_kwargs["fp_weight_range"] = self._fp_weight_range
         if self._fn_weight_range is not None:
             range_kwargs["fn_weight_range"] = self._fn_weight_range
+        range_kwargs["force_fresh"] = self._force_fresh
 
         def _do_work():
             try:

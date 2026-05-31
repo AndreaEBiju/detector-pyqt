@@ -2790,6 +2790,33 @@ class TrainingWindow(QMainWindow):
         self._hp_seed_spin.setValue(42)
         form.addRow("seed", self._hp_seed_spin)
 
+        # Start-fresh override. When checked, the orchestrator
+        # archives any existing study artifacts for each scope
+        # before running, even when the holdout hasn't changed.
+        # Useful when the user wants to validate the same holdout
+        # against new data (e.g. after adding recordings) or just
+        # wants a clean trial history without manually deleting
+        # files.
+        self._hp_force_fresh_cb = QCheckBox(
+            "Start fresh (archive previous trials)"
+        )
+        self._hp_force_fresh_cb.setChecked(False)
+        self._hp_force_fresh_cb.setToolTip(
+            "When checked, hyperopt archives the existing study.db "
+            "/ trial_log.json / best_params.json / plots for each "
+            "scope into a timestamped _archived/ subfolder before "
+            "starting. The new run begins at trial 0.\n\n"
+            "When unchecked (default), the orchestrator auto-"
+            "archives only when it detects a holdout change. Use "
+            "this checkbox when you want a fresh run for any "
+            "other reason -- different parameter ranges, validating "
+            "new data, etc.\n\n"
+            "Phase 1 / Phase 2 parquets are NOT archived -- they're "
+            "cached features that get re-validated by the recording-"
+            "set comparison."
+        )
+        form.addRow(self._hp_force_fresh_cb)
+
         self._hp_review_dir_edit = QLineEdit()
         self._hp_review_dir_edit.setPlaceholderText(
             "(optional) path to a review/ folder -- e.g. "
@@ -3390,6 +3417,9 @@ class TrainingWindow(QMainWindow):
                 w_neg_range=w_neg_range,
                 fp_weight_range=fp_weight_range,
                 fn_weight_range=fn_weight_range,
+                force_fresh=bool(
+                    self._hp_force_fresh_cb.isChecked()
+                ),
             )
         except Exception as exc:
             QMessageBox.critical(
