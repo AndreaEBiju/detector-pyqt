@@ -4617,21 +4617,46 @@ class TrainingWindow(QMainWindow):
     # ==================================================================
 
     def _refresh_all(self) -> None:
-        self._refresh_manifest_tab()
-        self._refresh_versions_tab()
-        self._refresh_retrain_tab()
-        self._refresh_per_animal_tab()
-        try:
-            self._refresh_hyperopt_tab()
-        except Exception:
-            pass
-        # The convergence-tab dropdown is keyed off list_versions(),
-        # which changes after a retrain. Repopulating here picks up
-        # the newly trained model automatically.
-        try:
-            self._refresh_convergence_versions()
-        except Exception:
-            pass
+        # Per-step timing -- helps diagnose startup slowdowns on
+        # Drive-hosted setups where any single tab's refresh might
+        # do enough I/O to feel like the UI is frozen. The breakdown
+        # tells the user exactly which tab is slow (look for the
+        # `[training-window] _refresh_all ...` lines in the terminal).
+        import time as _time
+        t_start = _time.time()
+        def _time_step(name: str, fn) -> None:
+            t0 = _time.time()
+            try:
+                fn()
+            except Exception as e:
+                print(
+                    f"[training-window] _refresh_all: {name} FAILED "
+                    f"({type(e).__name__}: {e})",
+                    flush=True,
+                )
+                return
+            dt = _time.time() - t0
+            if dt > 0.5:    # only log slow steps (>500ms)
+                print(
+                    f"[training-window] _refresh_all: {name} took "
+                    f"{dt:.2f}s",
+                    flush=True,
+                )
+
+        _time_step("manifest tab", self._refresh_manifest_tab)
+        _time_step("versions tab", self._refresh_versions_tab)
+        _time_step("retrain tab", self._refresh_retrain_tab)
+        _time_step("per-animal tab", self._refresh_per_animal_tab)
+        _time_step("hyperopt tab", self._refresh_hyperopt_tab)
+        _time_step(
+            "convergence versions", self._refresh_convergence_versions,
+        )
+        total_dt = _time.time() - t_start
+        if total_dt > 1.0:
+            print(
+                f"[training-window] _refresh_all total: {total_dt:.2f}s",
+                flush=True,
+            )
 
     # ------------------------------------------------------------------
     # Window-close handling
