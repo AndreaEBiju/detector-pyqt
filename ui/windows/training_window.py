@@ -322,10 +322,17 @@ class TrainingWindow(QMainWindow):
         self._tabs.addTab(self._tab_settings, "Settings")
         self.setCentralWidget(self._tabs)
 
-        self._refresh_all()
-        # If a retrain is already running from a previous session, pick
-        # up its monitoring on first open.
-        self._maybe_attach_running_job()
+        # Defer the heavy initial refresh to after the window paints.
+        # If we call _refresh_all() inline here, the main thread is
+        # blocked on Drive I/O before the window can even render and
+        # Qt marks the app "Not Responding". Scheduling via
+        # QTimer.singleShot(0, ...) lets Qt process the paint events
+        # first, so the user sees the window immediately. The
+        # refresh then runs (potentially still slow on Drive, but
+        # with a visible window the user knows something's happening).
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(0, self._refresh_all)
+        QTimer.singleShot(0, self._maybe_attach_running_job)
 
     # ==================================================================
     # Manifest tab
@@ -4622,8 +4629,17 @@ class TrainingWindow(QMainWindow):
         # do enough I/O to feel like the UI is frozen. The breakdown
         # tells the user exactly which tab is slow (look for the
         # `[training-window] _refresh_all ...` lines in the terminal).
+        #
+        # Between each step we call `processEvents()` so the Qt
+        # event loop has a chance to repaint, handle clicks, etc.
+        # Without this, the window appears (because we deferred via
+        # QTimer.singleShot from __init__) but freezes solid for the
+        # duration of the I/O. With it, the UI stays clickable
+        # between tab refreshes even if individual refreshes are slow.
         import time as _time
+        from PySide6.QtWidgets import QApplication
         t_start = _time.time()
+
         def _time_step(name: str, fn) -> None:
             t0 = _time.time()
             try:
@@ -4636,12 +4652,19 @@ class TrainingWindow(QMainWindow):
                 )
                 return
             dt = _time.time() - t0
-            if dt > 0.5:    # only log slow steps (>500ms)
+            if dt > 0.5:
                 print(
                     f"[training-window] _refresh_all: {name} took "
                     f"{dt:.2f}s",
                     flush=True,
                 )
+            # Yield to the Qt event loop so the UI repaints and
+            # the window doesn't show "Not Responding" between
+            # heavy I/O steps.
+            try:
+                QApplication.processEvents()
+            except Exception:
+                pass
 
         _time_step("manifest tab", self._refresh_manifest_tab)
         _time_step("versions tab", self._refresh_versions_tab)
