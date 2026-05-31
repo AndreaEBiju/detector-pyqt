@@ -513,19 +513,38 @@ class TrainingWindow(QMainWindow):
         )
         self._versions_table.setRowCount(len(versions))
         for i, v in enumerate(versions):
-            prov = RT.load_provenance(v) or {}
-            ls = (prov or {}).get("loro_summary") or {}
-            cells = [
-                v,
-                "★" if v == cmv else "",
-                (prov or {}).get("created_at", "—"),
-                _fmt(ls.get("recall_real"), 3),
-                _fmt(ls.get("recall_syn"), 3),
-                _fmt(ls.get("mean_bad_fraction"), 3),
-                f"{ls.get('gate_1_pass_count', '—')}/{ls.get('n_folds', '—')}",
-                f"{ls.get('gate_2_pass_count', '—')}/{ls.get('n_folds', '—')}",
-                f"{ls.get('gate_3_pass_count', '—')}/{ls.get('n_folds', '—')}",
-            ]
+            # Per-version failure isolation: each provenance load
+            # is wrapped so one unreadable file (Drive EINVAL,
+            # corrupted JSON, etc.) doesn't abort the iteration
+            # and leave half the table empty. load_provenance is
+            # already resilient (returns None on errors), but this
+            # belt-and-suspenders catches anything else in the row
+            # construction.
+            try:
+                prov = RT.load_provenance(v) or {}
+                ls = (prov or {}).get("loro_summary") or {}
+                cells = [
+                    v,
+                    "★" if v == cmv else "",
+                    (prov or {}).get("created_at", "—"),
+                    _fmt(ls.get("recall_real"), 3),
+                    _fmt(ls.get("recall_syn"), 3),
+                    _fmt(ls.get("mean_bad_fraction"), 3),
+                    f"{ls.get('gate_1_pass_count', '—')}/{ls.get('n_folds', '—')}",
+                    f"{ls.get('gate_2_pass_count', '—')}/{ls.get('n_folds', '—')}",
+                    f"{ls.get('gate_3_pass_count', '—')}/{ls.get('n_folds', '—')}",
+                ]
+            except Exception as e:
+                # Whole row goes to '—' fallbacks instead of crashing.
+                print(
+                    f"[training_window] error rendering version "
+                    f"row for {v}: {type(e).__name__}: {e}",
+                    flush=True,
+                )
+                cells = [
+                    v, "—", "(load error)", "—", "—", "—",
+                    "—", "—", "—",
+                ]
             for col, text in enumerate(cells):
                 self._versions_table.setItem(i, col, QTableWidgetItem(str(text)))
 
