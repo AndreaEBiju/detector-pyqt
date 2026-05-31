@@ -381,27 +381,91 @@ def scan_completed_studies(artifacts_dir: Path) -> dict:
 
     Used by the Hyperopt tab to populate the results table from a
     previous CLI run when the user opens the tab without launching a
-    fresh study."""
+    fresh study.
+
+    Resilient to Drive EINVAL on every I/O call: `.exists()`,
+    `.iterdir()`, and `.read_text()` can all raise OSError on
+    Files-On-Demand stub paths. Each is wrapped so a single
+    unreadable folder/file doesn't silently empty the results --
+    the failed entry is logged + skipped, but the iteration
+    continues. Andrea reported "previous hyperopt results not
+    found" after a pull that introduced Drive-EINVAL handling
+    elsewhere; this is the same root cause leaking into the
+    scan logic.
+    """
+    import sys as _sys
     artifacts_dir = Path(artifacts_dir)
     out = {"combined": None, "per_animal": {}}
 
     combined_bp = (
         artifacts_dir / "hyperopt_combined" / "hyperopt" / "best_params.json"
     )
-    if combined_bp.exists():
+    try:
+        combined_exists = combined_bp.exists()
+    except OSError as e:
+        print(
+            f"[hyperopt-scan] couldn't probe {combined_bp.name}: "
+            f"{type(e).__name__}: {e}",
+            file=_sys.stderr, flush=True,
+        )
+        combined_exists = False
+    if combined_exists:
         try:
             out["combined"] = json.loads(combined_bp.read_text())
-        except Exception:
-            pass
+        except (OSError, ValueError) as e:
+            print(
+                f"[hyperopt-scan] couldn't read combined "
+                f"best_params: {type(e).__name__}: {e}",
+                file=_sys.stderr, flush=True,
+            )
 
     pa_root = artifacts_dir / "hyperopt_per_animal"
-    if pa_root.exists():
-        for sub in sorted(pa_root.iterdir()):
+    try:
+        pa_root_exists = pa_root.exists()
+    except OSError as e:
+        print(
+            f"[hyperopt-scan] couldn't probe {pa_root}: "
+            f"{type(e).__name__}: {e}",
+            file=_sys.stderr, flush=True,
+        )
+        pa_root_exists = False
+
+    if pa_root_exists:
+        try:
+            sub_entries = sorted(pa_root.iterdir())
+        except OSError as e:
+            print(
+                f"[hyperopt-scan] couldn't iterdir {pa_root}: "
+                f"{type(e).__name__}: {e}",
+                file=_sys.stderr, flush=True,
+            )
+            sub_entries = []
+        for sub in sub_entries:
+            try:
+                if not sub.is_dir():
+                    continue
+            except OSError:
+                continue
             bp = sub / "hyperopt" / "best_params.json"
-            if not bp.exists():
+            try:
+                bp_exists = bp.exists()
+            except OSError as e:
+                print(
+                    f"[hyperopt-scan] couldn't probe {bp.name} for "
+                    f"{sub.name}: {type(e).__name__}: {e}",
+                    file=_sys.stderr, flush=True,
+                )
+                continue
+            if not bp_exists:
                 continue
             try:
-                out["per_animal"][sub.name] = json.loads(bp.read_text())
-            except Exception:
-                pass
+                out["per_animal"][sub.name] = json.loads(
+                    bp.read_text()
+                )
+            except (OSError, ValueError) as e:
+                print(
+                    f"[hyperopt-scan] couldn't read best_params for "
+                    f"{sub.name}: {type(e).__name__}: {e}",
+                    file=_sys.stderr, flush=True,
+                )
     return out

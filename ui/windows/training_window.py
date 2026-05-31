@@ -3610,6 +3610,7 @@ class TrainingWindow(QMainWindow):
         """Re-scan the artifacts dir for completed studies and rebuild
         the results table. Called on tab refresh, after each animal
         finishes, and on demand via the Reload button."""
+        artifacts_dir = None
         try:
             artifacts_dir = detector_paths.get_artifacts_dir()
             studies = scan_completed_studies(artifacts_dir)
@@ -3620,6 +3621,19 @@ class TrainingWindow(QMainWindow):
             )
             return
 
+        # Log what we found so the user can see in the terminal
+        # whether the scan came back empty due to a real "no studies"
+        # state or because Drive errored on per-file probes (the
+        # scan helper now logs those per-file failures itself).
+        n_combined = 1 if studies.get("combined") else 0
+        n_animals = len(studies.get("per_animal", {}))
+        print(
+            f"[training-window] hyperopt scan @ {artifacts_dir}: "
+            f"combined={n_combined}, per-animal={n_animals} "
+            f"({sorted((studies.get('per_animal') or {}).keys())})",
+            flush=True,
+        )
+
         # Build rows: ("combined", payload) first if present, then
         # one row per animal in alphabetical order.
         rows: list[tuple[str, dict]] = []
@@ -3629,10 +3643,37 @@ class TrainingWindow(QMainWindow):
             rows.append((animal, studies["per_animal"][animal]))
 
         if not rows:
-            self._hp_results_summary.setText(
-                "(no hyperopt run yet -- launch one above, or run "
-                "`detector hyperopt` from the CLI)"
-            )
+            # Differentiate "no studies exist" from "studies exist
+            # but couldn't read them" by checking whether the folders
+            # are present on disk -- gives the user a better hint
+            # in the empty-table case.
+            try:
+                pa_root = artifacts_dir / "hyperopt_per_animal"
+                combined_root = artifacts_dir / "hyperopt_combined"
+                pa_has_subs = (
+                    pa_root.exists()
+                    and any(pa_root.iterdir())
+                )
+                combined_has_files = combined_root.exists()
+            except Exception:
+                pa_has_subs = False
+                combined_has_files = False
+            if pa_has_subs or combined_has_files:
+                self._hp_results_summary.setText(
+                    "<span style='color:#c84'>Hyperopt folders "
+                    "exist but no best_params.json could be read. "
+                    "Check the terminal for `[hyperopt-scan]` log "
+                    "lines -- usually a Drive Files-On-Demand "
+                    "issue. Try right-clicking the artifacts folder "
+                    "in Drive -> 'Available offline', wait for the "
+                    "green check icons, then click 'Reload from "
+                    "disk' below.</span>"
+                )
+            else:
+                self._hp_results_summary.setText(
+                    "(no hyperopt run yet -- launch one above, or "
+                    "run `detector hyperopt` from the CLI)"
+                )
             self._hp_results_table.setRowCount(0)
             return
 
