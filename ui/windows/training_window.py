@@ -1319,6 +1319,31 @@ class TrainingWindow(QMainWindow):
         override_row.addWidget(self._btn_pa_clear_hp_override)
         layout.addLayout(override_row)
 
+        # "Only animals" picker -- a grid of checkboxes that lets the
+        # user run training for a subset of animals (e.g. retrain just
+        # J after tweaking its hyperopt weights, without re-spending
+        # the ~30-60 min/animal cost on F/L/O which are already in
+        # good shape). Leaving all unchecked = train every eligible
+        # animal (the historical default).
+        #
+        # Same pattern as the Hyperopt tab's own "Only animals" box.
+        # The backend retrain_per_animal() already accepts an
+        # only_animals filter, so this is purely a UI wiring up of
+        # an existing capability.
+        self._pa_only_box = QGroupBox(
+            "Only animals (leave all unchecked = train every eligible animal)"
+        )
+        self._pa_only_grid = QGridLayout(self._pa_only_box)
+        self._pa_only_grid.setHorizontalSpacing(12)
+        self._pa_animal_checks: dict[str, QCheckBox] = {}
+        self._pa_only_hint = QLabel(
+            "<i>(populated from the manifest -- check one or more "
+            "letters to limit this training round to those animals)</i>"
+        )
+        self._pa_only_hint.setStyleSheet("color: #888;")
+        self._pa_only_grid.addWidget(self._pa_only_hint, 0, 0)
+        layout.addWidget(self._pa_only_box)
+
         # The grouping table.
         self._pa_table = PerAnimalTable()
         self._pa_table.set_min_recordings_per_animal(3)
@@ -1474,7 +1499,94 @@ class TrainingWindow(QMainWindow):
             len(self._per_animal_extras) > 0
         )
         self._refresh_per_animal_hp_override_label()
+        self._refresh_per_animal_animal_checks()
         self._update_per_animal_summary()
+
+    def _refresh_per_animal_animal_checks(self) -> None:
+        """Repopulate the per-animal 'Only animals' checkbox grid from
+        the current manifest. Preserves any previously-checked letters
+        across the refresh so a stray manifest edit (e.g. user fixed an
+        animal letter on a different recording) doesn't wipe the user's
+        selection mid-flow.
+
+        Mirrors the Hyperopt tab's `_refresh_hyperopt_animal_checks`,
+        with one wrinkle: we keep the checked state by remembering
+        which letters were ticked before the rebuild and re-checking
+        them after. The hyperopt version doesn't preserve because its
+        refresh only fires on tab open / scope flip; this one fires on
+        every animal-column edit too.
+        """
+        # Snapshot the user's current selection so we can restore it
+        # after wiping. New letters (added since last refresh) come
+        # back unchecked; vanished letters are silently dropped.
+        previously_checked = {
+            letter for letter, cb in self._pa_animal_checks.items()
+            if cb.isChecked()
+        }
+        for cb in self._pa_animal_checks.values():
+            self._pa_only_grid.removeWidget(cb)
+            cb.deleteLater()
+        self._pa_animal_checks.clear()
+        if self._pa_only_hint is not None:
+            self._pa_only_grid.removeWidget(self._pa_only_hint)
+            self._pa_only_hint.setParent(None)
+            self._pa_only_hint = None
+
+        try:
+            from detector.animal_id import group_recordings_by_animal
+            manifest_path = detector_paths.get_manifest_path()
+            if not manifest_path.exists():
+                self._pa_only_hint = QLabel(
+                    "<i>(no manifest yet -- create one to enable "
+                    "per-animal training)</i>"
+                )
+                self._pa_only_hint.setStyleSheet("color: #888;")
+                self._pa_only_grid.addWidget(self._pa_only_hint, 0, 0)
+                return
+            m = Manifest.load(manifest_path)
+            # Held-out rows are excluded from training, so they
+            # shouldn't count toward the per-animal eligibility shown
+            # in the picker either. Matches what retrain_per_animal()
+            # actually trains on.
+            groups = group_recordings_by_animal(m.list_recordings())
+        except Exception as exc:
+            self._pa_only_hint = QLabel(f"<i>(error: {exc})</i>")
+            self._pa_only_hint.setStyleSheet("color: #c44;")
+            self._pa_only_grid.addWidget(self._pa_only_hint, 0, 0)
+            return
+
+        # Drop the None bucket (recordings without an auto-detected
+        # animal letter) and the < min-recordings buckets -- the user
+        # can't train them anyway, so showing them as checkboxes would
+        # be misleading.
+        min_recs = 3
+        letters_all = sorted(a for a in groups.keys() if a is not None)
+        letters_eligible = [
+            a for a in letters_all
+            if len(groups[a]) >= min_recs
+        ]
+        if not letters_eligible:
+            self._pa_only_hint = QLabel(
+                "<i>(no animals have >= 3 recordings -- edit the "
+                "Animal column or add more recordings)</i>"
+            )
+            self._pa_only_hint.setStyleSheet("color: #888;")
+            self._pa_only_grid.addWidget(self._pa_only_hint, 0, 0)
+            return
+        # Layout: max 6 checkboxes per row, label includes the count.
+        cols = 6
+        for i, letter in enumerate(letters_eligible):
+            n = len(groups[letter])
+            cb = QCheckBox(f"{letter} ({n})")
+            cb.setToolTip(
+                f"Limit this training round to animal {letter} "
+                f"(n={n} recordings). Leave every box unchecked to "
+                "train every eligible animal."
+            )
+            if letter in previously_checked:
+                cb.setChecked(True)
+            self._pa_animal_checks[letter] = cb
+            self._pa_only_grid.addWidget(cb, i // cols, i % cols)
 
     def _update_per_animal_summary(self) -> None:
         """Repaint the live eligible/skipped/badges header from the
@@ -2179,6 +2291,30 @@ class TrainingWindow(QMainWindow):
                 return
         manifest_path = detector_paths.get_manifest_path()
         artifacts_dir = detector_paths.get_artifacts_dir()
+        # Collect the user's "Only animals" picks. Empty selection =
+        # train every eligible animal (the historical default).
+        # Mirrors the Hyperopt tab's per-animal subset selection.
+        picked_animals = [
+            letter for letter, cb in self._pa_animal_checks.items()
+            if cb.isChecked()
+        ]
+        only_animals = picked_animals if picked_animals else None
+        if only_animals is not None:
+            # Confirm so the user can't accidentally retrain a single
+            # animal when they meant to train all four (e.g. a stale
+            # checkbox left over from the last session).
+            resp = QMessageBox.question(
+                self, "Train subset of animals?",
+                f"Only the following animal(s) will be trained:\n\n"
+                f"  {', '.join(only_animals)}\n\n"
+                "Every other animal in the manifest will be left "
+                "alone (no new model_v* dirs created for them). The "
+                "main viewer's auto-routing will still use the LAST "
+                "trained model for the unselected animals.\n\n"
+                "Continue?",
+            )
+            if resp != QMessageBox.Yes:
+                return
         # Re-use the existing retrain tab's settings for w_neg/seed/
         # rebuild flags so the user doesn't have to set them twice.
         # rebuild_phase2 defaults to True for per-animal because each
@@ -2187,7 +2323,7 @@ class TrainingWindow(QMainWindow):
             self._per_animal_worker = PerAnimalTrainWorker(
                 manifest_path,
                 artifacts_dir=artifacts_dir,
-                only_animals=None,
+                only_animals=only_animals,
                 min_recordings_per_animal=3,
                 # Scalar fallbacks -- used when the per-animal
                 # hyperopt override doesn't supply a value for a
