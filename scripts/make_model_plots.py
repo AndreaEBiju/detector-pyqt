@@ -241,50 +241,51 @@ def plot_feature_importance(model_dir: Path, out_dir: Path,
 @_safe
 def plot_synth_type_distribution(phase2_path: Path, out_dir: Path,
                                     tag: str) -> None:
+    """Reads the synth-type breakdown from the sidecar JSON written
+    by phase2.py (next to the parquet). The `_synth_type` column
+    itself is intentionally dropped from the parquet, so the sidecar
+    is the canonical source. Skips with a clear message if the
+    sidecar is missing -- means the retrain that produced this
+    parquet predates the sidecar code (commit 99dxxxx); re-run
+    phase 2 to generate it.
+    """
     print(f"[plot_synth_type_distribution:{tag}] {phase2_path.parent.name}")
-    if not phase2_path.exists():
-        print(f"  skip: no parquet at {phase2_path}")
+    sidecar = phase2_path.with_name(
+        phase2_path.stem + "_synth_summary.json")
+    if not sidecar.exists():
+        print(f"  skip: no sidecar at {sidecar.name}")
+        print("  (re-run Phase 2 to generate it; the parquet no "
+              "longer carries the _synth_type column)")
         return
     try:
-        import pandas as pd
-        df = pd.read_parquet(
-            phase2_path,
-            columns=["trust_level", SYNTH_TYPE_COL] if _has_col(phase2_path) else None,
-        )
+        data = json.loads(sidecar.read_text())
     except Exception as e:
-        # Fall back to reading the whole thing.
-        import pandas as pd
-        df = pd.read_parquet(phase2_path)
-        if SYNTH_TYPE_COL not in df.columns:
-            print(f"  skip: column {SYNTH_TYPE_COL} not in parquet")
-            return
-    synth = df[df["trust_level"] == "synthetic_positive"]
-    if synth.empty:
-        print("  skip: no synthetic_positive rows")
+        print(f"  skip: couldn't read sidecar: {e}")
         return
-    counts = synth[SYNTH_TYPE_COL].value_counts()
-    fig, ax = plt.subplots(figsize=(6, 4))
+    type_counts = data.get("type_counts") or {}
+    if not type_counts:
+        print("  skip: empty type_counts in sidecar")
+        return
+    # Sort by count descending for visual consistency.
+    items = sorted(type_counts.items(),
+                    key=lambda kv: -int(kv[1]))
+    names = [k for k, _ in items]
+    vals = [int(v) for _, v in items]
+    total = sum(vals)
+    fig, ax = plt.subplots(figsize=(6.5, 4.5))
     colors = ["#4c72b0", "#dd8452", "#55a868", "#c44e52", "#8172b3"]
-    bars = ax.bar(counts.index, counts.values,
-                  color=colors[: len(counts)])
+    bars = ax.bar(names, vals, color=colors[: len(names)])
     ax.set_ylabel("Count")
     ax.set_title(f"Synthetic positive type distribution — {tag}\n"
-                 f"(total synth: {counts.sum():,})")
-    for b, v in zip(bars, counts.values):
+                 f"(total synth: {total:,}; "
+                 f"phase1={data.get('n_phase1', '?'):,}, "
+                 f"augmented={data.get('n_augmented', '?'):,})")
+    for b, v in zip(bars, vals):
         ax.text(b.get_x() + b.get_width() / 2, v,
-                f"{v}\n({v / counts.sum() * 100:.1f}%)",
+                f"{v}\n({v / total * 100:.1f}%)",
                 ha="center", va="bottom", fontsize=8)
-    ax.set_ylim(0, counts.max() * 1.15)
+    ax.set_ylim(0, max(vals) * 1.18)
     _save(fig, out_dir, f"A3_F3_synth_type_{tag}")
-
-
-def _has_col(parquet_path: Path) -> bool:
-    """Best-effort: peek at parquet schema."""
-    try:
-        import pyarrow.parquet as pq
-        return SYNTH_TYPE_COL in pq.read_schema(parquet_path).names
-    except Exception:
-        return False
 
 
 # ==================================================================
@@ -541,8 +542,10 @@ def plot_hyperopt_optimization_history(artroot: Path,
         except Exception as e:
             ax.set_title(f"animal {a}: read error")
             continue
-        values = [(t.get("number"), t.get("value"))
-                   for t in trials if t.get("value") is not None]
+        # Field names in trial_log.json: trial_number, objective
+        # (not "number"/"value" like the live Optuna study object).
+        values = [(t.get("trial_number"), t.get("objective"))
+                   for t in trials if t.get("objective") is not None]
         values.sort(key=lambda x: x[0] if x[0] is not None else 0)
         if not values:
             ax.axis("off")
@@ -711,10 +714,11 @@ def plot_hyperopt_3d_trial_scatter(artroot: Path,
         except Exception as e:
             print(f"  warn: {a}: {e}")
             continue
+        # trial_log.json fields: params (dict), objective (float).
         rows = []
         for t in trials:
             p = t.get("params") or {}
-            v = t.get("value")
+            v = t.get("objective")
             if v is None:
                 continue
             try:
