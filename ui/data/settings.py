@@ -11,6 +11,8 @@ Keys persisted:
   stim_rec recordings with a boundary set).
 - `last_recording_dir` — last path the Open dialog was pointed at.
   Reduces clicks when working through a folder.
+- `additional_models_to_test` — planning list shown in Training →
+  Settings so the team tracks extra algorithms to evaluate.
 - `preprocessing_*` — defaults that pre-fill the per-batch
   preprocessing review UI. They never override an existing animal
   profile (profiles store their own resolved values); they only
@@ -37,6 +39,13 @@ DEFAULTS: dict[str, Any] = {
     "auto_run_on_open": True,
     "inference_skip_stim": True,
     "last_recording_dir": "",
+    "additional_models_to_test": [
+        "xgboost",
+        "random forest",
+        "svm rbf",
+        "svm linear",
+        "logistic regression",
+    ],
     # Preprocessing defaults — mirror NotchParams in
     # detector.preprocessing.notch. Editing these in the Training
     # window's Preprocessing tab updates the JSON; the next NEW

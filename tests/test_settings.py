@@ -29,6 +29,17 @@ def test_defaults_when_no_file(isolated_home):
     assert out == S.DEFAULTS
 
 
+def test_additional_models_default_present(isolated_home):
+    out = S.load_settings()
+    assert out["additional_models_to_test"] == [
+        "xgboost",
+        "random forest",
+        "svm rbf",
+        "svm linear",
+        "logistic regression",
+    ]
+
+
 def test_round_trip(isolated_home):
     settings = dict(S.DEFAULTS)
     settings["model_version"] = "v0.2.0"
