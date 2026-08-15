@@ -29,6 +29,10 @@ from PySide6.QtWidgets import (
     QPushButton, QRadioButton, QScrollArea, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
+from ui.data.model_ranking import (
+    GLOBAL_SCORE_WEIGHTS,
+    rank_models_from_report,
+)
 
 
 # ----------------------------------------------------------------------
@@ -234,7 +238,6 @@ _METRIC_ROWS = [
     ("bad_fraction_model", "Model bad%",         True),
 ]
 
-
 class HeldoutMultiModelDialog(QDialog):
     def __init__(
         self,
@@ -248,6 +251,14 @@ class HeldoutMultiModelDialog(QDialog):
         self.setWindowTitle("Multi-model held-out evaluation")
         self.resize(1280, 720)
         self._report = report
+        self._score_weights = dict(GLOBAL_SCORE_WEIGHTS)
+        self._ranking_rows = rank_models_from_report(
+            report, weights=self._score_weights
+        )
+        self._score_by_version = {
+            row["model_version"]: row["score"]
+            for row in self._ranking_rows
+        }
         self._interval_cache = interval_cache or {}
         self._manifest_path = (
             Path(manifest_path) if manifest_path is not None else None
@@ -304,7 +315,9 @@ class HeldoutMultiModelDialog(QDialog):
             empty.setWordWrap(True)
             root.addWidget(empty)
         else:
+            root.addWidget(self._build_recommendation_box())
             root.addWidget(self._build_aggregate_box(report))
+            root.addWidget(self._build_ranking_table())
             root.addWidget(self._build_per_recording_table(report))
 
         if report.get("skipped"):
@@ -343,8 +356,99 @@ class HeldoutMultiModelDialog(QDialog):
                 v = block.get(key)
                 s = _fmt_pct(v) if is_pct else _fmt_ratio(v)
                 sub_l.addWidget(QLabel(f"<b>{label}:</b> {s}"))
+            score = self._score_by_version.get(version)
+            sub_l.addWidget(QLabel(
+                f"<b>Global score:</b> {_fmt_pct(score)}"
+            ))
             sub_l.addStretch(1)
             layout.addWidget(sub)
+        return box
+
+    def _build_recommendation_box(self) -> QGroupBox:
+        box = QGroupBox("Recommended model")
+        layout = QVBoxLayout(box)
+        if not self._ranking_rows:
+            layout.addWidget(QLabel("No model available for ranking."))
+            return box
+        best = self._ranking_rows[0]
+        score = best.get("score")
+        if score is None:
+            layout.addWidget(QLabel(
+                "Not enough aggregate metrics to compute a global score."
+            ))
+            return box
+
+        runner_up = self._ranking_rows[1] if len(self._ranking_rows) > 1 else None
+        gap = None
+        if runner_up is not None and runner_up.get("score") is not None:
+            gap = float(score) - float(runner_up["score"])
+
+        metrics = best.get("metrics", {})
+        expl = (
+            f"<b>{best.get('model_version', '?')}</b> is currently the top "
+            f"candidate with global score <b>{_fmt_pct(score)}</b> "
+            f"(Recall {_fmt_pct(metrics.get('recall'))}, "
+            f"Precision {_fmt_ratio(metrics.get('precision'))}, "
+            f"F1 {_fmt_ratio(metrics.get('f1'))}, "
+            f"FP {_fmt_pct(metrics.get('fp_rate'))}, "
+            f"FN {_fmt_pct(metrics.get('fn_rate'))})."
+        )
+        if gap is not None:
+            expl += f" Margin vs #2: <b>{_fmt_pct(gap)}</b>."
+        lbl = QLabel(expl)
+        lbl.setTextFormat(Qt.RichText)
+        lbl.setWordWrap(True)
+        layout.addWidget(lbl)
+        return box
+
+    def _build_ranking_table(self) -> QGroupBox:
+        box = QGroupBox("Automatic ranking")
+        layout = QVBoxLayout(box)
+        rows = self._ranking_rows
+        table = QTableWidget(len(rows), 8)
+        table.setHorizontalHeaderLabels([
+            "Rank", "Model", "Global score",
+            "Recall", "Precision", "F1", "FP%", "FN%",
+        ])
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.setSelectionBehavior(QTableWidget.SelectRows)
+        table.setAlternatingRowColors(True)
+        table.verticalHeader().setVisible(False)
+
+        for i, row in enumerate(rows):
+            m = row.get("metrics", {})
+            vals = [
+                str(row.get("rank", i + 1)),
+                str(row.get("model_version", "?")),
+                _fmt_pct(row.get("score")),
+                _fmt_pct(m.get("recall")),
+                _fmt_ratio(m.get("precision")),
+                _fmt_ratio(m.get("f1")),
+                _fmt_pct(m.get("fp_rate")),
+                _fmt_pct(m.get("fn_rate")),
+            ]
+            for col, txt in enumerate(vals):
+                item = QTableWidgetItem(txt)
+                if col not in (1,):
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                table.setItem(i, col, item)
+
+        table.resizeColumnsToContents()
+        table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.Stretch
+        )
+        layout.addWidget(table)
+
+        weights_txt = ", ".join(
+            f"{k}={v:.3f}" for k, v in self._score_weights.items()
+        )
+        note = QLabel(
+            "Global score uses weighted aggregate held-out metrics: "
+            f"{weights_txt}. For FP/FN rates, lower is better "
+            "(converted internally as 1 - rate)."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
         return box
 
     # ----------------------------------------------------------------
@@ -508,6 +612,16 @@ class HeldoutMultiModelDialog(QDialog):
         )
         if not path_str:
             return
+        payload = dict(self._report)
+        payload["ui_global_score"] = {
+            "weights": dict(self._score_weights),
+            "ranking": list(self._ranking_rows),
+            "recommended_model": (
+                self._ranking_rows[0]["model_version"]
+                if self._ranking_rows and self._ranking_rows[0]["score"] is not None
+                else None
+            ),
+        }
         Path(path_str).write_text(
-            json.dumps(self._report, indent=2, default=float)
+            json.dumps(payload, indent=2, default=float)
         )
