@@ -4522,6 +4522,22 @@ class TrainingWindow(QMainWindow):
         form.addRow("N (untrained recordings before prompt)", self._auto_retrain_n)
         layout.addWidget(group)
 
+        models_group = QGroupBox("Additional model candidates to test")
+        models_layout = QVBoxLayout(models_group)
+        models = settings.get("additional_models_to_test", [])
+        if not isinstance(models, list):
+            models = []
+        models = [str(m).strip() for m in models if str(m).strip()]
+        if not models:
+            models_text = "(none configured)"
+        else:
+            models_text = "\n".join(f"• {m}" for m in models)
+        models_label = QLabel(models_text)
+        models_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        models_label.setStyleSheet("color: #ddd;")
+        models_layout.addWidget(models_label)
+        layout.addWidget(models_group)
+
         # Paths section (read-only info)
         paths_group = QGroupBox("Resolved paths")
         paths_layout = QFormLayout(paths_group)
