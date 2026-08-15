@@ -1,6 +1,6 @@
-from ui.dialogs.heldout_multi_model_dialog import (
-    _compute_global_score,
-    _rank_models_from_report,
+from ui.data.model_ranking import (
+    compute_global_score,
+    rank_models_from_report,
 )
 
 
@@ -31,14 +31,14 @@ def test_rank_models_orders_by_weighted_score():
             ),
         ]
     }
-    rows = _rank_models_from_report(report)
+    rows = rank_models_from_report(report)
     assert [r["model_version"] for r in rows] == ["v0.2.0", "v0.1.0", "v0.3.0"]
     assert rows[0]["score"] is not None
     assert 0.0 <= rows[0]["score"] <= 1.0
 
 
 def test_global_score_renormalizes_when_some_metrics_missing():
-    score = _compute_global_score({
+    score = compute_global_score({
         "recall": 0.90,
         "precision": 0.85,
         # Missing f1/agreement/fp_rate/fn_rate on purpose.
@@ -58,7 +58,7 @@ def test_rank_models_puts_unscorable_models_last():
             ),
         ]
     }
-    rows = _rank_models_from_report(report)
+    rows = rank_models_from_report(report)
     assert rows[0]["model_version"] == "v0.2.0"
     assert rows[1]["model_version"] == "v0.1.0"
     assert rows[1]["score"] is None

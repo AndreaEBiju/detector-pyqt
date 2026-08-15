@@ -29,6 +29,10 @@ from PySide6.QtWidgets import (
     QPushButton, QRadioButton, QScrollArea, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
+from ui.data.model_ranking import (
+    GLOBAL_SCORE_WEIGHTS,
+    rank_models_from_report,
+)
 
 
 # ----------------------------------------------------------------------
@@ -223,10 +227,6 @@ def _fmt_ratio(v) -> str:
     return f"{v:.4f}"
 
 
-def _clamp01(v: float) -> float:
-    return max(0.0, min(1.0, float(v)))
-
-
 _METRIC_ROWS = [
     ("agreement",          "Agreement",          True),   # pct
     ("precision",          "Precision",          False),
@@ -237,80 +237,6 @@ _METRIC_ROWS = [
     ("bad_fraction_human", "Human bad%",         True),
     ("bad_fraction_model", "Model bad%",         True),
 ]
-
-# Weighted business score used to rank models after held-out comparison.
-# Positive metrics are better as-is; error-rate metrics are inverted
-# (1 - rate) before aggregation so larger is always better.
-_GLOBAL_SCORE_WEIGHTS = {
-    "recall": 0.30,
-    "precision": 0.20,
-    "f1": 0.20,
-    "agreement": 0.15,
-    "fp_rate": 0.075,
-    "fn_rate": 0.075,
-}
-
-
-def _compute_global_score(
-    metrics: dict, weights: Optional[dict] = None,
-) -> Optional[float]:
-    """Compute a normalized weighted score in [0, 1].
-
-    Missing metrics are skipped and remaining weights are renormalized.
-    Returns None only if no weighted metric is available.
-    """
-    ws = dict(weights or _GLOBAL_SCORE_WEIGHTS)
-    total_weight = 0.0
-    score_sum = 0.0
-    for key, weight in ws.items():
-        raw = metrics.get(key)
-        if raw is None:
-            continue
-        try:
-            v = _clamp01(float(raw))
-        except Exception:
-            continue
-        contrib = v if key not in {"fp_rate", "fn_rate"} else (1.0 - v)
-        score_sum += float(weight) * contrib
-        total_weight += float(weight)
-    if total_weight <= 0:
-        return None
-    return _clamp01(score_sum / total_weight)
-
-
-def _rank_models_from_report(
-    report: dict, weights: Optional[dict] = None,
-) -> list[dict]:
-    """Build score/ranking rows from a multi-model held-out report."""
-    rows: list[dict] = []
-    for m in (report.get("models", []) or []):
-        version = m.get("model_version", "?")
-        micro = ((m.get("report") or {}).get("aggregate") or {}).get("micro") or {}
-        score = _compute_global_score(micro, weights=weights)
-        rows.append({
-            "model_version": str(version),
-            "score": score,
-            "metrics": {
-                "agreement": micro.get("agreement"),
-                "precision": micro.get("precision"),
-                "recall": micro.get("recall"),
-                "f1": micro.get("f1"),
-                "fp_rate": micro.get("fp_rate"),
-                "fn_rate": micro.get("fn_rate"),
-            },
-        })
-
-    rows.sort(
-        key=lambda r: (
-            r["score"] is None,
-            -float(r["score"]) if r["score"] is not None else 0.0,
-            r["model_version"],
-        )
-    )
-    for i, row in enumerate(rows, start=1):
-        row["rank"] = i
-    return rows
-
 
 class HeldoutMultiModelDialog(QDialog):
     def __init__(
@@ -325,8 +251,8 @@ class HeldoutMultiModelDialog(QDialog):
         self.setWindowTitle("Multi-model held-out evaluation")
         self.resize(1280, 720)
         self._report = report
-        self._score_weights = dict(_GLOBAL_SCORE_WEIGHTS)
-        self._ranking_rows = _rank_models_from_report(
+        self._score_weights = dict(GLOBAL_SCORE_WEIGHTS)
+        self._ranking_rows = rank_models_from_report(
             report, weights=self._score_weights
         )
         self._score_by_version = {
