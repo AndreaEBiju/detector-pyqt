@@ -39,9 +39,6 @@ from PySide6.QtWidgets import (
 # Mirror the worker's sys.path setup so the window works whether it
 # was launched from the main app or from a standalone script.
 _repo_root = Path(__file__).resolve().parent.parent.parent
-_detector_core = _repo_root / "detector-core"
-if _detector_core.exists() and str(_detector_core) not in sys.path:
-    sys.path.insert(0, str(_detector_core))
 if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 

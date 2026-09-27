@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
-import sys
 from pathlib import Path
 from typing import Optional
 
@@ -38,9 +37,6 @@ from PySide6.QtWidgets import (
 )
 
 _repo_root = Path(__file__).resolve().parent.parent.parent
-_detector_core = _repo_root / "detector-core"
-if _detector_core.exists() and str(_detector_core) not in sys.path:
-    sys.path.insert(0, str(_detector_core))
 
 from detector import review as R                                  # noqa: E402
 from detector.model_artifact import ModelArtifact                  # noqa: E402

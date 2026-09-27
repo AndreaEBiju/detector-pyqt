@@ -35,9 +35,6 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(ROOT))
 
-_DETECTOR_CORE = ROOT / "detector-core"
-if _DETECTOR_CORE.exists() and str(_DETECTOR_CORE) not in sys.path:
-    sys.path.insert(0, str(_DETECTOR_CORE))
 
 from ui.workers.hyperopt_worker import (
     HyperoptWorker,

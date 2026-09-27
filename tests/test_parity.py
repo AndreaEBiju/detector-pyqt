@@ -36,8 +36,6 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(ROOT))
 _DETECTOR_CORE = ROOT / "detector-core"
-if _DETECTOR_CORE.exists() and str(_DETECTOR_CORE) not in sys.path:
-    sys.path.insert(0, str(_DETECTOR_CORE))
 
 
 # ----------------------------------------------------------------------
@@ -248,13 +246,9 @@ def test_retrain_subprocess_re_export_paths():
     """Streamlit's `ui.workers.training_worker` re-exports from
     `detector.retrain_subprocess`. Both modules must expose the same
     names so future Streamlit code keeps working unchanged."""
-    sys.path.insert(0, str(_DETECTOR_CORE))
-    try:
-        from detector.retrain_subprocess import (
-            RetrainJob, start_retrain, status, cancel, list_jobs, JOBS_DIR,
-        )
-    finally:
-        sys.path.remove(str(_DETECTOR_CORE))
+    from detector.retrain_subprocess import (
+        RetrainJob, start_retrain, status, cancel, list_jobs, JOBS_DIR,
+    )
     assert callable(start_retrain)
     assert callable(status)
     assert callable(cancel)

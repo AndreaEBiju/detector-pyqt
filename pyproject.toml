@@ -17,7 +17,11 @@ dependencies = [
     # GUI stack
     "PySide6>=6.6",
     "pyqtgraph>=0.13",
-    # Upper bound 2 -> 3, in lockstep with detector-core's own pin , measured:
+    # The detector backend: the detector-core distribution, installed editable
+    # from the ./detector-core submodule (`pip install -e detector-core`). A
+    # declared dependency, never a sys.path entry (invariant 21).
+    "detector-core",
+    # Upper bound 2 -> 3, in lockstep with detector-core's own pin, measured:
     # this suite runs under numpy 2.5.3 / scipy 1.18.1 / shap 0.52.0 /
     # numba 0.67.0 on python 3.12 (the <2 pin had not matched the tested
     # environment for some time). <3, not unbounded: declared = tested.
@@ -61,6 +65,5 @@ packages = ["ui"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# Make `from detector import ...` work in tests by injecting the
-# submodule path. conftest.py at repo root mirrors this for dev runs.
-pythonpath = ["detector-core"]
+# No `pythonpath` entry: `detector` resolves through the installed
+# detector-core distribution, as it does for the app.

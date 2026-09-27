@@ -42,9 +42,6 @@ from PySide6.QtWidgets import (
 )
 
 _repo_root = Path(__file__).resolve().parent.parent.parent
-_detector_core = _repo_root / "detector-core"
-if _detector_core.exists() and str(_detector_core) not in sys.path:
-    sys.path.insert(0, str(_detector_core))
 if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 

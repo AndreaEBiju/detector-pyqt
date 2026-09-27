@@ -20,16 +20,12 @@ Keys persisted:
 from __future__ import annotations
 
 import json
-import sys
 from pathlib import Path
 from typing import Any
 
-_repo_root = Path(__file__).resolve().parent.parent.parent
-_detector_core = _repo_root / "detector-core"
-if _detector_core.exists() and str(_detector_core) not in sys.path:
-    sys.path.insert(0, str(_detector_core))
-
-from detector import paths as detector_paths  # noqa: E402
+# `detector` is the detector-core distribution, a declared dependency installed
+# editable from the submodule - never found by inserting its path (invariant 21).
+from detector import paths as detector_paths
 
 
 DEFAULTS: dict[str, Any] = {

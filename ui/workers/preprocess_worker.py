@@ -39,9 +39,6 @@ from PySide6.QtCore import QObject, Signal, Slot
 # detector-pyqt must come before detector-core or our `ui/` package gets
 # shadowed by detector-core's Streamlit `ui/`.
 _repo_root = Path(__file__).resolve().parent.parent.parent
-_detector_core = _repo_root / "detector-core"
-if _detector_core.exists() and str(_detector_core) not in sys.path:
-    sys.path.insert(0, str(_detector_core))
 if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 

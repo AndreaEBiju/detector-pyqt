@@ -19,19 +19,16 @@ import argparse
 import sys
 from pathlib import Path
 
-# Make `from detector import …` and `from ui.widgets import …` work
-# whether we're running from a checked-out repo (submodule under
-# ./detector-core/) or an installed wheel. Insertion order matters:
-# detector-core/ is the GEMSBlanking submodule and contains its own
-# Streamlit `ui/` package (no `widgets/` subdir). If it sits BEFORE
-# detector-pyqt in sys.path, `from ui.widgets …` resolves to the
-# Streamlit `ui` and fails. Insert detector-core first, then prepend
-# the detector-pyqt root on top of it. Final order:
-#     [detector-pyqt, detector-core, …rest]
+# `detector` comes from the detector-core distribution - a declared dependency,
+# installed editable from the submodule - and is never found by inserting its
+# path (invariant 21). What remains is this app's OWN package: `python ui/app.py`
+# puts ui/ on sys.path, not the repo root, so `import ui...` needs the root.
+#
+# It must go FIRST, and that is load-bearing: detector-core's editable install
+# exposes its whole checkout, which contains a Streamlit `ui/` package (no
+# `widgets/`). Anywhere later than that entry, `from ui.widgets ...` resolves to
+# the Streamlit `ui` and fails. tests/test_audit_dependency.py checks both.
 _repo_root = Path(__file__).resolve().parent.parent
-_detector_core = _repo_root / "detector-core"
-if _detector_core.exists():
-    sys.path.insert(0, str(_detector_core))
 sys.path.insert(0, str(_repo_root))
 
 from PySide6.QtWidgets import QApplication

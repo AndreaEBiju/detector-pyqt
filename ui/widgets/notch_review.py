@@ -17,7 +17,6 @@ files for the same animal via the per-animal Profile.
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 from typing import Optional
 
@@ -32,9 +31,6 @@ from PySide6.QtWidgets import (
 )
 
 _repo_root = Path(__file__).resolve().parent.parent.parent
-_detector_core = _repo_root / "detector-core"
-if _detector_core.exists() and str(_detector_core) not in sys.path:
-    sys.path.insert(0, str(_detector_core))
 
 from detector.preprocessing import notch as notch_mod                # noqa: E402
 from detector.preprocessing.profiles import (                          # noqa: E402

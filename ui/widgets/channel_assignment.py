@@ -19,7 +19,6 @@ Returns a `channel_assignment` dict ready to drop into a
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 from typing import Optional
 
@@ -32,12 +31,9 @@ from PySide6.QtWidgets import (
     QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-_repo_root = Path(__file__).resolve().parent.parent.parent
-_detector_core = _repo_root / "detector-core"
-if _detector_core.exists() and str(_detector_core) not in sys.path:
-    sys.path.insert(0, str(_detector_core))
-
-from detector.preprocessing.tdt_io import StreamInfo, load_stream  # noqa: E402
+# `detector` is the detector-core distribution, a declared dependency installed
+# editable from the submodule - never found by inserting its path (invariant 21).
+from detector.preprocessing.tdt_io import StreamInfo, load_stream
 
 
 # How much of the recording to read for the sparkline previews. 5 s

@@ -1,24 +1,15 @@
-"""Add the detector-core submodule to sys.path so `from detector import …`
-works in both `python -c "..."` invocations and pytest.
+"""Pytest configuration for detector-pyqt.
 
-The submodule layout is `detector-pyqt/detector-core/detector/`, so we
-prepend `detector-core/` to sys.path — that puts the `detector` package
-at the top of the search path.
+`detector` is NOT put on sys.path here: it is the detector-core distribution,
+a declared dependency installed editable from the submodule (invariant 21 -
+a library resolved by path order is an accident, not a dependency).
 
-Also registers the `qt_display` marker (default-deselected) for widget
+Registers the `qt_display` marker (default-deselected) for widget
 tests that need a real Qt display. Bare QApplication construction
 segfaults on truly headless boxes, so those tests are opt-in: run with
 `pytest -m qt_display` from a Mac terminal."""
 
 from __future__ import annotations
-
-import sys
-from pathlib import Path
-
-_root = Path(__file__).resolve().parent
-_detector_core = _root / "detector-core"
-if _detector_core.exists() and str(_detector_core) not in sys.path:
-    sys.path.insert(0, str(_detector_core))
 
 
 def pytest_configure(config):

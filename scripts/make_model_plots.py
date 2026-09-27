@@ -53,9 +53,6 @@ import numpy as np
 # Wire detector-core onto the path so this script runs from a fresh
 # Python without needing the package installed.
 _repo_root = Path(__file__).resolve().parent.parent
-_detector_core = _repo_root / "detector-core"
-if _detector_core.exists() and str(_detector_core) not in sys.path:
-    sys.path.insert(0, str(_detector_core))
 if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 

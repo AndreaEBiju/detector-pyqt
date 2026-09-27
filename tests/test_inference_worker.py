@@ -31,9 +31,6 @@ ROOT = HERE.parent
 sys.path.insert(0, str(ROOT))
 
 # Add the submodule to sys.path so `from detector import …` works.
-_DETECTOR_CORE = ROOT / "detector-core"
-if _DETECTOR_CORE.exists() and str(_DETECTOR_CORE) not in sys.path:
-    sys.path.insert(0, str(_DETECTOR_CORE))
 
 from ui.workers.inference_worker import (
     InferenceWorker, current_promoted_version_short,

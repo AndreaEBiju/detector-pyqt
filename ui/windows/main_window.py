@@ -23,16 +23,12 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-# Self-contained sys.path setup so `from detector …` works whether
-# this module is imported via ui/app.py or directly. The repo-vs-
-# submodule order is critical — same lesson as scripts/m1_benchmark.py:
-# detector-core has its own `ui/` package (Streamlit) so it must come
-# AFTER detector-pyqt in sys.path or it'll shadow our ui.widgets.
+# This repo's own root goes FIRST on sys.path, so `ui.*` is detector-pyqt's
+# package when this module is imported directly: detector-core's editable
+# install exposes its checkout, whose Streamlit `ui/` would otherwise shadow
+# ours. `detector` itself is the declared detector-core dependency, never a
+# path entry (invariant 21).
 _repo_root = Path(__file__).resolve().parent.parent.parent
-_detector_core = _repo_root / "detector-core"
-if _detector_core.exists():
-    if str(_detector_core) not in sys.path:
-        sys.path.insert(0, str(_detector_core))
 if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
