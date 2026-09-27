@@ -49,7 +49,7 @@ def test_pyqt_inference_worker_imports_lifted_backend():
     (e.g. someone copies the function into ui/ as a quick fix), the
     two UIs will silently diverge. Pin this contract."""
     from ui.workers import inference_worker
-    src = Path(inference_worker.__file__).read_text()
+    src = Path(inference_worker.__file__).read_text(encoding="utf-8")
     assert "from detector.predict import detect_bad_with_progress" in src, (
         "PyQt inference worker must import detect_bad_with_progress from "
         "detector.predict (the lifted shared backend). Found local copy?"
@@ -59,7 +59,7 @@ def test_pyqt_inference_worker_imports_lifted_backend():
 def test_pyqt_retrain_worker_imports_lifted_backend():
     """Same contract for the retrain subprocess plumbing."""
     from ui.workers import retrain_worker
-    src = Path(retrain_worker.__file__).read_text()
+    src = Path(retrain_worker.__file__).read_text(encoding="utf-8")
     assert "from detector.retrain_subprocess import" in src, (
         "PyQt retrain worker must import from detector.retrain_subprocess "
         "(the lifted shared backend)."
@@ -72,13 +72,13 @@ def test_pyqt_uses_detector_recording_io_not_streamlit_loader():
     `ui/data/loaders.py` (which is a re-export shim and would
     conflict with the PyQt-side `ui/`)."""
     from ui.windows import main_window
-    src = Path(main_window.__file__).read_text()
+    src = Path(main_window.__file__).read_text(encoding="utf-8")
     assert "from detector.recording_io import" in src
 
 
 def test_pyqt_uses_detector_labeled_save():
     from ui.windows import main_window
-    src = Path(main_window.__file__).read_text()
+    src = Path(main_window.__file__).read_text(encoding="utf-8")
     for sym in ("save_native", "save_matlab_compatible",
                  "save_segment_table"):
         assert sym in src, f"main_window must call {sym}"
@@ -218,7 +218,7 @@ def test_review_json_schema_matches_streamlit():
 
     # Streamlit side: detector-core/ui/components/disagreement_review.py
     sl_src = (_DETECTOR_CORE / "ui" / "components"
-              / "disagreement_review.py").read_text()
+              / "disagreement_review.py").read_text(encoding="utf-8")
     for key in expected_top:
         assert f'"{key}"' in sl_src, (
             f"Streamlit review writer missing key {key!r}"
@@ -229,7 +229,7 @@ def test_review_json_schema_matches_streamlit():
         )
 
     # PyQt side: ui/widgets/review_panel.py
-    py_src = (ROOT / "ui" / "widgets" / "review_panel.py").read_text()
+    py_src = (ROOT / "ui" / "widgets" / "review_panel.py").read_text(encoding="utf-8")
     for key in expected_top:
         assert f'"{key}"' in py_src, (
             f"PyQt review writer missing key {key!r}"

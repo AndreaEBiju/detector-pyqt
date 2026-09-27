@@ -17,12 +17,11 @@ dependencies = [
     # GUI stack
     "PySide6>=6.6",
     "pyqtgraph>=0.13",
-    # Detector backend deps (imported via the detector-core/ submodule).
-    # numpy is pinned <2 because: (a) the Streamlit UI's pyproject pins
-    # 1.26.4, (b) several anaconda-bundled packages (contourpy,
-    # pywavelets) don't yet support numpy 2.x, and (c) shap's transitive
-    # numba upgrade will silently pull in numpy 2 otherwise.
-    "numpy>=1.26,<2",
+    # Upper bound 2 -> 3, in lockstep with detector-core's own pin , measured:
+    # this suite runs under numpy 2.5.3 / scipy 1.18.1 / shap 0.52.0 /
+    # numba 0.67.0 on python 3.12 (the <2 pin had not matched the tested
+    # environment for some time). <3, not unbounded: declared = tested.
+    "numpy>=1.26,<3",
     "pandas>=2.0",
     "scipy>=1.11",
     "scikit-learn>=1.3",
@@ -36,8 +35,8 @@ dependencies = [
     "psutil>=5.0",
     "lightgbm>=4.0",
     # Optional but referenced by detector.review (SHAP explanations).
-    # Cap to a version that still works with numba 0.59 / numpy 1.26.
-    "shap>=0.44,<0.50",
+    # Cap raised 0.50 -> 0.53 for numpy 2: 0.52.0 is the tested version.
+    "shap>=0.44,<0.53",
     # detector.review embeds matplotlib figures in the per-fold SHAP
     # review HTMLs. It's imported by ui.windows.main_window indirectly,
     # so the UI fails to start without it.
