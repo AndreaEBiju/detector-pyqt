@@ -42,18 +42,27 @@ DEFAULTS: dict[str, Any] = {
     # window's Preprocessing tab updates the JSON; the next NEW
     # animal's review picks them up. Existing per-animal profiles
     # are unaffected (they store their own values).
-    # Defaults for the notch review dialog (matches gi-vagus-viewer):
-    # mains hum is filtered prophylactically at 60/120/180 Hz with
-    # Q=30. There's no per-harmonic auto-detection — the user
-    # adjusts the harmonics field manually if their setup needs
-    # different frequencies (e.g. 50/100/150 for European mains).
+    # Defaults for the notch review dialog: mains hum is filtered at
+    # 60 Hz ONLY, Q=30. There is no per-harmonic auto-detection and it
+    # must not be enabled — the user adjusts the harmonics field
+    # manually if their setup needs different frequencies (e.g. 50 Hz
+    # for European mains).
+    #
+    # 120 and 180 were removed, measured: a 120 Hz notch rings INSIDE
+    # the 300-3000 Hz ENG band at 2.41 uV per mV of excursion, so a
+    # 7.5 mV motion excursion puts its ringing at the 4.5-sigma spike
+    # threshold and manufactures spikes out of the filter. The 60 Hz
+    # notch contributes 0.221 uV/mV, an order of magnitude less,
+    # because the bandpass attenuates 60 Hz by -36.4 dB through
+    # filtfilt. Prophylactic filtering of a harmonic that may not be
+    # present is not worth injecting artifact into the consumer band.
     "preprocessing_q_factor": 30.0,
     # Detrend toggle. When on, the per-channel mean is subtracted
     # from the signal before filtering AND from the raw trace shown
     # alongside the filtered trace — so both display at the same
     # baseline. Off → both traces show their natural DC offset.
     "preprocessing_detrend": True,
-    "preprocessing_default_freqs_hz": [60.0, 120.0, 180.0],
+    "preprocessing_default_freqs_hz": [60.0],
 }
 
 

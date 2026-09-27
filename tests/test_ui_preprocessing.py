@@ -68,7 +68,9 @@ def test_settings_has_preprocessing_defaults(isolated_home):
     out = S.load_settings()
     assert out["preprocessing_q_factor"] == 30.0
     assert out["preprocessing_detrend"] is True
-    assert out["preprocessing_default_freqs_hz"] == [60.0, 120.0, 180.0]
+    # Change 3 (task 16, ratified): the default notches 60 Hz only; harmonics
+    # are added deliberately per recording, not pre-filled.
+    assert out["preprocessing_default_freqs_hz"] == [60.0]
 
 
 def test_settings_round_trip_preprocessing(isolated_home):
@@ -236,14 +238,14 @@ def test_notch_review_settings_includes_apply_scope(qapp, isolated_home,
                     "role": "nerve", "label": "VN1"}],
     )
     try:
-        # Default = apply_all + harmonics field pre-populated with
-        # 60/120/180 (the gi-vagus-viewer default).
+        # Default = apply_all + harmonics field pre-populated with 60 Hz only
+        # (Change 3, task 16, ratified - was 60/120/180).
         assert nrd._apply_all_radio.isChecked()
         assert "60" in nrd._harmonics_edit.text()
-        assert "180" in nrd._harmonics_edit.text()
+        assert "180" not in nrd._harmonics_edit.text()
         out = nrd.notch_settings()
         assert out["apply_scope"] == "all_channels"
-        assert out["frequencies_filtered"] == [60.0, 120.0, 180.0]
+        assert out["frequencies_filtered"] == [60.0]
         assert out["q_factor"] == 30.0
         assert out["detrend"] is True
         # Notch metric version is stamped so future loads know which
