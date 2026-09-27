@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from gems_blanking_v2.detect import recall
 from gems_blanking_v2.io.audit_pool import (
     EligibleRecording,
     assessable_regions,
@@ -178,6 +179,12 @@ class AuditWindow(QMainWindow):
         if self.plan is not None:
             msg = f"plan {self.plan['plan_id']} is still open; finish it first"
             raise RuntimeError(msg)
+        # The sequential rule (task 09, pre-declared): a new round only once the
+        # last is scored and every miss is diagnosed and fixed in task 07.
+        allowed, why = recall.check_next_round(self._store)
+        if not allowed:
+            msg = f"a new audit round cannot be drawn yet: {why}"
+            raise RuntimeError(msg)
         pool: list[Assessable] = []
         for r in self._pool:
             planned = planned_regions(r, self._protocol(r))
@@ -214,7 +221,8 @@ class AuditWindow(QMainWindow):
         return None
 
     def _span_id(self, plan: dict[str, Any], k: int) -> str:
-        return f"{plan['plan_id']}_s{k + 1}"
+        # One construction site, shared with the scorer that reads these files back.
+        return recall.span_id(plan, k)
 
     def _committed(self, plan: dict[str, Any]) -> set[int]:
         """Span indices whose marks are on disk - progress is read, not remembered."""
@@ -369,6 +377,17 @@ class AuditWindow(QMainWindow):
         self._status.setText("Committed. Computing candidates and z-traces...")
         assert self._region is not None
         intervals, traces = self._reveal_fn(self._recording, self._region)
+        # What was revealed, digested into the span record (ratified 2026-09-27): the
+        # scorer recomputes the candidates and refuses a span whose recompute does
+        # not reproduce this. The marks file is untouched - it was written above.
+        self._record["reveal"] = {
+            "candidates_sha256": recall.candidate_digest(intervals),
+            "n_candidates": int(np.asarray(intervals).reshape(-1, 2).shape[0]),
+            "digest_rule": recall.DIGEST_RULE,
+            "revealed_at": datetime.now(UTC).isoformat(),
+        }
+        atomic_write_text(out_dir / f"{s.span_id}_plan.json",
+                          json.dumps(self._record, indent=1, sort_keys=True) + "\n")
         s.reveal(candidates=intervals, traces=traces)
         self._sync()
         self.ztrace.set_traces(traces)

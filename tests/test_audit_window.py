@@ -226,3 +226,91 @@ def test_an_empty_store_says_why_instead_of_failing_silently(qapp, store: GemsSt
 
 
 
+
+def _three_recordings(store: GemsStore) -> None:
+    for i, folder in enumerate(["gems_j_t01_ms3_bl_230315", "gems_j_t01_ms1_bl_164532",
+                                "gems_d_t01_es1_bl_200359"]):
+        _block(store, folder, 1_789_527_801.0 + 3600 * i, fs=1000.0, duration_s=600.0)
+
+
+def _label_round(store: GemsStore, reveal_fn) -> str:
+    from ui.windows.audit_window import AuditWindow
+
+    w = AuditWindow(store, reveal_fn=reveal_fn)
+    w._plan_btn.click()
+    assert w.last_error is None, w.last_error
+    for _ in range(5):
+        s = w.open_next_span()
+        w._on_mark(s.start_s + 10.0, s.start_s + 11.0)
+        w.commit()
+    assert "all 5 spans committed" in w.progress.text()
+    return w.plan["plan_id"]
+
+
+def test_a_second_round_waits_for_the_first_to_be_scored_and_clean(
+    qapp, store: GemsStore, monkeypatch
+) -> None:
+    """The sequential rule, through the real window: no new round until the last is
+    scored clean. The window and the scorer share ONE reveal, so the digests the
+    window wrote verify against the scorer's recompute."""
+    from gems_blanking_v2.detect.recall import (
+        candidate_digest,
+        load_round,
+        score_stored_round,
+    )
+
+    from ui.audit import bridge, score
+    from ui.windows.audit_window import AuditWindow
+
+    def covering(region):  # every mark covered
+        return np.array([[region[0], region[1]]]), []
+
+    _three_recordings(store)
+    plan_id = _label_round(store, lambda r, g: covering(g))
+    spans = load_round(store, plan_id)[1]
+    for sp in spans:  # the window digested exactly what it revealed
+        region = tuple(sp["record"]["assessable_regions_s"][0])
+        assert sp["record"]["reveal"]["candidates_sha256"] == candidate_digest(
+            covering(region)[0])
+    w2 = AuditWindow(store, reveal_fn=lambda r, g: covering(g))
+    w2._plan_btn.click()
+    assert w2.plan is None and "has not been scored" in (w2.last_error or "")
+
+    seen = []
+    monkeypatch.setattr(bridge, "reveal_for_region",
+                        lambda rec, region: (seen.append(region), covering(region))[1])
+    result = score_stored_round(store, plan_id, score.make_reveal(store))
+    assert seen == [tuple(sp["record"]["assessable_regions_s"][0]) for sp in spans]
+    assert result.warnings == [] and result.found == 5 and result.covered == 5
+    assert set(result.provenance["reveal_digests"].values()) == {"verified"}
+    w3 = AuditWindow(store, reveal_fn=lambda r, g: covering(g))
+    w3._plan_btn.click()
+    assert w3.last_error is None and w3.plan is not None and w3.plan["plan_id"] != plan_id
+
+
+def test_a_recompute_that_differs_from_the_reveal_is_refused_and_a_legacy_span_warns(
+    qapp, store: GemsStore, monkeypatch
+) -> None:
+    from gems_blanking_v2.detect.recall import RevealMismatchError, score_stored_round
+
+    from ui.audit import bridge, score
+
+    def shown(region):
+        return np.array([[region[0] + 1.0, region[0] + 1.5]]), []
+
+    _three_recordings(store)
+    plan_id = _label_round(store, lambda r, g: shown(g))
+    monkeypatch.setattr(bridge, "reveal_for_region",  # a different generator
+                        lambda rec, region: (np.array([[region[0] + 2.0, region[0] + 2.5]]), []))
+    with pytest.raises(RevealMismatchError, match="do not match"):
+        score_stored_round(store, plan_id, score.make_reveal(store))
+    assert not store.audit_score_path(plan_id).exists()
+
+    # The same round as an app started before digests would have left it.
+    for rec_path in store.root.glob(f"labels/*/blind_audit/*/{plan_id}_s*_plan.json"):
+        doc = json.loads(rec_path.read_text(encoding="utf-8"))
+        doc.pop("reveal")
+        rec_path.write_text(json.dumps(doc), encoding="utf-8")
+    legacy = score_stored_round(store, plan_id, score.make_reveal(store))
+    assert len(legacy.warnings) == 5
+    assert all("without candidate digests" in w for w in legacy.warnings)
