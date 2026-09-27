@@ -1,0 +1,402 @@
+"""The blind recall audit, launchable: plan five spans, mark each blind, commit, reveal.
+
+Task 16 Change 2's pieces (plan, session, controller, dock) existed but nothing
+opened them, so Andrea could not start labelling - the human critical path to
+the 09 gate. This window is that entry point:
+
+* **The formal audit is a five-span PLAN**, drawn once by ``plan_audit`` (five
+  contiguous 2-min spans, stratified across 2-3 animals and conditions) with its
+  seed and pool written to the store BEFORE the first span is shown. Each open
+  advances through it ("span k of 5"); progress is read back from which spans
+  have committed marks, so closing the window and returning resumes the plan.
+* **A trial span is not audit data.** "Trial span" draws one span on a chosen
+  recording, for learning the UI; its record says ``"trial": true``.
+* **Only eligible recordings are offered or planned** (``audit_pool``): excluded
+  ones never appear, and a direct request for one is refused.
+* **Stim epochs are removed before any span is drawn** (the protocol window at the
+  start of every stim/recovery file), and each span's ``Assessable`` asserts it.
+* **Marks are written to the store under the session key before anything is
+  revealed** (``store.audit_dir``); candidates are not computed until after the
+  commit, so there is nothing in memory to leak into the blind phase.
+"""
+
+from __future__ import annotations
+
+import json
+import secrets
+from collections.abc import Callable
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+from gems_blanking_v2.io.audit_pool import (
+    EligibleRecording,
+    assessable_regions,
+    eligible_recordings,
+    planned_regions,
+    stim_epoch_s,
+)
+from gems_blanking_v2.io.stim_split import (
+    PROTOCOL_FILENAME,
+    ProtocolSpec,
+    load_protocol_book,
+)
+from gems_blanking_v2.io.store import GemsStore, atomic_write_text
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QDockWidget,
+    QHBoxLayout,
+    QLabel,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+from ui.audit import bridge
+from ui.audit.array_recording import ArrayRecording
+from ui.audit.controller import sync_viewer
+from ui.audit.plan import N_SPANS, SPAN_S, Assessable, plan_audit
+from ui.audit.session import Phase, SpanSession
+from ui.widgets.signal_viewer import MultiChannelViewer
+from ui.widgets.ztrace_dock import ZTraceDock
+
+RevealFn = Callable[[Any, tuple[float, float]], tuple[np.ndarray, list[Any]]]
+
+_COLOURS = ("#4c9be8", "#6bb3f0", "#9ccbf5", "#e8834c", "#f0a06b", "#f5bf9c",
+            "#5cc98a", "#7fd6a3", "#a6e3bf")
+
+
+class AuditWindow(QMainWindow):
+    """The five-span blind audit, plus trial spans, on eligible new-cohort data."""
+
+    def __init__(
+        self, store: GemsStore, *, reveal_fn: RevealFn | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Blind recall audit")
+        self._store = store
+        self._reveal_fn: RevealFn = reveal_fn or bridge.reveal_for_region
+        self._pool = eligible_recordings(store)
+        self.last_error: str | None = None
+        self._book = load_protocol_book(store.root / PROTOCOL_FILENAME)
+        self._rec: EligibleRecording | None = None
+        self._recording: Any = None
+        self._session: SpanSession | None = None
+        self._region: tuple[float, float] | None = None
+        self._record: dict[str, Any] = {}
+        self.viewer: MultiChannelViewer | None = None
+        self.plan: dict[str, Any] | None = self._latest_open_plan()
+
+        self._list = QListWidget()
+        for r in self._pool:
+            item = QListWidgetItem(f"{r.animal}  {r.epoch:14}  {r.folder_name}")
+            item.setData(Qt.UserRole, r.session)
+            self._list.addItem(item)
+        self._plan_btn = QPushButton("Create the five-span audit plan")
+        self._next_btn = QPushButton("Open next audit span")
+        self._trial_btn = QPushButton("Trial span on selected recording (not audit data)")
+        self._undo_btn = QPushButton("Undo last mark")
+        self._commit_btn = QPushButton("Commit marks (then reveal)")
+        self.progress = QLabel("")
+        self._status = QLabel(f"{len(self._pool)} eligible recordings.")
+        # Every button goes through _clicked: ``clicked`` emits ``checked`` and
+        # PySide6 hands it to any slot with a free parameter, so connecting
+        # create_plan directly made every plan's seed int(False) == 0.
+        self._plan_btn.clicked.connect(self._clicked(self.create_plan))
+        self._next_btn.clicked.connect(self._clicked(self.open_next_span))
+        self._trial_btn.clicked.connect(self._clicked(self._on_trial_clicked))
+        self._undo_btn.clicked.connect(self._clicked(self.undo_mark))
+        self._commit_btn.clicked.connect(self._clicked(self.commit))
+
+        left = QWidget()
+        lay = QVBoxLayout(left)
+        lay.addWidget(QLabel("Formal audit"))
+        lay.addWidget(self._plan_btn)
+        lay.addWidget(self._next_btn)
+        lay.addWidget(self.progress)
+        lay.addWidget(QLabel("Eligible recordings (excluded ones are never listed)"))
+        lay.addWidget(self._list)
+        lay.addWidget(self._trial_btn)
+        bar = QWidget()
+        blay = QHBoxLayout(bar)
+        for w in (self._undo_btn, self._commit_btn, self._status):
+            blay.addWidget(w)
+        self._centre = QWidget()
+        self._centre_lay = QVBoxLayout(self._centre)
+        self._centre_lay.addWidget(bar)
+        root = QWidget()
+        rlay = QHBoxLayout(root)
+        rlay.addWidget(left, 1)
+        rlay.addWidget(self._centre, 4)
+        self.setCentralWidget(root)
+
+        self.ztrace = ZTraceDock()
+        dock = QDockWidget("z-traces (after commit)", self)
+        dock.setWidget(self.ztrace)
+        self.addDockWidget(Qt.RightDockWidgetArea, dock)
+        self._refresh()
+
+    def _clicked(self, action: Callable[[], Any]) -> Callable[..., None]:
+        """A button slot: call ``action()`` with no arguments; show any failure.
+
+        A refusal (no plan possible, a planned recording since excluded, the
+        store unreachable) must reach the person at the screen, not a console
+        they cannot see.
+        """
+        def slot(*_ignored: object) -> None:
+            try:
+                action()
+            except Exception as exc:  # noqa: BLE001 - shown, not swallowed
+                self._status.setText(f"Could not do that: {exc}")
+                box = QMessageBox(QMessageBox.Warning, "Blind recall audit", str(exc),
+                                  parent=self)
+                box.setModal(False)
+                box.show()
+                self.last_error = str(exc)
+        return slot
+
+    # -- the pool ---------------------------------------------------------
+
+    @property
+    def offered(self) -> list[EligibleRecording]:
+        """What the list shows - by construction, only eligible recordings."""
+        return list(self._pool)
+
+    def _protocol(self, rec: EligibleRecording) -> ProtocolSpec:
+        return self._book.for_path(self._store.relpath(rec.source))
+
+    # -- the five-span plan -------------------------------------------------
+
+    def create_plan(self, seed: int | None = None) -> dict[str, Any]:
+        """Draw the plan once, write it with its seed, and make it the active plan."""
+        if self.plan is not None:
+            msg = f"plan {self.plan['plan_id']} is still open; finish it first"
+            raise RuntimeError(msg)
+        pool: list[Assessable] = []
+        for r in self._pool:
+            planned = planned_regions(r, self._protocol(r))
+            if planned is None or not planned[0]:
+                continue
+            pool.append(Assessable(recording_id=r.session, animal=r.animal,
+                                   condition=r.epoch, regions=planned[0],
+                                   excluded=planned[1]))
+        seed = secrets.randbits(32) if seed is None else int(seed)
+        drawn = plan_audit(pool, seed)
+        plan_id = f"plan_{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}_{seed:08x}"
+        record = {
+            "plan_id": plan_id, "created_at": datetime.now(UTC).isoformat(),
+            **drawn.to_json(), "pool_size": len(pool),
+            "pool_rule": "eligible (non-excluded) baseline and stim_recovery recordings "
+                         "with a recorded duration; stim_recovery loses 0 to "
+                         "stim_duration + tolerance s; 20 s edge guards",
+        }
+        path = self._store.audit_plan_path(plan_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(path, json.dumps(record, indent=1, sort_keys=True) + "\n")
+        self.plan = record
+        self._refresh()
+        return record
+
+    def _latest_open_plan(self) -> dict[str, Any] | None:
+        folder = self._store.audit_plan_path("x").parent
+        if not folder.is_dir():
+            return None
+        for path in sorted(folder.glob("plan_*.json"), reverse=True):
+            plan = json.loads(path.read_text(encoding="utf-8"))
+            if len(self._committed(plan)) < len(plan["spans"]):
+                return plan
+        return None
+
+    def _span_id(self, plan: dict[str, Any], k: int) -> str:
+        return f"{plan['plan_id']}_s{k + 1}"
+
+    def _committed(self, plan: dict[str, Any]) -> set[int]:
+        """Span indices whose marks are on disk - progress is read, not remembered."""
+        done = set()
+        for k, span in enumerate(plan["spans"]):
+            marks = (self._store.audit_dir(span["animal"], span["recording_id"])
+                     / f"{self._span_id(plan, k)}_blind_marks.json")
+            if marks.is_file():
+                done.add(k)
+        return done
+
+    def open_next_span(self) -> SpanSession | None:
+        """Open the first uncommitted span of the active plan."""
+        plan = self.plan
+        if plan is None:
+            self._status.setText("Create the audit plan first.")
+            return None
+        todo = [k for k in range(len(plan["spans"])) if k not in self._committed(plan)]
+        if not todo:
+            self._status.setText("All spans of this plan are committed.")
+            return None
+        k = todo[0]
+        span = plan["spans"][k]
+        rec = next((r for r in self._pool if r.session == span["recording_id"]), None)
+        if rec is None:
+            msg = (f"span {k + 1}'s recording {span['recording_id']} is no longer "
+                   "eligible (excluded or unreachable since the plan was drawn)")
+            raise RuntimeError(msg)
+        return self._open_span(
+            rec, float(span["start_s"]), float(span["stop_s"]), self._span_id(plan, k),
+            {"plan_id": plan["plan_id"], "span_index": k + 1,
+             "n_spans": len(plan["spans"]), "seed": plan["seed"], "trial": False},
+        )
+
+    # -- a trial span -------------------------------------------------------
+
+    def _on_trial_clicked(self) -> None:
+        row = self._list.currentRow()
+        if row < 0:
+            self._status.setText("Pick a recording first.")
+            return
+        self.open_recording(self._pool[row])
+
+    def open_recording(self, rec: EligibleRecording, seed: int | None = None) -> SpanSession:
+        """A TRIAL span: one span drawn on ``rec``. Recorded as trial, not audit data."""
+        duration = rec.duration_s
+        if duration is None:
+            duration = float("inf")  # resolved against the loaded length in _open_span
+        seed = secrets.randbits(32) if seed is None else int(seed)
+        stim, _ = stim_epoch_s(None, rec.source, rec.epoch, self._protocol(rec))
+        regions = assessable_regions(duration, stim) if np.isfinite(duration) else None
+        if regions is None:
+            loaded = bridge.load_new_cohort(rec.source, rec.animal, store=self._store)
+            regions = assessable_regions(
+                loaded.recording.data.shape[0] / loaded.recording.fs, stim)
+        placeable = Assessable(recording_id=rec.session, animal=rec.animal,
+                               condition=rec.epoch, regions=regions,
+                               excluded=(stim,) if stim is not None else ()
+                               ).placeable(SPAN_S)
+        if not placeable:
+            msg = f"{rec.session}: no assessable stretch long enough for a {SPAN_S:g} s span"
+            raise ValueError(msg)
+        rng = np.random.default_rng(seed)
+        widths = np.array([b - a for a, b in placeable])
+        i = int(rng.choice(len(placeable), p=widths / widths.sum()))
+        start = float(rng.uniform(*placeable[i]))
+        return self._open_span(rec, start, start + SPAN_S,
+                               f"trial_{round(start * 1000):09d}ms",
+                               {"trial": True, "seed": seed})
+
+    # -- one span (shared) ----------------------------------------------------
+
+    def _open_span(
+        self, rec: EligibleRecording, start: float, stop: float, span_id: str,
+        extra: dict[str, Any],
+    ) -> SpanSession:
+        """Load ``rec`` and enter BLIND on ``[start, stop)``, asserting it is assessable."""
+        loaded = bridge.load_new_cohort(rec.source, rec.animal, store=self._store)
+        if loaded.provenance.get("excluded"):  # defence in depth: never offered
+            msg = f"{rec.session} is excluded: {loaded.provenance['excluded']}"
+            raise RuntimeError(msg)
+        recording = loaded.recording
+        duration = recording.data.shape[0] / recording.fs
+        stim, method = stim_epoch_s(recording, rec.source, rec.epoch, self._protocol(rec))
+        regions = assessable_regions(duration, stim)
+        Assessable(recording_id=rec.session, animal=rec.animal, condition=rec.epoch,
+                   regions=regions, excluded=(stim,) if stim is not None else ())
+        region = next((r for r in regions if r[0] <= start and stop <= r[1]), None)
+        if region is None:
+            msg = (f"{span_id}: [{start:.1f}, {stop:.1f}) is not inside an assessable "
+                   f"region of {rec.session} {regions}")
+            raise ValueError(msg)
+        self._region = region
+        self._rec, self._recording = rec, recording
+        self._session = SpanSession(span_id=span_id, recording_id=rec.session,
+                                    start_s=start, stop_s=stop)
+        self._record = {
+            "session": rec.session, "animal": rec.animal, "epoch": rec.epoch,
+            "source_path": self._store.relpath(rec.source), "span_id": span_id,
+            "span_s": [start, stop], "assessable_regions_s": [list(r) for r in regions],
+            "stim_epoch_s": list(stim) if stim is not None else None,
+            "stim_epoch_method": method, "opened_at": datetime.now(UTC).isoformat(),
+            **extra,
+        }
+        if self.viewer is not None:
+            self.viewer.setParent(None)
+        names = tuple(c.name for c in recording.channels)
+        self.viewer = MultiChannelViewer(ArrayRecording(recording.data, recording.fs),
+                                         channel_names=names,
+                                         channel_colors=_COLOURS[: len(names)])
+        self.viewer.bad_interval_added.connect(self._on_mark)
+        self._centre_lay.insertWidget(0, self.viewer, 1)
+        self.viewer.set_viewport(start, stop)
+        self.ztrace.set_traces([])
+        self._sync()
+        label = ("TRIAL span (not audit data)" if extra.get("trial")
+                 else f"Audit span {extra['span_index']} of {extra['n_spans']}")
+        self._status.setText(f"BLIND - {label}: {rec.folder_name}, {start:.1f}-{stop:.1f} s. "
+                             "Shift+drag to mark every artifact you see.")
+        self._refresh()
+        return self._session
+
+    def _on_mark(self, lo: float, hi: float) -> None:
+        """A Shift+drag in the viewer. Clipped to the span; outside it is refused."""
+        s = self._session
+        if s is None or s.phase is not Phase.BLIND:
+            return
+        a, b = max(lo, s.start_s), min(hi, s.stop_s)
+        if not b > a:
+            self._status.setText("That mark is outside the span and was not recorded.")
+            return
+        s.add_mark(a, b)
+        self._sync()
+        self._status.setText(f"BLIND - {len(s.marks)} mark(s).")
+
+    def undo_mark(self) -> None:
+        """Remove the most recent mark while blind."""
+        s = self._session
+        if s is not None and s.phase is Phase.BLIND and s.marks:
+            s.remove_mark(len(s.marks) - 1)
+            self._sync()
+
+    def commit(self) -> Path | None:
+        """Write marks and the span record to the store, THEN compute and show the reveal."""
+        s, rec = self._session, self._rec
+        if s is None or rec is None or s.phase is not Phase.BLIND:
+            return None
+        out_dir = self._store.audit_dir(rec.animal, rec.session)
+        path = s.commit(out_dir)
+        atomic_write_text(out_dir / f"{s.span_id}_plan.json",
+                          json.dumps(self._record, indent=1, sort_keys=True) + "\n")
+        self._status.setText("Committed. Computing candidates and z-traces...")
+        assert self._region is not None
+        intervals, traces = self._reveal_fn(self._recording, self._region)
+        s.reveal(candidates=intervals, traces=traces)
+        self._sync()
+        self.ztrace.set_traces(traces)
+        try:
+            shown = self._store.relpath(path)
+        except ValueError:
+            shown = str(path)
+        self._status.setText(f"REVEALED - {len(s.marks)} mark(s), {len(intervals)} "
+                             f"candidate(s). Marks saved to {shown}")
+        self._refresh()
+        return path
+
+    def _sync(self) -> None:
+        if self.viewer is not None and self._session is not None:
+            sync_viewer(self.viewer, self._session, float(self._recording.fs))
+
+    def _refresh(self) -> None:
+        blind = self._session is not None and self._session.phase is Phase.BLIND
+        self._undo_btn.setEnabled(blind)
+        self._commit_btn.setEnabled(blind)
+        self._plan_btn.setEnabled(self.plan is None and not blind)
+        if self.plan is None:
+            self.progress.setText(f"No open plan. Creating one draws {N_SPANS} spans.")
+            self._next_btn.setEnabled(False)
+            return
+        done = len(self._committed(self.plan))
+        n = len(self.plan["spans"])
+        self.progress.setText(f"Plan {self.plan['plan_id']}: {done} of {n} spans committed")
+        self._next_btn.setEnabled(not blind and done < n)
+        if done == n:
+            self.progress.setText(f"Plan {self.plan['plan_id']}: all {n} spans committed - done")

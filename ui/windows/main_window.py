@@ -328,6 +328,13 @@ class MainWindow(QMainWindow):
         self._action_show_queue.setCheckable(True)
         self._action_show_queue.toggled.connect(self._on_toggle_queue_panel)
         tools_menu.addAction(self._action_show_queue)
+        # Blind recall audit (task 16 Change 2): pick an eligible new-cohort
+        # recording from the GEMS store, mark one span blind, commit to the store,
+        # then see candidates and z-traces. Its own window, so nothing in this one
+        # can leak candidates into the blind phase.
+        self._action_blind_audit = QAction("Blind recall audit…", self)
+        self._action_blind_audit.triggered.connect(self._open_blind_audit)
+        tools_menu.addAction(self._action_blind_audit)
         # Held-out evaluation: runs the current model against every
         # manifest entry tagged held_out=True (which are excluded from
         # training), reports per-sample model-vs-human agreement. The
@@ -421,6 +428,22 @@ class MainWindow(QMainWindow):
         self._preprocess_window.show()
         self._preprocess_window.raise_()
         self._preprocess_window.activateWindow()
+
+    def _open_blind_audit(self) -> None:
+        """Open the blind recall audit on the GEMS store this machine can reach."""
+        from gems_blanking_v2.io.store import GemsStore, find_gems_root
+
+        from ui.windows.audit_window import AuditWindow
+
+        try:
+            store = GemsStore(find_gems_root())
+        except Exception as exc:  # noqa: BLE001 - shown to the user, not swallowed
+            QMessageBox.warning(self, "Blind recall audit",
+                                f"Cannot find the GEMS store on this machine:\n{exc}")
+            return
+        self._audit_window = AuditWindow(store, parent=None)
+        self._audit_window.resize(1500, 900)
+        self._audit_window.show()
 
     def _open_training_window(self) -> None:
         from ui.windows.training_window import TrainingWindow

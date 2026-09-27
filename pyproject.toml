@@ -41,6 +41,10 @@ dependencies = [
     # review HTMLs. It's imported by ui.windows.main_window indirectly,
     # so the UI fails to start without it.
     "matplotlib>=3.7",
+    # The blind recall audit reads new-cohort recordings, candidates and z-traces
+    # through gems_blanking_v2 (task 16). Declared, and installed editable from its
+    # one checkout - never found by inserting a sibling path (invariant 21).
+    "gems-blanking-v2",
 ]
 
 [project.optional-dependencies]
