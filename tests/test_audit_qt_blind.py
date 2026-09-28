@@ -142,3 +142,35 @@ def test_seconds_convert_to_one_based_samples() -> None:
 
     np.testing.assert_array_equal(got, [[1, 1001]])
     assert seconds_to_samples(np.zeros((0, 2)), 1000.0).shape == (0, 2)
+
+
+@pytest.mark.parametrize(("follow", "x", "expect"), [
+    (True, 12.0, (2.0, 12.0)), (True, -1.0, (0.0, 10.0)), (False, 12.0, (0.0, 10.0)),
+])
+def test_a_mark_dragged_past_the_edge_moves_the_viewport_when_asked(
+    viewer, follow: bool, x: float, expect: tuple[float, float]
+) -> None:
+    """A mark may run past the visible viewport (2026-09-28): the view follows the drag."""
+    viewer.follow_mark_drag = follow
+    viewer._start_pending_region(0, 5.0)
+    viewer._update_pending_region(x)
+    (v0, v1), _ = viewer.plots[0][0].getViewBox().viewRange()
+
+    assert (v0, v1) == pytest.approx(expect, abs=1e-6)
+    viewer._clear_pending_regions()
+
+
+def test_the_viewer_does_not_follow_unless_asked(viewer) -> None:
+    """The main labelling app shares this widget and keeps its behaviour."""
+    assert viewer.follow_mark_drag is False
+
+
+def test_the_viewport_follows_a_drag_back_past_its_left_edge(viewer) -> None:
+    viewer.follow_mark_drag = True
+    viewer.set_viewport(8.0, 18.0)
+    viewer._start_pending_region(0, 12.0)
+    viewer._update_pending_region(6.0)
+    (v0, v1), _ = viewer.plots[0][0].getViewBox().viewRange()
+
+    assert (v0, v1) == pytest.approx((6.0, 16.0), abs=1e-6)
+    viewer._clear_pending_regions()

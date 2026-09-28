@@ -78,6 +78,18 @@ def _block(store: GemsStore, folder: str, epoch_s: float, *, excluded: bool = Fa
     return key
 
 
+@pytest.fixture(autouse=True)
+def _no_modal_commit_dialog(monkeypatch) -> None:
+    """A test must never open the real commit dialog: offscreen it blocks forever.
+    One that reaches it fails loudly instead."""
+    from ui.windows.audit_window import AuditWindow
+
+    def refuse(self, text: str) -> bool:
+        raise AssertionError(f"the commit dialog opened unexpectedly: {text!r}")
+
+    monkeypatch.setattr(AuditWindow, "_confirm_merged", refuse)
+
+
 @pytest.fixture
 def store(tmp_path: Path) -> GemsStore:
     s = GemsStore.initialise(tmp_path / "gems")
@@ -548,3 +560,63 @@ def test_parallel_budget_rows_equal_serial_rows_in_sample_order(
                                      workers=3, executor=ThreadPoolExecutor)
     assert parallel["recordings"] == serial["recordings"]
     assert len({r["candidates"] for r in serial["recordings"]}) > 1
+
+
+def _open_span(store: GemsStore, **kw):
+    from ui.windows.audit_window import AuditWindow
+
+    _small_pool(store)
+    w = AuditWindow(store, reveal_fn=lambda r, g: (np.zeros((0, 2)), []), **kw)
+    w.create_plan(seed=7)
+    return w, w.open_next_span()
+
+
+def test_overlapping_marks_are_shown_merged_and_cancel_keeps_the_span_blind(
+    qapp, store: GemsStore
+) -> None:
+    """Andrea, 2026-09-28: overlapping or touching marks are one artifact. The window
+    shows that, with a count, before she confirms; the file keeps the marks as drawn."""
+    from ui.audit.session import Phase
+
+    asked: list[str] = []
+    answer = [False]
+    w, s = _open_span(store, confirm_commit=lambda text: (asked.append(text), answer[0])[1])
+    t0 = s.start_s
+    w._on_mark(t0 + 10.0, t0 + 11.0)
+    w._on_mark(t0 + 10.8, t0 + 11.5)  # overlaps the first
+    w._on_mark(t0 + 11.55, t0 + 12.0)  # 50 ms after: kept separate, but named
+
+    assert w.commit() is None and w._session.phase is Phase.BLIND
+    assert not list(store.audit_dir(w._rec.animal, w._rec.session).glob("*_blind_marks.json"))
+    assert asked[0].startswith("3 marks -> 2 artifacts.")
+    assert "marks 1 + 2 overlap or touch" in asked[0] and "50 ms apart" in asked[0]
+
+    answer[0] = True
+    path = w.commit()
+    assert path is not None and len(asked) == 2
+    saved = json.loads(path.read_text(encoding="utf-8"))["marks"]
+    assert len(saved) == 3  # as drawn: the merge is a scoring step, not an edit
+
+
+def test_marks_that_do_not_touch_commit_without_asking(qapp, store: GemsStore) -> None:
+    def refuse(text: str) -> bool:
+        raise AssertionError("asked although nothing merges")
+
+    w, s = _open_span(store, confirm_commit=refuse)
+    w._on_mark(s.start_s + 10.0, s.start_s + 11.0)
+    w._on_mark(s.start_s + 12.0, s.start_s + 13.0)
+    assert w.commit() is not None
+    assert w.last_merge_summary is not None and w.last_merge_summary.startswith(
+        "2 marks -> 2 artifacts.")
+
+
+def test_the_window_lets_a_mark_run_past_the_viewport(qapp, store: GemsStore) -> None:
+    w, _s = _open_span(store)
+    assert w.viewer is not None and w.viewer.follow_mark_drag is True
+
+
+def test_a_new_plan_declares_the_merged_scoring_unit(qapp, store: GemsStore) -> None:
+    """Declared before labelling, so the scorer reads the unit from the plan."""
+    w, _s = _open_span(store)
+    on_disk = json.loads(store.audit_plan_path(w.plan["plan_id"]).read_text(encoding="utf-8"))
+    assert on_disk["scoring_unit"] == "merged"

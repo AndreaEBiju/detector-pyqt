@@ -289,6 +289,10 @@ class MultiChannelViewer(pg.GraphicsLayoutWidget):
         # commit; bad_interval_added emitted.
         self._mark_active: bool = False
         self._mark_start_sec: Optional[float] = None
+        # When True, a Shift+drag past the visible edge moves the viewport with it, so
+        # a mark can extend beyond what was on screen when it began (the audit window
+        # sets this; Andrea split one artifact into several marks without it).
+        self.follow_mark_drag: bool = False
         self._mark_active_plot_idx: Optional[int] = None
 
         self.plots: list[tuple[pg.PlotItem, pg.PlotDataItem]] = []
@@ -553,11 +557,25 @@ class MultiChannelViewer(pg.GraphicsLayoutWidget):
         """Resize the pending region as Shift+drag continues."""
         if not self._mark_active or self._mark_start_sec is None:
             return
+        if self.follow_mark_drag:
+            self._follow(x_sec)
         lo = min(self._mark_start_sec, x_sec)
         hi = max(self._mark_start_sec, x_sec)
         for region in self._pending_items:
             if region is not None:
                 region.setRegion((lo, hi))
+
+    def _follow(self, x_sec: float) -> None:
+        """Shift the viewport, same width, so ``x_sec`` is back on screen."""
+        (v0, v1), _ = self.plots[0][0].getViewBox().viewRange()
+        width = v1 - v0
+        dur = float(self.recording.duration_sec)
+        if x_sec > v1:
+            hi = min(x_sec, dur)
+            self.set_viewport(max(hi - width, 0.0), hi)
+        elif x_sec < v0:
+            lo = max(x_sec, 0.0)
+            self.set_viewport(lo, min(lo + width, dur))
 
     def _commit_pending_region(self, x_sec: float) -> None:
         """Mouse-release ends the drag. Emit bad_interval_added with

@@ -80,12 +80,15 @@ class AuditWindow(QMainWindow):
 
     def __init__(
         self, store: GemsStore, *, reveal_fn: RevealFn | None = None,
+        confirm_commit: Callable[[str], bool] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Blind recall audit")
         self._store = store
         self._reveal_fn: RevealFn = reveal_fn or bridge.reveal_for_region
+        self._confirm_commit: Callable[[str], bool] = confirm_commit or self._confirm_merged
+        self.last_merge_summary: str | None = None
         self._pool = eligible_recordings(store)
         self.last_error: str | None = None
         self._book = load_protocol_book(store.root / PROTOCOL_FILENAME)
@@ -201,6 +204,9 @@ class AuditWindow(QMainWindow):
         record = {
             "plan_id": plan_id, "created_at": datetime.now(UTC).isoformat(),
             **drawn.to_json(), "pool_size": len(pool),
+            # Declared before any labelling (Andrea, 2026-09-28): one artifact is one
+            # connected run of committed marks. The scorer reads it from here.
+            "scoring_unit": recall.CURRENT_SCORING_UNIT,
             "pool_rule": "eligible (non-excluded) baseline and stim_recovery recordings "
                          "with a recorded duration; stim_recovery loses 0 to "
                          "stim_duration + tolerance s; 20 s edge guards",
@@ -385,6 +391,7 @@ class AuditWindow(QMainWindow):
                                          channel_names=names,
                                          channel_colors=_COLOURS[: len(names)])
         self.viewer.bad_interval_added.connect(self._on_mark)
+        self.viewer.follow_mark_drag = True  # a mark may run past the viewport
         self._centre_lay.insertWidget(0, self.viewer, 1)
         self.viewer.set_viewport(start, stop)
         self._shade_outside_span(start, stop, recording.data.shape[0] / recording.fs)
@@ -442,10 +449,48 @@ class AuditWindow(QMainWindow):
             s.remove_mark(len(s.marks) - 1)
             self._sync()
 
+    def merge_summary(self) -> tuple[int, int, str]:
+        """``(marks, artifacts, text)`` for the open span: overlapping or touching marks
+        merged, as the scorer will count them, and close-but-separate pairs named."""
+        s = self._session
+        marks = [(m.start_s, m.stop_s) for m in (s.marks if s else [])]
+        if not marks:
+            return 0, 0, "No marks."
+        merged, groups = recall.merge_marks(marks)
+        order = sorted(range(len(marks)), key=lambda i: marks[i])
+        num = {i: k + 1 for k, i in enumerate(order)}  # 1-based, in time order
+        lines = [f"{len(marks)} marks -> {len(merged)} artifacts."]
+        for (a, b), g in zip(merged, groups, strict=True):
+            if len(g) > 1:
+                lines.append(f"  marks {' + '.join(str(num[i]) for i in sorted(g, key=num.get))} "
+                             f"overlap or touch: one artifact, {a:.2f}-{b:.2f} s")
+        close = recall.close_pairs(marks)
+        if close:
+            lines.append("Kept separate (gap under 100 ms - two artifacts if you meant two):")
+            lines += [f"  marks {num[i]} and {num[j]}, {1000 * gap:.0f} ms apart"
+                      for i, j, gap in close]
+        return len(marks), len(merged), "\n".join(lines)
+
+    def _confirm_merged(self, text: str) -> bool:
+        box = QMessageBox(QMessageBox.Question, "Commit - marks merged", text + "\n\nCommit "
+                          "these marks? They are saved exactly as drawn; the merge is how "
+                          "they are scored.", QMessageBox.Ok | QMessageBox.Cancel, self)
+        return box.exec() == QMessageBox.Ok
+
     def commit(self) -> Path | None:
-        """Write marks and the span record to the store, THEN compute and show the reveal."""
+        """Write marks and the span record to the store, THEN compute and show the reveal.
+
+        When marks overlap or touch, the merged view and its count are shown first and
+        the commit waits for confirmation (Andrea, 2026-09-28); Cancel keeps the span
+        blind. The marks file records the marks exactly as drawn.
+        """
         s, rec = self._session, self._rec
         if s is None or rec is None or s.phase is not Phase.BLIND:
+            return None
+        n_marks, n_artifacts, text = self.merge_summary()
+        self.last_merge_summary = text
+        if n_artifacts < n_marks and not self._confirm_commit(text):
+            self._status.setText(f"BLIND - not committed. {text.splitlines()[0]}")
             return None
         out_dir = self._store.audit_dir(rec.animal, rec.session)
         path = s.commit(out_dir)
