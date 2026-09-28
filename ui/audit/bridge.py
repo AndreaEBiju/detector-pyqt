@@ -14,15 +14,12 @@ something rather than moving it between shapes, it is in the wrong repository.
 
 from __future__ import annotations
 
-import logging
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-
-_log = logging.getLogger(__name__)
 
 # ``gems_blanking_v2`` is a DECLARED dependency (pyproject ``dependencies``), installed
 # into the environment - never located by inserting a sibling checkout into
@@ -74,32 +71,6 @@ def load_new_cohort(path: Path, animal: str, **kw: Any):
     return load_recording(Path(path), animal, **kw)
 
 
-def z_by_pair(
-    data: np.ndarray, fs: float, names: list[str], bands: tuple[str, ...] | None = None
-) -> dict[tuple[str, str], np.ndarray]:
-    """Compute z for every ``(signal, band)`` pair, using tasks 06's machinery.
-
-    Each signal is thresholded against **its own** reference (invariant 3), which
-    is why this loops rather than pooling: borrowing one signal's sigma for
-    another was measured at 1136 true / 19,624 false detections.
-    """
-    from gems_blanking_v2.bands.envelope import band_envelope_for, log_envelope
-    from gems_blanking_v2.bands.reference import epoch_reference
-    from gems_blanking_v2.bands.zscore import zscore
-    from gems_blanking_v2.constants import BANDS
-
-    use = bands if bands is not None else tuple(BANDS)
-    out: dict[tuple[str, str], np.ndarray] = {}
-    for col, name in enumerate(names):
-        x = np.asarray(data[:, col], dtype=np.float64)
-        for band in use:
-            env = band_envelope_for(x, fs, band)
-            log_env = log_envelope(env)
-            ref = epoch_reference(log_env, signal=name, band=band)
-            out[(name, band)] = zscore(log_env, ref, signal=name, band=band)
-    return out
-
-
 def reduce_to_band_traces(
     z: dict[tuple[str, str], np.ndarray], z_enter: float, grid_s: float
 ) -> list[BandTrace]:
@@ -142,88 +113,30 @@ def reduce_to_band_traces(
     return traces
 
 
-def candidates_for(
-    z: dict[tuple[str, str], np.ndarray], beats: Any, **kw: Any
-):
-    """Task 07's ``candidate_report``. Returns the report, not a bare list.
-
-    The report, deliberately: task 07 makes ``CandidateReport`` the exported
-    contract so a consumer cannot receive the candidate list without the
-    ``over_cap`` and ``cardiac_windows`` state that says how to treat it.
-    """
-    from gems_blanking_v2.detect.candidates import candidate_report
-
-    return candidate_report(z, beats, **kw)
-
-
-def intervals_from_candidates(report: Any) -> np.ndarray:
-    """``(n, 2)`` float seconds, the shape ``MultiChannelViewer`` overlays want."""
-    spans = [(c.start_s, c.stop_s) for c in report.candidates]
-    if not spans:
-        return np.zeros((0, 2), dtype=np.float64)
-    return np.asarray(spans, dtype=np.float64)
-
-
 def reveal_for_region(
     rec: Any, region: tuple[float, float], z_enter: float | None = None
 ) -> tuple[np.ndarray, list[BandTrace]]:
     """Candidates and the six band traces for one assessable region.
 
-    Everything is task 03-07 machinery, composed rather than reimplemented: the
-    detection signal set is ``build_derivations`` (per cuff V1-V3 and T, plus
-    ``stomach_ref`` - ``constants.NERVE_SIGNALS`` / ``STOMACH_SIGNALS``), beats come
-    from ``detect_rpeaks`` on the right-cuff tripole, and z uses each signal's own
-    whole-epoch reference (invariants 3 and 5). Computed on the REGION (the
-    baseline, or the recovery epoch of a stim/recovery file) so the stim epoch
-    never enters a reference, then placed on the recording's own timeline: the
-    candidate intervals are offset by the region start and each trace is padded
-    with NaN frames ("not assessable here") up to it.
-
-    ``z_enter`` defaults to the generator's own pinned threshold
-    (``recall.Z_ENTER``, read from ``candidate_report``), never a copy of it here:
-    a second literal would leave the reveal at the old value the day task 09 pins
-    a new one, while the diagnosis moved (invariants 33 and 39).
-
-    Contacts that fail ``contact_quality``'s screen (flat, a copy, or off the cuff)
-    are left out of the max, with their cuff's ``T`` (invariant 41; adopted
-    2026-09-28). The screen reads the first 120 s of the REGION, the same data the
-    reference is computed on, and what it removed is logged.
+    The detection itself is ``gems_blanking_v2.detect.chain.detect_region`` - the
+    one construction site production shares (invariant 33; moved out of this file
+    2026-09-28, and proved to give identical candidates on the 60 budget regions
+    and the 5 round-1 regions). This function only places its result on the
+    recording's own timeline for display: the candidate intervals already are, and
+    each trace is padded with NaN frames ("not assessable here") up to the region
+    start. ``z_enter`` defaults to the generator's own.
     """
-    from dataclasses import replace
-
     from gems_blanking_v2.constants import GRID_S
-    from gems_blanking_v2.derive.contact_quality import (
-        assess_contacts,
-        screened_signals,
-    )
-    from gems_blanking_v2.derive.derivations import build_derivations
-    from gems_blanking_v2.detect.recall import Z_ENTER
-    from gems_blanking_v2.physio.rpeaks import detect_rpeaks
+    from gems_blanking_v2.detect import chain
 
-    if z_enter is None:
-        z_enter = Z_ENTER
-    lo, hi = region
-    i0, i1 = round(lo * rec.fs), round(hi * rec.fs)
-    sub = replace(rec, data=rec.data[i0:i1])
-    signals, _weights = build_derivations(sub)
-    quality = assess_contacts(sub)
-    dropped = screened_signals(quality)
-    if dropped:
-        why = {k: q.reasons for k, q in quality.items() if q.screened}
-        _log.warning("contact screen removed %s from detection (%s)", sorted(dropped), why)
-    names = sorted(n for n in signals if n not in dropped)
-    stack = np.column_stack([signals[n] for n in names])
-    z = z_by_pair(stack, float(rec.fs), names)
-    beats = detect_rpeaks(signals["R_T"], float(rec.fs))
-    report = candidates_for(z, beats, z_enter=z_enter)
-    intervals = intervals_from_candidates(report) + lo
-    pad = round(lo / GRID_S)
+    found = chain.detect_region(rec, region, z_enter=z_enter)
+    pad = round(region[0] / GRID_S)
     traces = [
         BandTrace(band=t.band, z_max=np.concatenate([np.full(pad, np.nan), t.z_max]),
                   winner=("",) * pad + t.winner, grid_s=t.grid_s, z_enter=t.z_enter)
-        for t in reduce_to_band_traces(z, z_enter=z_enter, grid_s=GRID_S)
+        for t in reduce_to_band_traces(found.z, z_enter=found.report.z_enter, grid_s=GRID_S)
     ]
-    return intervals, traces
+    return found.intervals, traces
 
 
 def reveal_sha() -> str:

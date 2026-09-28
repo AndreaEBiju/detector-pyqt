@@ -85,64 +85,32 @@ def test_a_time_outside_the_trace_returns_nan_rather_than_wrapping() -> None:
     assert np.isnan(t.at(99.0)[0])
 
 
-def _stub_reveal(monkeypatch, signals: list[str], screened: dict[str, tuple]) -> dict:
-    """Stub reveal_for_region's stages; return what it passed downstream.
-
-    ``screened`` maps a contact label (``"L3"``) to the reasons its screen fired.
-    """
-    import dataclasses
+def test_the_reveal_is_the_gems_chain_placed_on_the_recordings_timeline(monkeypatch) -> None:
+    """Invariant 33: the bridge detects nothing itself. It calls
+    ``gems_blanking_v2.detect.chain.detect_region`` - the construction site production
+    shares - passes z_enter through, and only pads the traces up to the region start."""
     from types import SimpleNamespace
 
-    from gems_blanking_v2.derive import contact_quality, derivations
-    from gems_blanking_v2.physio import rpeaks
+    from gems_blanking_v2.detect import chain
 
     from ui.audit import bridge
 
-    seen: dict = {}
-    monkeypatch.setattr(derivations, "build_derivations",
-                        lambda rec: ({n: np.zeros(rec.data.shape[0]) for n in signals}, {}))
-    quality = {lab: SimpleNamespace(cuff_id=lab[0], contact_index=int(lab[1:]), reasons=why,
-                                    screened=bool(why))
-               for lab, why in screened.items()}
-    monkeypatch.setattr(contact_quality, "assess_contacts", lambda rec: quality)
-    monkeypatch.setattr(rpeaks, "detect_rpeaks", lambda x, fs: None)
+    seen: list = []
+    intervals = np.array([[12.0, 12.5], [30.0, 31.0]])
 
-    def z_by_pair(stack, fs, names):
-        seen["names"] = list(names)
-        return {(n, "0-2"): np.zeros(10) for n in names}
+    def fake(rec, region, *, z_enter=None):
+        seen.append((region, z_enter))
+        return SimpleNamespace(intervals=intervals, report=SimpleNamespace(z_enter=2.75),
+                               z={("R_T", "0-2"): np.array([1.0, 4.0])})
 
-    def capture(z, beats, **kw):
-        seen["z_enter"] = kw["z_enter"]
-        return SimpleNamespace(candidates=[])
+    monkeypatch.setattr(chain, "detect_region", fake)
+    got, traces = bridge.reveal_for_region(object(), (10.0, 20.0), z_enter=2.75)
 
-    monkeypatch.setattr(bridge, "z_by_pair", z_by_pair)
-    monkeypatch.setattr(bridge, "candidates_for", capture)
-    monkeypatch.setattr(dataclasses, "replace", lambda r, data: SimpleNamespace(fs=r.fs, data=data))
-    rec = SimpleNamespace(fs=100.0, data=np.zeros((1000, 1)))
-    _intervals, seen["traces"] = bridge.reveal_for_region(rec, (0.0, 10.0))
-    return seen
-
-
-def test_the_reveal_uses_the_generators_pinned_threshold(monkeypatch) -> None:
-    """One source for z_enter: the reveal must follow ``recall.Z_ENTER``.
-
-    A literal default here would keep revealing at the old threshold the day task
-    09 pins a new one, while the miss diagnosis moved with the generator - two
-    halves of one score using two thresholds, and nothing would raise.
-    """
-    from gems_blanking_v2.detect import recall
-
-    monkeypatch.setattr(recall, "Z_ENTER", 2.25)
-    seen = _stub_reveal(monkeypatch, ["R_T"], {})
-
-    assert seen["z_enter"] == 2.25
-    assert {t.z_enter for t in seen["traces"]} == {2.25}
-
-
-def test_a_screened_contact_leaves_the_max_with_its_cuffs_tripole(monkeypatch) -> None:
-    """Invariant 41: an off-cuff contact's z means nothing, and neither does its T."""
-    signals = ["L_T", "L_V1", "L_V2", "L_V3", "R_T", "R_V1", "R_V2", "R_V3", "stomach_ref"]
-    seen = _stub_reveal(monkeypatch, signals, {"L3": ("uncorrelated",), "L1": (), "R2": ()})
-
-    assert seen["names"] == ["L_V1", "L_V2", "R_T", "R_V1", "R_V2", "R_V3", "stomach_ref"]
-    assert _stub_reveal(monkeypatch, signals, {"L3": ()})["names"] == signals
+    assert seen == [((10.0, 20.0), 2.75)]
+    assert got is intervals
+    (t,) = traces
+    assert t.z_enter == 2.75 and t.z_max.size == 1000 + 2  # 10 s of NaN frames, then z
+    assert np.isnan(t.z_max[:1000]).all() and list(t.z_max[1000:]) == [1.0, 4.0]
+    assert t.winner[1000:] == ("R_T", "R_T")
+    bridge.reveal_for_region(object(), (0.0, 5.0))
+    assert seen[-1] == ((0.0, 5.0), None)  # the generator's own z_enter, not restated
