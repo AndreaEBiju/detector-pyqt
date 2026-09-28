@@ -8,6 +8,8 @@ Usage::
                                                 #   "tuning check, not gate evidence"
     python -m ui.audit.score --pooled           # the cumulative gate over eligible rounds
     python -m ui.audit.score --check-next       # may another round be drawn now?
+    python -m ui.audit.score --measure-budget [PER_CELL [SEED]]
+                                                # candidates per recording on the pool
 
 The scoring itself is ``gems_blanking_v2.detect.recall`` (pre-declared 2026-09-26).
 This runner supplies the candidates and z-traces. The audit window keeps its reveal
@@ -33,7 +35,6 @@ from gems_blanking_v2.detect.recall import (
     check_next_round,
     pooled_gate,
     score_stored_round,
-    source_sha256,
 )
 from gems_blanking_v2.io.store import GemsStore, find_gems_root
 
@@ -98,9 +99,20 @@ def main(argv: list[str]) -> int:
     """Command-line entry point."""
     store = GemsStore(find_gems_root())
     if argv == ["--check-next"]:
-        ok, why = check_next_round(store)
+        ok, why = check_next_round(store, reveal_sha=bridge.reveal_sha())
         print(("ALLOWED: " if ok else "REFUSED: ") + why)
         return 0 if ok else 1
+    if argv[:1] == ["--measure-budget"]:
+        from ui.audit.budget import measure_budget
+
+        per_cell = int(argv[1]) if len(argv) > 1 else 5
+        seed = int(argv[2]) if len(argv) > 2 else 20260928
+        rec = measure_budget(store, per_cell=per_cell, seed=seed)
+        print(json.dumps({k: rec[k] for k in ("key", "n_recordings", "candidates_median",
+                                               "candidates_quantile", "fraction_over_budget",
+                                               "time_covered_median", "within_budget")},
+                         indent=1))
+        return 0 if rec["within_budget"] else 1
     if argv == ["--pooled"]:
         print(json.dumps(pooled_gate(store), indent=1))
         return 0
@@ -114,7 +126,7 @@ def main(argv: list[str]) -> int:
         "reveal": "ui.audit.bridge.reveal_for_region (recomputed)",
         # The reveal's composition lives here, not in the package the generator hash
         # covers, so it is hashed too.
-        "reveal_source_sha256": source_sha256(Path(bridge.__file__).resolve().parent),
+        "reveal_source_sha256": bridge.reveal_sha(),
         "detector_pyqt_commit": _commit(_REPO),
         # The installed package's own checkout (an editable install), never a
         # sibling folder found by name (invariant 21).

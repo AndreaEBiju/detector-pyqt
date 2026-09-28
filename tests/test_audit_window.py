@@ -82,7 +82,24 @@ def _block(store: GemsStore, folder: str, epoch_s: float, *, excluded: bool = Fa
 def store(tmp_path: Path) -> GemsStore:
     s = GemsStore.initialise(tmp_path / "gems")
     write_protocol_book(default_protocol_book(), s.root / PROTOCOL_FILENAME)
+    _within_budget(s)
     return s
+
+
+def _within_budget(s: GemsStore) -> None:
+    """A budget measurement for the generator and reveal under test, within budget."""
+    from gems_blanking_v2.detect.recall import (
+        BUDGET_MIN_RECORDINGS,
+        budget_record,
+        write_budget,
+    )
+
+    from ui.audit import bridge
+
+    rows = [{"animal": "J", "condition": "baseline", "session": f"s{i}", "folder": f"f{i}",
+             "candidates": 500, "assessable_s": 560.0, "covered_s": 30.0}
+            for i in range(BUDGET_MIN_RECORDINGS)]
+    write_budget(s, budget_record(rows, reveal_sha=bridge.reveal_sha(), sample_rule="test"))
 
 
 def test_a_blind_span_is_marked_committed_to_the_store_and_revealed(
@@ -315,6 +332,7 @@ def test_a_recompute_that_differs_from_the_reveal_is_refused_and_a_legacy_span_w
     assert len(legacy.warnings) == 5
     assert all("without candidate digests" in w for w in legacy.warnings)
 
+
 def _real_shift_drag(qapp, w, x0: float, x1: float) -> None:
     """A Shift+drag through Qt mouse events on channel 0, from x0 to x1 seconds."""
     from PySide6.QtCore import QPointF, Qt
@@ -380,6 +398,7 @@ def test_scrolling_off_the_span_is_shaded_refused_clearly_and_one_click_back(
     qapp.processEvents()
     assert w.viewer.time_range == (s.start_s, s.stop_s)
 
+
 def test_an_animal_excluded_mid_round_is_replaced_without_touching_committed_spans(
     qapp, store: GemsStore
 ) -> None:
@@ -440,3 +459,52 @@ def test_an_animal_excluded_mid_round_is_replaced_without_touching_committed_spa
     # the plan carries on: the next span opens, from an eligible recording
     nxt = w2.open_next_span()
     assert nxt is not None and "span 2 of 5" in w2._status.text().lower()
+
+
+
+def test_no_plan_is_drawn_until_the_generator_is_measured_within_budget(
+    qapp, tmp_path: Path
+) -> None:
+    """Task 09's budget, enforced at the button: round 1 cleared recall by coverage."""
+    from gems_blanking_v2.detect.recall import budget_record, write_budget
+
+    from ui.audit import bridge
+    from ui.windows.audit_window import AuditWindow
+
+    s = GemsStore.initialise(tmp_path / "gems")
+    write_protocol_book(default_protocol_book(), s.root / PROTOCOL_FILENAME)
+    _three_recordings(s)
+    w = AuditWindow(s, reveal_fn=lambda r, g: (np.zeros((0, 2)), []))
+    w._plan_btn.click()
+    assert w.plan is None and "has not been measured" in (w.last_error or "")
+
+    rows = [{"animal": "J", "condition": "baseline", "session": f"s{i}", "folder": f"f{i}",
+             "candidates": 13_000, "assessable_s": 1200.0, "covered_s": 1150.0}
+            for i in range(30)]
+    write_budget(s, budget_record(rows, reveal_sha=bridge.reveal_sha(), sample_rule="test"))
+    w._plan_btn.click()
+    assert w.plan is None and "exceeds the candidate budget" in (w.last_error or "")
+
+    _within_budget(s)
+    w.last_error = None
+    w._plan_btn.click()
+    assert w.last_error is None and w.plan is not None
+
+
+def test_the_budget_is_measured_as_the_window_reveals(qapp, store: GemsStore, monkeypatch) -> None:
+    from ui.audit import bridge, budget
+
+    _three_recordings(store)
+    calls = []
+
+    def fake(recording, region):
+        calls.append(region)
+        lo = region[0]
+        return np.array([[lo + 10.0, lo + 20.0], [lo + 15.0, lo + 30.0]]), []
+
+    monkeypatch.setattr(bridge, "reveal_for_region", fake)
+    rec = budget.measure_budget(store, per_cell=5, seed=1, progress=lambda m: None)
+    assert rec["n_recordings"] == 3 and len(calls) == 3
+    row = rec["recordings"][0]
+    assert row["candidates"] == 2 and row["covered_s"] == pytest.approx(20.0)  # union 10-30
+    assert rec["within_budget"] is False  # 3 recordings < the minimum: not a measurement

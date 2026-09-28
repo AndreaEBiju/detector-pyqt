@@ -199,3 +199,15 @@ def reveal_for_region(
         for t in reduce_to_band_traces(z, z_enter=z_enter, grid_s=GRID_S)
     ]
     return intervals, traces
+
+
+def reveal_sha() -> str:
+    """Hash of this module's source - the reveal composition a score or budget used.
+
+    LF-normalised, so Windows and macOS checkouts agree. A budget measured under
+    one reveal does not license a round under another (``recall.budget_status``).
+    """
+    import hashlib
+    from pathlib import Path
+
+    return hashlib.sha256(Path(__file__).read_bytes().replace(b"\r\n", b"\n")).hexdigest()
