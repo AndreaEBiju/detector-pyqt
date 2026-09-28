@@ -54,6 +54,16 @@ def viewer(qapp, tmp_path_factory):
     v = MultiChannelViewer(rec)
     v.set_viewport(0.0, 10.0)
     yield v
+    # Destroy the widget BEFORE closing the file it reads. Closing the file first
+    # left a live viewer over a closed HDF5 dataset until garbage collection, and a
+    # later paint read through it: an access violation in 3-4 of 6 full-suite runs
+    # once test ordering changed (2026-09-28).
+    from PySide6.QtCore import QCoreApplication, QEvent
+
+    v.close()
+    v.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    del v
     rec.close()
 
 

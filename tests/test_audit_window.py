@@ -207,10 +207,13 @@ def test_the_buttons_draw_a_random_seed_and_advance_the_plan(qapp, store: GemsSt
     become the seed (it did - every plan was seed 0)."""
     from ui.windows.audit_window import AuditWindow
 
-    # 600 s (the shortest real recording): wherever a first 120 s span lands in
-    # the 560 s assessable region, a second still fits, so any seed can place five.
+    # 600 s (the shortest real recording): wherever a first 120 s span lands in the
+    # 560 s assessable region a second still fits, but a THIRD may not - and with two
+    # animals the round-robin gives the first animal three of the five spans. So each
+    # animal has two recordings, and no recording ever needs three (1.2% of seeds
+    # failed with one D recording; 0 of 3000 with two).
     for i, folder in enumerate(["gems_j_t01_ms3_bl_230315", "gems_j_t01_ms1_bl_164532",
-                                "gems_d_t01_es1_bl_200359"]):
+                                "gems_d_t01_es1_bl_200359", "gems_d_t02_es1_bl_210933"]):
         _block(store, folder, 1_789_527_801.0 + 3600 * i, fs=1000.0, duration_s=600.0)
     seeds = []
     for _ in range(3):
@@ -244,9 +247,14 @@ def test_an_empty_store_says_why_instead_of_failing_silently(qapp, store: GemsSt
 
 
 
-def _three_recordings(store: GemsStore) -> None:
+def _small_pool(store: GemsStore) -> None:
+    """Two animals, two 600 s recordings each: every seed can place five spans.
+
+    With one recording for an animal, the round-robin can ask it for three spans,
+    and two unlucky placements leave no room for the third (1.2% of seeds).
+    """
     for i, folder in enumerate(["gems_j_t01_ms3_bl_230315", "gems_j_t01_ms1_bl_164532",
-                                "gems_d_t01_es1_bl_200359"]):
+                                "gems_d_t01_es1_bl_200359", "gems_d_t02_es1_bl_210933"]):
         _block(store, folder, 1_789_527_801.0 + 3600 * i, fs=1000.0, duration_s=600.0)
 
 
@@ -282,7 +290,7 @@ def test_a_second_round_waits_for_the_first_to_be_scored_and_clean(
     def covering(region):  # every mark covered
         return np.array([[region[0], region[1]]]), []
 
-    _three_recordings(store)
+    _small_pool(store)
     plan_id = _label_round(store, lambda r, g: covering(g))
     spans = load_round(store, plan_id)[1]
     for sp in spans:  # the window digested exactly what it revealed
@@ -315,7 +323,7 @@ def test_a_recompute_that_differs_from_the_reveal_is_refused_and_a_legacy_span_w
     def shown(region):
         return np.array([[region[0] + 1.0, region[0] + 1.5]]), []
 
-    _three_recordings(store)
+    _small_pool(store)
     plan_id = _label_round(store, lambda r, g: shown(g))
     monkeypatch.setattr(bridge, "reveal_for_region",  # a different generator
                         lambda rec, region: (np.array([[region[0] + 2.0, region[0] + 2.5]]), []))
@@ -362,7 +370,7 @@ def test_scrolling_off_the_span_is_shaded_refused_clearly_and_one_click_back(
 
     from ui.windows.audit_window import AuditWindow
 
-    _three_recordings(store)
+    _small_pool(store)
     w = AuditWindow(store, reveal_fn=lambda r, g: (np.zeros((0, 2)), []))
     w.resize(1500, 900)
     w.show()
@@ -473,7 +481,7 @@ def test_no_plan_is_drawn_until_the_generator_is_measured_within_budget(
 
     s = GemsStore.initialise(tmp_path / "gems")
     write_protocol_book(default_protocol_book(), s.root / PROTOCOL_FILENAME)
-    _three_recordings(s)
+    _small_pool(s)
     w = AuditWindow(s, reveal_fn=lambda r, g: (np.zeros((0, 2)), []))
     w._plan_btn.click()
     assert w.plan is None and "has not been measured" in (w.last_error or "")
@@ -494,7 +502,7 @@ def test_no_plan_is_drawn_until_the_generator_is_measured_within_budget(
 def test_the_budget_is_measured_as_the_window_reveals(qapp, store: GemsStore, monkeypatch) -> None:
     from ui.audit import bridge, budget
 
-    _three_recordings(store)
+    _small_pool(store)
     calls = []
 
     def fake(recording, region):
@@ -504,10 +512,10 @@ def test_the_budget_is_measured_as_the_window_reveals(qapp, store: GemsStore, mo
 
     monkeypatch.setattr(bridge, "reveal_for_region", fake)
     rec = budget.measure_budget(store, per_cell=5, seed=1, progress=lambda m: None)
-    assert rec["n_recordings"] == 3 and len(calls) == 3
+    assert rec["n_recordings"] == 4 and len(calls) == 4
     row = rec["recordings"][0]
     assert row["candidates"] == 2 and row["covered_s"] == pytest.approx(20.0)  # union 10-30
-    assert rec["within_budget"] is False  # 3 recordings < the minimum: not a measurement
+    assert rec["within_budget"] is False  # 4 recordings < the minimum: not a measurement
 
 
 def test_parallel_budget_rows_equal_serial_rows_in_sample_order(
@@ -520,7 +528,7 @@ def test_parallel_budget_rows_equal_serial_rows_in_sample_order(
 
     from ui.audit import bridge, budget
 
-    _three_recordings(store)
+    _small_pool(store)
 
     calls: list[str] = []
     lock = threading.Lock()
