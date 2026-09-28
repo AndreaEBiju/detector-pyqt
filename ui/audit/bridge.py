@@ -14,12 +14,15 @@ something rather than moving it between shapes, it is in the wrong repository.
 
 from __future__ import annotations
 
+import logging
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+_log = logging.getLogger(__name__)
 
 # ``gems_blanking_v2`` is a DECLARED dependency (pyproject ``dependencies``), installed
 # into the environment - never located by inserting a sibling checkout into
@@ -162,7 +165,7 @@ def intervals_from_candidates(report: Any) -> np.ndarray:
 
 
 def reveal_for_region(
-    rec: Any, region: tuple[float, float], z_enter: float = 3.0
+    rec: Any, region: tuple[float, float], z_enter: float | None = None
 ) -> tuple[np.ndarray, list[BandTrace]]:
     """Candidates and the six band traces for one assessable region.
 
@@ -175,18 +178,40 @@ def reveal_for_region(
     never enters a reference, then placed on the recording's own timeline: the
     candidate intervals are offset by the region start and each trace is padded
     with NaN frames ("not assessable here") up to it.
+
+    ``z_enter`` defaults to the generator's own pinned threshold
+    (``recall.Z_ENTER``, read from ``candidate_report``), never a copy of it here:
+    a second literal would leave the reveal at the old value the day task 09 pins
+    a new one, while the diagnosis moved (invariants 33 and 39).
+
+    Contacts that fail ``contact_quality``'s screen (flat, a copy, or off the cuff)
+    are left out of the max, with their cuff's ``T`` (invariant 41; adopted
+    2026-09-28). The screen reads the first 120 s of the REGION, the same data the
+    reference is computed on, and what it removed is logged.
     """
     from dataclasses import replace
 
     from gems_blanking_v2.constants import GRID_S
+    from gems_blanking_v2.derive.contact_quality import (
+        assess_contacts,
+        screened_signals,
+    )
     from gems_blanking_v2.derive.derivations import build_derivations
+    from gems_blanking_v2.detect.recall import Z_ENTER
     from gems_blanking_v2.physio.rpeaks import detect_rpeaks
 
+    if z_enter is None:
+        z_enter = Z_ENTER
     lo, hi = region
     i0, i1 = round(lo * rec.fs), round(hi * rec.fs)
     sub = replace(rec, data=rec.data[i0:i1])
     signals, _weights = build_derivations(sub)
-    names = sorted(signals)
+    quality = assess_contacts(sub)
+    dropped = screened_signals(quality)
+    if dropped:
+        why = {k: q.reasons for k, q in quality.items() if q.screened}
+        _log.warning("contact screen removed %s from detection (%s)", sorted(dropped), why)
+    names = sorted(n for n in signals if n not in dropped)
     stack = np.column_stack([signals[n] for n in names])
     z = z_by_pair(stack, float(rec.fs), names)
     beats = detect_rpeaks(signals["R_T"], float(rec.fs))

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from ui.audit.bridge import BandTrace, reduce_to_band_traces
 
@@ -84,3 +83,66 @@ def test_a_time_outside_the_trace_returns_nan_rather_than_wrapping() -> None:
 
     assert np.isnan(t.at(-1.0)[0])
     assert np.isnan(t.at(99.0)[0])
+
+
+def _stub_reveal(monkeypatch, signals: list[str], screened: dict[str, tuple]) -> dict:
+    """Stub reveal_for_region's stages; return what it passed downstream.
+
+    ``screened`` maps a contact label (``"L3"``) to the reasons its screen fired.
+    """
+    import dataclasses
+    from types import SimpleNamespace
+
+    from gems_blanking_v2.derive import contact_quality, derivations
+    from gems_blanking_v2.physio import rpeaks
+
+    from ui.audit import bridge
+
+    seen: dict = {}
+    monkeypatch.setattr(derivations, "build_derivations",
+                        lambda rec: ({n: np.zeros(rec.data.shape[0]) for n in signals}, {}))
+    quality = {lab: SimpleNamespace(cuff_id=lab[0], contact_index=int(lab[1:]), reasons=why,
+                                    screened=bool(why))
+               for lab, why in screened.items()}
+    monkeypatch.setattr(contact_quality, "assess_contacts", lambda rec: quality)
+    monkeypatch.setattr(rpeaks, "detect_rpeaks", lambda x, fs: None)
+
+    def z_by_pair(stack, fs, names):
+        seen["names"] = list(names)
+        return {(n, "0-2"): np.zeros(10) for n in names}
+
+    def capture(z, beats, **kw):
+        seen["z_enter"] = kw["z_enter"]
+        return SimpleNamespace(candidates=[])
+
+    monkeypatch.setattr(bridge, "z_by_pair", z_by_pair)
+    monkeypatch.setattr(bridge, "candidates_for", capture)
+    monkeypatch.setattr(dataclasses, "replace", lambda r, data: SimpleNamespace(fs=r.fs, data=data))
+    rec = SimpleNamespace(fs=100.0, data=np.zeros((1000, 1)))
+    _intervals, seen["traces"] = bridge.reveal_for_region(rec, (0.0, 10.0))
+    return seen
+
+
+def test_the_reveal_uses_the_generators_pinned_threshold(monkeypatch) -> None:
+    """One source for z_enter: the reveal must follow ``recall.Z_ENTER``.
+
+    A literal default here would keep revealing at the old threshold the day task
+    09 pins a new one, while the miss diagnosis moved with the generator - two
+    halves of one score using two thresholds, and nothing would raise.
+    """
+    from gems_blanking_v2.detect import recall
+
+    monkeypatch.setattr(recall, "Z_ENTER", 2.25)
+    seen = _stub_reveal(monkeypatch, ["R_T"], {})
+
+    assert seen["z_enter"] == 2.25
+    assert {t.z_enter for t in seen["traces"]} == {2.25}
+
+
+def test_a_screened_contact_leaves_the_max_with_its_cuffs_tripole(monkeypatch) -> None:
+    """Invariant 41: an off-cuff contact's z means nothing, and neither does its T."""
+    signals = ["L_T", "L_V1", "L_V2", "L_V3", "R_T", "R_V1", "R_V2", "R_V3", "stomach_ref"]
+    seen = _stub_reveal(monkeypatch, signals, {"L3": ("uncorrelated",), "L1": (), "R2": ()})
+
+    assert seen["names"] == ["L_V1", "L_V2", "R_T", "R_V1", "R_V2", "R_V3", "stomach_ref"]
+    assert _stub_reveal(monkeypatch, signals, {"L3": ()})["names"] == signals
