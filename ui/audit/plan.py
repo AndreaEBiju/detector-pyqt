@@ -248,3 +248,45 @@ def plan_audit(
             "recordings": sorted({s.recording_id for s in spans}),
         },
     )
+
+
+def replace_spans(
+    spans: list[Span], indices: list[int], pool: list[Assessable], seed: int,
+    *, span_s: float = SPAN_S,
+) -> list[Span]:
+    """Replace ``spans[i]`` for each ``i`` in ``indices``; the others are kept as-is.
+
+    For a plan whose recordings became ineligible after it was drawn (an animal
+    excluded mid-round). Each replacement keeps the replaced span's CONDITION, comes
+    from a recording not already in the plan - chosen uniformly among the
+    recordings with room for a span - and starts uniformly within its placeable
+    range, exactly as :func:`plan_audit` places spans. Seeded; the caller records
+    the seed.
+
+    Raises
+    ------
+    ValueError
+        If no eligible recording of the needed condition has room for a span.
+    """
+    rng = random.Random(seed)
+    in_plan = {sp.recording_id for sp in spans}
+    out = list(spans)
+    for i in sorted(indices):
+        condition = spans[i].condition
+        candidates = sorted(
+            (a for a in pool
+             if a.condition == condition and a.recording_id not in in_plan
+             and a.placeable(span_s)),
+            key=lambda a: a.recording_id,
+        )
+        if not candidates:
+            msg = f"no eligible {condition} recording has room to replace span {i + 1}"
+            raise ValueError(msg)
+        rec = candidates[rng.randrange(len(candidates))]
+        ranges = rec.placeable(span_s)
+        lo, hi = ranges[rng.randrange(len(ranges))]
+        start = rng.uniform(lo, hi)
+        out[i] = Span(recording_id=rec.recording_id, animal=rec.animal,
+                      condition=rec.condition, start_s=start, stop_s=start + span_s)
+        in_plan.add(rec.recording_id)
+    return out

@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import secrets
 from collections.abc import Callable
+from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -63,7 +64,7 @@ from PySide6.QtWidgets import (
 from ui.audit import bridge
 from ui.audit.array_recording import ArrayRecording
 from ui.audit.controller import sync_viewer
-from ui.audit.plan import N_SPANS, SPAN_S, Assessable, plan_audit
+from ui.audit.plan import N_SPANS, SPAN_S, Assessable, Span, plan_audit, replace_spans
 from ui.audit.session import Phase, SpanSession
 from ui.widgets.signal_viewer import MultiChannelViewer
 from ui.widgets.ztrace_dock import ZTraceDock
@@ -193,14 +194,7 @@ class AuditWindow(QMainWindow):
         if not allowed:
             msg = f"a new audit round cannot be drawn yet: {why}"
             raise RuntimeError(msg)
-        pool: list[Assessable] = []
-        for r in self._pool:
-            planned = planned_regions(r, self._protocol(r))
-            if planned is None or not planned[0]:
-                continue
-            pool.append(Assessable(recording_id=r.session, animal=r.animal,
-                                   condition=r.epoch, regions=planned[0],
-                                   excluded=planned[1]))
+        pool = self._assessable_pool()
         seed = secrets.randbits(32) if seed is None else int(seed)
         drawn = plan_audit(pool, seed)
         plan_id = f"plan_{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}_{seed:08x}"
@@ -217,6 +211,54 @@ class AuditWindow(QMainWindow):
         self.plan = record
         self._refresh()
         return record
+
+    def _assessable_pool(self) -> list[Assessable]:
+        """Every eligible recording with room for a span, as the planner sees it."""
+        pool: list[Assessable] = []
+        for r in self._pool:
+            planned = planned_regions(r, self._protocol(r))
+            if planned is None or not planned[0]:
+                continue
+            pool.append(Assessable(recording_id=r.session, animal=r.animal,
+                                   condition=r.epoch, regions=planned[0],
+                                   excluded=planned[1]))
+        return pool
+
+    def ineligible_spans(self) -> list[int]:
+        """Indices of the open plan's UNCOMMITTED spans whose recording is no longer
+        eligible (excluded, or unreachable, since the plan was drawn)."""
+        if self.plan is None:
+            return []
+        eligible = {r.session for r in self._pool}
+        done = self._committed(self.plan)
+        return [k for k, sp in enumerate(self.plan["spans"])
+                if k not in done and sp["recording_id"] not in eligible]
+
+    def replace_ineligible_spans(self, reason: str, seed: int | None = None) -> list[int]:
+        """Replace the open plan's ineligible uncommitted spans, and record it in the plan.
+
+        Committed spans are never touched. Each replacement keeps its span's
+        condition and index (so its span id is unchanged); the plan keeps the
+        original spans, the fresh seed and ``reason`` under ``amendments``.
+        """
+        indices = self.ineligible_spans()
+        if not indices or self.plan is None:
+            return []
+        seed = secrets.randbits(32) if seed is None else int(seed)
+        old = [Span(**sp) for sp in self.plan["spans"]]
+        new = replace_spans(old, indices, self._assessable_pool(), seed)
+        self.plan["spans"] = [asdict(sp) for sp in new]
+        self.plan.setdefault("amendments", []).append({
+            "at": datetime.now(UTC).isoformat(), "seed": seed, "reason": reason,
+            "rule": "same condition, a recording not already in the plan chosen "
+                    "uniformly, start uniform within its placeable range",
+            "replaced": [{"span": k + 1, "old": asdict(old[k]), "new": asdict(new[k])}
+                         for k in indices],
+        })
+        atomic_write_text(self._store.audit_plan_path(self.plan["plan_id"]),
+                          json.dumps(self.plan, indent=1, sort_keys=True) + "\n")
+        self._refresh()
+        return indices
 
     def _latest_open_plan(self) -> dict[str, Any] | None:
         folder = self._store.audit_plan_path("x").parent
@@ -257,7 +299,8 @@ class AuditWindow(QMainWindow):
         rec = next((r for r in self._pool if r.session == span["recording_id"]), None)
         if rec is None:
             msg = (f"span {k + 1}'s recording {span['recording_id']} is no longer "
-                   "eligible (excluded or unreachable since the plan was drawn)")
+                   "eligible (excluded or unreachable since the plan was drawn). "
+                   "Replace it with replace_ineligible_spans(); committed spans stay.")
             raise RuntimeError(msg)
         return self._open_span(
             rec, float(span["start_s"]), float(span["stop_s"]), self._span_id(plan, k),

@@ -379,3 +379,64 @@ def test_scrolling_off_the_span_is_shaded_refused_clearly_and_one_click_back(
     QTest.keyClick(w, Qt.Key_Home)
     qapp.processEvents()
     assert w.viewer.time_range == (s.start_s, s.stop_s)
+
+def test_an_animal_excluded_mid_round_is_replaced_without_touching_committed_spans(
+    qapp, store: GemsStore
+) -> None:
+    """Round 1 drew two spans from animal D; D was then excluded. The D spans are
+    replaced - same condition, a recording not already in the plan - while the
+    committed span stays exactly as labelled, and the plan records the change."""
+    from ui.windows.audit_window import AuditWindow
+
+    keys = {}
+    for i, folder in enumerate(["gems_j_t01_ms3_bl_230315", "gems_j_t01_ms1_bl_164532",
+                                "gems_d_t01_es1_bl_200359", "gems_d_t02_es1_bl_210933",
+                                "gems_b_t01_es2_bl_214117", "gems_b_t01_ms1_bl_224934",
+                                # enough non-D recordings that replacements exist
+                                # outside the plan (the real pool has 458)
+                                "gems_j_t02_es1_bl_233531", "gems_b_t02_ms2_bl_180847",
+                                "gems_j_t02_ms3_bl_203835", "gems_b_t03_ms3_bl_184100"]):
+        keys[folder] = _block(store, folder, 1_789_527_801.0 + 3600 * i, fs=1000.0,
+                              duration_s=600.0)
+    for seed in range(200):  # a plan whose span 1 is not D, with D later in it
+        for p in store.audit_plan_path("x").parent.glob("plan_*.json"):
+            p.unlink()
+        w = AuditWindow(store, reveal_fn=lambda r, g: (np.zeros((0, 2)), []))
+        plan = w.create_plan(seed=seed)
+        animals = [sp["animal"] for sp in plan["spans"]]
+        if animals[0] != "D" and "D" in animals[1:]:
+            break
+    first = w.open_next_span()
+    w._on_mark(first.start_s + 5.0, first.start_s + 6.0)
+    w.commit()
+    committed_span = dict(plan["spans"][0])
+
+    for folder, key in keys.items():  # exclude animal D, as the generator does
+        if folder.startswith("gems_d_"):
+            meta = store.root / "data" / "D" / key / "meta.json"
+            doc = json.loads(meta.read_text(encoding="utf-8"))
+            doc["excluded"] = {"reason": "animal_excluded", "animal": "D"}
+            meta.write_text(json.dumps(doc), encoding="utf-8", newline="\n")
+
+    w2 = AuditWindow(store, reveal_fn=lambda r, g: (np.zeros((0, 2)), []))
+    expected = [k for k, a in enumerate(animals) if a == "D"]
+    assert w2.ineligible_spans() == expected
+    replaced = w2.replace_ineligible_spans("animal D excluded (test)", seed=7)
+    assert replaced == expected
+    spans = w2.plan["spans"]
+    assert spans[0] == committed_span  # the committed span is untouched
+    assert all(sp["animal"] != "D" for sp in spans)
+    for k in expected:
+        assert spans[k]["condition"] == plan["spans"][k]["condition"]
+    assert len({sp["recording_id"] for sp in spans}) >= len({sp["recording_id"] for sp in
+                                                              plan["spans"]}) - len(expected)
+    assert w2.ineligible_spans() == []
+    on_disk = json.loads(store.audit_plan_path(plan["plan_id"]).read_text(encoding="utf-8"))
+    amend = on_disk["amendments"][0]
+    assert amend["seed"] == 7 and amend["reason"] == "animal D excluded (test)"
+    assert [r["span"] for r in amend["replaced"]] == [k + 1 for k in expected]
+    assert all(r["old"]["animal"] == "D" for r in amend["replaced"])
+
+    # the plan carries on: the next span opens, from an eligible recording
+    nxt = w2.open_next_span()
+    assert nxt is not None and "span 2 of 5" in w2._status.text().lower()

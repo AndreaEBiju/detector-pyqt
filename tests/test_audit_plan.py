@@ -149,3 +149,44 @@ def test_unsorted_or_overlapping_regions_raise() -> None:
 def test_an_empty_or_reversed_region_raises() -> None:
     with pytest.raises(ValueError, match="empty or reversed"):
         Assessable("r", "A", "baseline", regions=((300.0, 300.0),))
+
+
+def test_replacement_keeps_condition_index_and_never_reuses_a_recording() -> None:
+    """Mid-round exclusion: spans 2 and 5 replaced; the rest untouched; each new span
+    has its old span's condition and a recording no other span uses; seeded."""
+    from ui.audit.plan import Assessable, Span, replace_spans
+
+    def rec(rid: str, animal: str, cond: str) -> Assessable:
+        return Assessable(recording_id=rid, animal=animal, condition=cond,
+                          regions=((0.0, 600.0),))
+
+    pool = [rec(f"{a}{i}_{c[:2]}", a, c) for a in "ABJ" for i in range(3)
+            for c in ("baseline", "stim_recovery")]
+    spans = [Span("B0_ba", "B", "baseline", 100.0, 220.0),
+             Span("D1_st", "D", "stim_recovery", 50.0, 170.0),
+             Span("A0_st", "A", "stim_recovery", 200.0, 320.0),
+             Span("B1_st", "B", "stim_recovery", 30.0, 150.0),
+             Span("D2_ba", "D", "baseline", 300.0, 420.0)]
+    new = replace_spans(spans, [1, 4], pool, seed=11)
+    assert [new[k] for k in (0, 2, 3)] == [spans[k] for k in (0, 2, 3)]
+    assert new[1].condition == "stim_recovery" and new[4].condition == "baseline"
+    assert "D" not in {new[1].animal, new[4].animal}
+    assert len({s.recording_id for s in new}) == len(new)  # no recording used twice
+    for s in (new[1], new[4]):
+        assert 20.0 <= s.start_s and s.stop_s <= 580.0
+        assert s.stop_s - s.start_s == pytest.approx(120.0)
+    assert replace_spans(spans, [1, 4], pool, seed=11) == new  # seeded
+
+
+def test_two_same_condition_replacements_never_share_a_recording() -> None:
+    """Only two eligible baselines outside the plan: both replacements must use
+    different ones, for every seed (a reuse would put one recording in twice)."""
+    from ui.audit.plan import Assessable, Span, replace_spans
+
+    pool = [Assessable(recording_id=r, animal=a, condition="baseline", regions=((0.0, 600.0),))
+            for r, a in (("A0", "A"), ("B0", "B"), ("A9", "A"), ("B9", "B"))]
+    spans = [Span("A0", "A", "baseline", 100.0, 220.0), Span("D1", "D", "baseline", 1.0, 121.0),
+             Span("B0", "B", "baseline", 100.0, 220.0), Span("D2", "D", "baseline", 1.0, 121.0)]
+    for seed in range(20):
+        new = replace_spans(spans, [1, 3], pool, seed=seed)
+        assert {new[1].recording_id, new[3].recording_id} == {"A9", "B9"}
