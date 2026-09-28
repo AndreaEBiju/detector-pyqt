@@ -314,3 +314,68 @@ def test_a_recompute_that_differs_from_the_reveal_is_refused_and_a_legacy_span_w
     legacy = score_stored_round(store, plan_id, score.make_reveal(store))
     assert len(legacy.warnings) == 5
     assert all("without candidate digests" in w for w in legacy.warnings)
+
+def _real_shift_drag(qapp, w, x0: float, x1: float) -> None:
+    """A Shift+drag through Qt mouse events on channel 0, from x0 to x1 seconds."""
+    from PySide6.QtCore import QPointF, Qt
+    from PySide6.QtTest import QTest
+
+    vb = w.viewer.plots[0][0].getViewBox()
+    ymid = sum(vb.viewRange()[1]) / 2
+
+    def pos(x):
+        return w.viewer.mapFromScene(vb.mapViewToScene(QPointF(x, ymid)))
+
+    vp = w.viewer.viewport()
+    QTest.mousePress(vp, Qt.LeftButton, Qt.ShiftModifier, pos(x0))
+    QTest.mouseMove(vp, pos(x1))
+    QTest.mouseRelease(vp, Qt.LeftButton, Qt.ShiftModifier, pos(x1))
+    qapp.processEvents()
+
+
+def test_scrolling_off_the_span_is_shaded_refused_clearly_and_one_click_back(
+    qapp, store: GemsStore
+) -> None:
+    """Andrea scrolled to the recording's start, marked at 17.8 s, and was refused
+    with no sign of where the span was. Scrolling stays free; the span is visible,
+    the refusal says both ranges, and Back to span / Home returns to it."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    from ui.windows.audit_window import AuditWindow
+
+    _three_recordings(store)
+    w = AuditWindow(store, reveal_fn=lambda r, g: (np.zeros((0, 2)), []))
+    w.resize(1500, 900)
+    w.show()
+    qapp.processEvents()
+    w._plan_btn.click()
+    w._next_btn.click()
+    qapp.processEvents()
+    s = w._session
+    assert w.viewer.time_range == (s.start_s, s.stop_s)
+
+    # the outside of the span is shaded on every channel
+    shaded = [tuple(i.getRegion()) for i in w._outside_items]
+    assert (0.0, s.start_s) in shaded and len(w._outside_items) == 2 * len(w.viewer.plots)
+
+    # scroll to the recording's start and mark there: refused, and it says why
+    w.viewer.set_viewport(0.0, 60.0)
+    qapp.processEvents()
+    _real_shift_drag(qapp, w, 17.8, 18.0)
+    assert s.marks == []
+    msg = w._status.text()
+    assert "17.8-18.0 s" in msg and f"{s.start_s:.1f}-{s.stop_s:.1f} s" in msg
+    assert "Back to span" in msg
+
+    # one click back, and a real mark inside the span is recorded
+    w._span_btn.click()
+    assert w.viewer.time_range == (s.start_s, s.stop_s)
+    _real_shift_drag(qapp, w, s.start_s + 10.0, s.start_s + 12.0)
+    assert len(s.marks) == 1 and s.start_s + 9.9 < s.marks[0].start_s < s.start_s + 10.1
+
+    # Home does the same
+    w.viewer.set_viewport(0.0, 60.0)
+    QTest.keyClick(w, Qt.Key_Home)
+    qapp.processEvents()
+    assert w.viewer.time_range == (s.start_s, s.stop_s)

@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pyqtgraph as pg
 from gems_blanking_v2.detect import recall
 from gems_blanking_v2.io.audit_pool import (
     EligibleRecording,
@@ -45,6 +46,7 @@ from gems_blanking_v2.io.stim_split import (
 )
 from gems_blanking_v2.io.store import GemsStore, atomic_write_text
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QDockWidget,
     QHBoxLayout,
@@ -104,6 +106,10 @@ class AuditWindow(QMainWindow):
         self._trial_btn = QPushButton("Trial span on selected recording (not audit data)")
         self._undo_btn = QPushButton("Undo last mark")
         self._commit_btn = QPushButton("Commit marks (then reveal)")
+        # Scrolling past the span is allowed - context helps - so getting back is
+        # one click (or Home). Andrea scrolled to the recording's start and every
+        # mark there was, correctly, refused as outside the span.
+        self._span_btn = QPushButton("Back to span (Home)")
         self.progress = QLabel("")
         self._status = QLabel(f"{len(self._pool)} eligible recordings.")
         # Every button goes through _clicked: ``clicked`` emits ``checked`` and
@@ -114,6 +120,8 @@ class AuditWindow(QMainWindow):
         self._trial_btn.clicked.connect(self._clicked(self._on_trial_clicked))
         self._undo_btn.clicked.connect(self._clicked(self.undo_mark))
         self._commit_btn.clicked.connect(self._clicked(self.commit))
+        self._span_btn.clicked.connect(self._clicked(self.back_to_span))
+        QShortcut(QKeySequence(Qt.Key_Home), self, activated=self._clicked(self.back_to_span))
 
         left = QWidget()
         lay = QVBoxLayout(left)
@@ -126,7 +134,7 @@ class AuditWindow(QMainWindow):
         lay.addWidget(self._trial_btn)
         bar = QWidget()
         blay = QHBoxLayout(bar)
-        for w in (self._undo_btn, self._commit_btn, self._status):
+        for w in (self._span_btn, self._undo_btn, self._commit_btn, self._status):
             blay.addWidget(w)
         self._centre = QWidget()
         self._centre_lay = QVBoxLayout(self._centre)
@@ -336,6 +344,7 @@ class AuditWindow(QMainWindow):
         self.viewer.bad_interval_added.connect(self._on_mark)
         self._centre_lay.insertWidget(0, self.viewer, 1)
         self.viewer.set_viewport(start, stop)
+        self._shade_outside_span(start, stop, recording.data.shape[0] / recording.fs)
         self.ztrace.set_traces([])
         self._sync()
         label = ("TRIAL span (not audit data)" if extra.get("trial")
@@ -345,6 +354,28 @@ class AuditWindow(QMainWindow):
         self._refresh()
         return self._session
 
+    def back_to_span(self) -> None:
+        """Snap the viewer back to exactly the open span."""
+        if self.viewer is not None and self._session is not None:
+            self.viewer.set_viewport(self._session.start_s, self._session.stop_s)
+
+    def _shade_outside_span(self, start: float, stop: float, duration: float) -> None:
+        """Grey out everything before and after the span, on every channel.
+
+        Only the span can be marked; the shading makes it visible when scrolling
+        has left it, instead of a refusal being the first sign.
+        """
+        self._outside_items = []
+        for plot, _curve in self.viewer.plots:
+            for lo, hi in ((0.0, start), (stop, duration)):
+                if hi > lo:
+                    item = pg.LinearRegionItem(values=(lo, hi), orientation="vertical",
+                                               movable=False, brush=pg.mkBrush(128, 128, 128, 90),
+                                               pen=pg.mkPen(None))
+                    item.setZValue(-10)
+                    plot.addItem(item)
+                    self._outside_items.append(item)
+
     def _on_mark(self, lo: float, hi: float) -> None:
         """A Shift+drag in the viewer. Clipped to the span; outside it is refused."""
         s = self._session
@@ -352,7 +383,10 @@ class AuditWindow(QMainWindow):
             return
         a, b = max(lo, s.start_s), min(hi, s.stop_s)
         if not b > a:
-            self._status.setText("That mark is outside the span and was not recorded.")
+            self._status.setText(
+                f"That mark ({lo:.1f}-{hi:.1f} s) is outside this span "
+                f"({s.start_s:.1f}-{s.stop_s:.1f} s, unshaded) and was not recorded. "
+                "Click 'Back to span' or press Home.")
             return
         s.add_mark(a, b)
         self._sync()
@@ -408,6 +442,7 @@ class AuditWindow(QMainWindow):
         blind = self._session is not None and self._session.phase is Phase.BLIND
         self._undo_btn.setEnabled(blind)
         self._commit_btn.setEnabled(blind)
+        self._span_btn.setEnabled(self._session is not None and self.viewer is not None)
         self._plan_btn.setEnabled(self.plan is None and not blind)
         if self.plan is None:
             self.progress.setText(f"No open plan. Creating one draws {N_SPANS} spans.")
