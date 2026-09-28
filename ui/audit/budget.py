@@ -12,11 +12,17 @@ Each recording is measured exactly as the audit window reveals a span: loaded by
 ``bridge.reveal_for_region`` over each assessable region. "Candidates per
 recording" is the sum over its regions; "time covered" is the union of candidate
 intervals inside them. It reads whole recordings from the Drive.
+
+Recordings are independent, so ``workers > 1`` measures them in separate processes
+(invariant 37: spend cores on tasks, not threads). The result is identical to the
+serial one and in the same order - the sample, not completion order, fixes it.
 """
 
 from __future__ import annotations
 
 import random
+from concurrent.futures import Executor, ProcessPoolExecutor, as_completed
+from pathlib import Path
 from typing import Any
 
 from gems_blanking_v2.detect.recall import budget_record, write_budget
@@ -83,18 +89,38 @@ def measure_recording(store: GemsStore, rec: EligibleRecording, book: Any) -> di
             "candidates_per_20min": candidates * 1200.0 / assessable if assessable else None}
 
 
+def _measure_in_worker(root: Path, rec: EligibleRecording) -> dict[str, Any]:
+    """One recording, in a worker: the store and protocol book rebuilt from the root."""
+    store = GemsStore(root)
+    return measure_recording(store, rec, load_protocol_book(root / PROTOCOL_FILENAME))
+
+
 def measure_budget(store: GemsStore, *, per_cell: int, seed: int,
-                   progress: Any = print) -> dict[str, Any]:
+                   progress: Any = print, workers: int = 1,
+                   executor: type[Executor] = ProcessPoolExecutor) -> dict[str, Any]:
     """Measure, record and return the budget for the current generator."""
-    book = load_protocol_book(store.root / PROTOCOL_FILENAME)
     sample = sample_pool(eligible_recordings(store), per_cell, seed)
-    rows = []
-    for k, rec in enumerate(sample, 1):
-        row = measure_recording(store, rec, book)
-        rows.append(row)
+
+    def report(k: int, row: dict[str, Any]) -> None:
         progress(f"[{k}/{len(sample)}] {row['animal']} {row['condition']:13} "
                  f"{row['folder']:34} {row['candidates']:6d} candidates, "
                  f"{row['covered_s'] / max(row['assessable_s'], 1e-9):.1%} of time")
+
+    rows: list[dict[str, Any]] = []
+    if workers <= 1:
+        book = load_protocol_book(store.root / PROTOCOL_FILENAME)
+        for k, rec in enumerate(sample, 1):
+            rows.append(measure_recording(store, rec, book))
+            report(k, rows[-1])
+    else:
+        by_index: dict[int, dict[str, Any]] = {}
+        with executor(max_workers=workers) as pool:
+            futures = {pool.submit(_measure_in_worker, store.root, rec): i
+                       for i, rec in enumerate(sample)}
+            for k, fut in enumerate(as_completed(futures), 1):
+                by_index[futures[fut]] = fut.result()
+                report(k, by_index[futures[fut]])
+        rows = [by_index[i] for i in range(len(sample))]
     record = budget_record(rows, reveal_sha=bridge.reveal_sha(), sample_rule=(
         f"up to {per_cell} recordings per (animal, condition) cell of the eligible pool, "
         f"seed {seed}; candidates over each recording's assessable regions (stim removed "

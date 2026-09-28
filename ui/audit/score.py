@@ -8,7 +8,7 @@ Usage::
                                                 #   "tuning check, not gate evidence"
     python -m ui.audit.score --pooled           # the cumulative gate over eligible rounds
     python -m ui.audit.score --check-next       # may another round be drawn now?
-    python -m ui.audit.score --measure-budget [PER_CELL [SEED]]
+    python -m ui.audit.score --measure-budget [PER_CELL [SEED [WORKERS]]]
                                                 # candidates per recording on the pool
 
 The scoring itself is ``gems_blanking_v2.detect.recall`` (pre-declared 2026-09-26).
@@ -107,7 +107,8 @@ def main(argv: list[str]) -> int:
 
         per_cell = int(argv[1]) if len(argv) > 1 else 5
         seed = int(argv[2]) if len(argv) > 2 else 20260928
-        rec = measure_budget(store, per_cell=per_cell, seed=seed)
+        workers = int(argv[3]) if len(argv) > 3 else 1
+        rec = measure_budget(store, per_cell=per_cell, seed=seed, workers=workers)
         print(json.dumps({k: rec[k] for k in ("key", "n_recordings", "candidates_median",
                                                "candidates_quantile", "fraction_over_budget",
                                                "time_covered_median", "within_budget")},

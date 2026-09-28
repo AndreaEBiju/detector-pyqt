@@ -508,3 +508,35 @@ def test_the_budget_is_measured_as_the_window_reveals(qapp, store: GemsStore, mo
     row = rec["recordings"][0]
     assert row["candidates"] == 2 and row["covered_s"] == pytest.approx(20.0)  # union 10-30
     assert rec["within_budget"] is False  # 3 recordings < the minimum: not a measurement
+
+
+def test_parallel_budget_rows_equal_serial_rows_in_sample_order(
+    qapp, store: GemsStore, monkeypatch
+) -> None:
+    """Workers change the wall clock, never the record - order included."""
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    from ui.audit import bridge, budget
+
+    _three_recordings(store)
+
+    calls: list[str] = []
+    lock = threading.Lock()
+
+    def fake(recording, region):
+        with lock:
+            first = not calls
+            calls.append(str(recording.path))
+        time.sleep(0.3 if first else 0.0)  # the first submitted finishes last
+        n = 1 + ("ms3" in str(recording.path))  # differs per recording, so order shows
+        lo = region[0]
+        return np.array([[lo + 1.0 + i, lo + 1.5 + i] for i in range(n)]), []
+
+    monkeypatch.setattr(bridge, "reveal_for_region", fake)
+    serial = budget.measure_budget(store, per_cell=5, seed=1, progress=lambda m: None)
+    parallel = budget.measure_budget(store, per_cell=5, seed=1, progress=lambda m: None,
+                                     workers=3, executor=ThreadPoolExecutor)
+    assert parallel["recordings"] == serial["recordings"]
+    assert len({r["candidates"] for r in serial["recordings"]}) > 1
