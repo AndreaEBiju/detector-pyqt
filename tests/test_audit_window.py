@@ -176,10 +176,12 @@ def test_the_five_span_plan_is_recorded_up_front_advanced_and_resumed(
     from ui.windows.audit_window import AuditWindow
 
     for i, folder in enumerate(["gems_j_t01_ms3_bl_230315", "gems_j_t01_ms1_bl_164532",
-                                "gems_d_t01_3_2_bl_213219", "gems_d_t01_es1_bl_200359"]):
-        # 400 s holds two non-overlapping 120 s spans after the 20 s guards;
-        # real recordings are 600-1320 s.
-        _block(store, folder, 1_789_527_801.0 + 3600 * i, fs=1000.0, duration_s=400.0)
+                                "gems_d_t01_3_2_bl_213219", "gems_d_t01_es1_bl_200359",
+                                "gems_j_t02_ms1_sr_164532", "gems_d_t02_es1_sr_210933"]):
+        # Both conditions, as the real pool has: an empty pool asks for baseline,
+        # stim_recovery, baseline, ... (ruling 2026-09-29).
+        _block(store, folder, 1_789_527_801.0 + 3600 * i, fs=1000.0,
+               duration_s=900.0 if "_sr_" in folder else 400.0)
     w = AuditWindow(store, reveal_fn=lambda r, g: (np.zeros((0, 2)), []))
     assert w.plan is None
     plan = w.create_plan(seed=99)
@@ -224,9 +226,7 @@ def test_the_buttons_draw_a_random_seed_and_advance_the_plan(qapp, store: GemsSt
     # animals the round-robin gives the first animal three of the five spans. So each
     # animal has two recordings, and no recording ever needs three (1.2% of seeds
     # failed with one D recording; 0 of 3000 with two).
-    for i, folder in enumerate(["gems_j_t01_ms3_bl_230315", "gems_j_t01_ms1_bl_164532",
-                                "gems_d_t01_es1_bl_200359", "gems_d_t02_es1_bl_210933"]):
-        _block(store, folder, 1_789_527_801.0 + 3600 * i, fs=1000.0, duration_s=600.0)
+    _small_pool(store)
     seeds = []
     for _ in range(3):
         w = AuditWindow(store, reveal_fn=lambda r, g: (np.zeros((0, 2)), []))
@@ -260,14 +260,18 @@ def test_an_empty_store_says_why_instead_of_failing_silently(qapp, store: GemsSt
 
 
 def _small_pool(store: GemsStore) -> None:
-    """Two animals, two 600 s recordings each: every seed can place five spans.
+    """Two animals, each with two 600 s baselines and one 900 s stim/recovery.
 
-    With one recording for an animal, the round-robin can ask it for three spans,
-    and two unlucky placements leave no room for the third (1.2% of seeds).
+    Both conditions, as the real pool has (ruling 2026-09-29: the planner asks for
+    them). With two animals and alternating conditions one animal takes every
+    baseline span - three - so each needs two baseline recordings: one recording
+    asked for three spans can run out of room (1.2% of seeds).
     """
     for i, folder in enumerate(["gems_j_t01_ms3_bl_230315", "gems_j_t01_ms1_bl_164532",
-                                "gems_d_t01_es1_bl_200359", "gems_d_t02_es1_bl_210933"]):
-        _block(store, folder, 1_789_527_801.0 + 3600 * i, fs=1000.0, duration_s=600.0)
+                                "gems_d_t01_es1_bl_200359", "gems_d_t02_es1_bl_210933",
+                                "gems_j_t02_ms1_sr_164532", "gems_d_t02_es2_sr_222933"]):
+        _block(store, folder, 1_789_527_801.0 + 3600 * i, fs=1000.0,
+               duration_s=900.0 if "_sr_" in folder else 600.0)
 
 
 def _label_round(store: GemsStore, reveal_fn) -> str:
@@ -434,7 +438,10 @@ def test_an_animal_excluded_mid_round_is_replaced_without_touching_committed_spa
                                 # enough non-D recordings that replacements exist
                                 # outside the plan (the real pool has 458)
                                 "gems_j_t02_es1_bl_233531", "gems_b_t02_ms2_bl_180847",
-                                "gems_j_t02_ms3_bl_203835", "gems_b_t03_ms3_bl_184100"]):
+                                "gems_j_t02_ms3_bl_203835", "gems_b_t03_ms3_bl_184100",
+                                "gems_j_t03_ms1_sr_164532", "gems_b_t03_ms1_sr_194532",
+                                "gems_j_t03_ms2_sr_174532", "gems_b_t03_ms2_sr_204532",
+                                "gems_d_t03_ms1_sr_184532"]):
         keys[folder] = _block(store, folder, 1_789_527_801.0 + 3600 * i, fs=1000.0,
                               duration_s=600.0)
     for seed in range(200):  # a plan whose span 1 is not D, with D later in it
@@ -524,10 +531,10 @@ def test_the_budget_is_measured_as_the_window_reveals(qapp, store: GemsStore, mo
 
     monkeypatch.setattr(bridge, "reveal_for_region", fake)
     rec = budget.measure_budget(store, per_cell=5, seed=1, progress=lambda m: None)
-    assert rec["n_recordings"] == 4 and len(calls) == 4
+    assert rec["n_recordings"] == 6 and len(calls) == 6
     row = rec["recordings"][0]
     assert row["candidates"] == 2 and row["covered_s"] == pytest.approx(20.0)  # union 10-30
-    assert rec["within_budget"] is False  # 4 recordings < the minimum: not a measurement
+    assert rec["within_budget"] is False  # 6 recordings < the minimum: not a measurement
 
 
 def test_parallel_budget_rows_equal_serial_rows_in_sample_order(
@@ -620,3 +627,32 @@ def test_a_new_plan_declares_the_merged_scoring_unit(qapp, store: GemsStore) -> 
     w, _s = _open_span(store)
     on_disk = json.loads(store.audit_plan_path(w.plan["plan_id"]).read_text(encoding="utf-8"))
     assert on_disk["scoring_unit"] == "merged"
+
+
+def test_the_plan_draws_the_conditions_the_eligible_pool_needs(
+    qapp, store: GemsStore, monkeypatch
+) -> None:
+    """Ruling 2026-09-29: round 3 was all stim/recovery, so round 4 is all baseline."""
+    from gems_blanking_v2.detect import recall
+
+    w, _s = _open_span(store)  # empty eligible pool: baseline first, then alternate
+    first = json.loads(store.audit_plan_path(w.plan["plan_id"]).read_text(encoding="utf-8"))
+    assert [sp["condition"] for sp in first["spans"]] == \
+        ["baseline", "stim_recovery", "baseline", "stim_recovery", "baseline"]
+    assert first["conditions_requested"] == [sp["condition"] for sp in first["spans"]]
+    assert "never scores" in first["condition_rule"]
+
+    from ui.windows.audit_window import AuditWindow
+
+    asked: list[int] = []
+
+    def five_baselines(st: GemsStore, n: int) -> tuple[str, ...]:
+        asked.append(n)
+        return ("baseline",) * n
+
+    monkeypatch.setattr(recall, "condition_plan", five_baselines)
+    for p in store.audit_plan_path("x").parent.glob("plan_*.json"):
+        p.unlink()
+    w2 = AuditWindow(store, reveal_fn=lambda r, g: (np.zeros((0, 2)), []))
+    plan = w2.create_plan(seed=11)
+    assert asked == [5] and {sp["condition"] for sp in plan["spans"]} == {"baseline"}

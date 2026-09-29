@@ -190,3 +190,46 @@ def test_two_same_condition_replacements_never_share_a_recording() -> None:
     for seed in range(20):
         new = replace_spans(spans, [1, 3], pool, seed=seed)
         assert {new[1].recording_id, new[3].recording_id} == {"A9", "B9"}
+
+
+# --- conditions (ruling 2026-09-29) --------------------------------------------------
+
+
+def test_without_conditions_a_recorded_seed_still_rebuilds_its_plan() -> None:
+    """The pre-2026-09-29 draw, kept exactly: seed 7 on this pool, as it was."""
+    plan = plan_audit(_pool(), seed=7)
+
+    assert [(s.recording_id, round(s.start_s, 6)) for s in plan.spans] == [
+        ("rec_C1", 180.903123), ("rec_A0", 420.269788), ("rec_B1", 36.49809),
+        ("rec_C0", 203.995747), ("rec_A1", 59.913726)]
+    assert "not stratified" in plan.to_json()["selection_rule"]
+
+
+@pytest.mark.parametrize("wanted", [
+    ("baseline",) * 5, ("stim_recovery",) * 5,
+    ("baseline", "stim_recovery", "baseline", "stim_recovery", "baseline"),
+])
+def test_each_span_has_the_condition_asked_for(wanted: tuple[str, ...]) -> None:
+    for seed in range(30):
+        plan = plan_audit(_pool(n_animals=3, per_animal=4), seed=seed, conditions=wanted)
+        assert tuple(s.condition for s in plan.spans) == wanted
+        assert len({s.animal for s in plan.spans}) >= MIN_ANIMALS  # rotation kept
+        assert plan.provenance["conditions_requested"] == list(wanted)
+        assert "balancing the gate's eligible pool" in plan.to_json()["selection_rule"]
+
+
+def test_conditions_of_the_wrong_length_or_absent_from_the_pool_refuse() -> None:
+    with pytest.raises(ValueError, match="4 conditions given for 5 spans"):
+        plan_audit(_pool(), seed=0, conditions=("baseline",) * 4)
+    only_bl = [a for a in _pool() if a.condition == "baseline"]
+    with pytest.raises(ValueError, match="at least"):
+        plan_audit(only_bl, seed=0, conditions=("stim_recovery",) * 5)
+
+
+def test_the_first_animal_in_the_rotation_with_the_condition_takes_the_span() -> None:
+    """An animal with no recording of the asked condition is skipped, not the span."""
+    pool = [a for a in _pool(n_animals=3, per_animal=4)
+            if not (a.animal == "A" and a.condition == "baseline")]
+    for seed in range(20):
+        plan = plan_audit(pool, seed=seed, conditions=("baseline",) * 5)
+        assert all(s.condition == "baseline" and s.animal != "A" for s in plan.spans)

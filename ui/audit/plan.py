@@ -4,8 +4,11 @@
 regions would re-introduce, at the span level, exactly the anchoring that blind
 marking exists to prevent: the audit would measure recall over the regions the
 detector already likes. The selection is therefore uniform-random within the
-assessable part of each recording, stratified only by animal and condition, and
-the seed is recorded so the same plan can be rebuilt.
+assessable part of each recording, and the seed is recorded so the same plan can be
+rebuilt. Two strata, and only these (ruling 2026-09-29): **animals** by rotation
+within a plan, and **conditions** across the gate's eligible pool - the window asks
+``gems_blanking_v2.detect.recall.condition_plan`` which condition each span must
+have, from the composition of earlier eligible plans alone, never their scores.
 
 Budget: five contiguous 2-minute spans, ~10 minutes of signal per plan. The task's
 labelling budget is 500-1000 judged events in 1-3 hours across ~12 recordings, and
@@ -19,6 +22,7 @@ one-second windows would cost the same wall-clock and produce worse labels.
 from __future__ import annotations
 
 import random
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from typing import Final
 
@@ -76,10 +80,14 @@ class AuditPlan:
             "span_s": SPAN_S,
             "total_s": self.total_s,
             "selection_rule": (
-                "uniform-random start within each assessable region, stratified "
-                "by animal and condition; NOT candidate-dense, because selecting "
-                "spans with the detector under test would measure recall over the "
-                "regions it already likes"
+                "uniform-random start within each assessable region; animals rotated "
+                "within the plan; conditions "
+                + ("as requested per span, balancing the gate's eligible pool from "
+                   "earlier eligible plans' composition (ruling 2026-09-29)"
+                   if "conditions_requested" in self.provenance else
+                   "not stratified (drawn by recording, the pre-2026-09-29 rule)")
+                + "; NOT candidate-dense, because selecting spans with the detector "
+                "under test would measure recall over the regions it already likes"
             ),
             "edge_guard_s": EDGE_GUARD_S,
             "spans": [asdict(s) for s in self.spans],
@@ -158,21 +166,37 @@ def plan_audit(
     *,
     n_spans: int = N_SPANS,
     span_s: float = SPAN_S,
+    conditions: Sequence[str] | None = None,
 ) -> AuditPlan:
-    """Draw ``n_spans`` contiguous spans, stratified across animals and conditions.
+    """Draw ``n_spans`` contiguous spans: animals rotated, conditions as asked.
 
-    Stratification is by round-robin over animals first, then over
-    ``(recording, condition)`` within an animal, so a plan cannot land all five
-    spans on one recording. Within the chosen recording the start is uniform over
-    the placeable range - the only randomness, and it is seeded.
+    Animals are rotated round-robin (at most :data:`MAX_ANIMALS`, shuffled), and
+    within an animal its recordings are taken in shuffled order, so a plan cannot
+    land all five spans on one recording. Within the chosen recording the start is
+    uniform over the placeable range; all randomness is seeded.
+
+    ``conditions`` - one per span - is how conditions are stratified: span ``i`` is
+    drawn from a recording of ``conditions[i]``, from the first animal in the
+    rotation that has one. The window passes
+    ``recall.condition_plan``'s answer, which balances conditions across the gate's
+    eligible pool. Without it the conditions are whatever the recordings drawn happen
+    to be - the pre-2026-09-29 behaviour, kept byte-for-byte so a recorded seed
+    still rebuilds its plan.
 
     Raises
     ------
     ValueError
-        If the pool spans fewer than :data:`MIN_ANIMALS` animals, or if no
-        recording has room for a span. Both mean the plan would not measure what
-        it claims to, and quietly returning a shorter plan would hide that.
+        If the pool (restricted to the asked conditions) spans fewer than
+        :data:`MIN_ANIMALS` animals, if ``conditions`` has the wrong length, or if no
+        recording has room for a span. Each means the plan would not measure what it
+        claims to, and quietly returning a shorter plan would hide that.
     """
+    if conditions is not None:
+        if len(conditions) != n_spans:
+            msg = f"{len(conditions)} conditions given for {n_spans} spans"
+            raise ValueError(msg)
+        return _plan_by_condition(pool, seed, n_spans=n_spans, span_s=span_s,
+                                  conditions=tuple(conditions))
     usable = [a for a in pool if a.placeable(span_s)]
     if not usable:
         msg = (
@@ -247,6 +271,64 @@ def plan_audit(
             "conditions": sorted({s.condition for s in spans}),
             "recordings": sorted({s.recording_id for s in spans}),
         },
+    )
+
+
+def _plan_by_condition(
+    pool: list[Assessable], seed: int, *, n_spans: int, span_s: float,
+    conditions: tuple[str, ...],
+) -> AuditPlan:
+    """:func:`plan_audit` with span ``i`` drawn from a ``conditions[i]`` recording."""
+    wanted = set(conditions)
+    usable = [a for a in pool if a.placeable(span_s) and a.condition in wanted]
+    animals = sorted({a.animal for a in usable})
+    if len(animals) < MIN_ANIMALS:
+        msg = (f"the {sorted(wanted)} recordings cover {len(animals)} animal(s) "
+               f"({animals}); at least {MIN_ANIMALS} are needed")
+        raise ValueError(msg)
+    rng = random.Random(seed)
+    order = animals[:MAX_ANIMALS] if len(animals) > MAX_ANIMALS else animals
+    rng.shuffle(order)
+    by_key: dict[tuple[str, str], list[Assessable]] = {}
+    for a in sorted(usable, key=lambda a: (a.animal, a.condition, a.recording_id)):
+        if a.animal in order:
+            by_key.setdefault((a.animal, a.condition), []).append(a)
+    for recs in by_key.values():
+        rng.shuffle(recs)
+    spans: list[Span] = []
+    used: set[tuple[str, float]] = set()
+    cursor = dict.fromkeys(by_key, 0)
+    guard = 0
+    while len(spans) < n_spans and guard < n_spans * 50:
+        guard += 1
+        cond = conditions[len(spans)]
+        first = len(spans) % len(order)
+        animal = next((order[(first + k) % len(order)] for k in range(len(order))
+                       if (order[(first + k) % len(order)], cond) in by_key), None)
+        if animal is None:
+            msg = f"no animal in the rotation {order} has a {cond} recording with room"
+            raise ValueError(msg)
+        recs = by_key[(animal, cond)]
+        rec = recs[cursor[(animal, cond)] % len(recs)]
+        cursor[(animal, cond)] += 1
+        ranges = rec.placeable(span_s)
+        lo, hi = ranges[rng.randrange(len(ranges))]
+        start = rng.uniform(lo, hi)
+        if any(r == rec.recording_id and abs(s - start) < span_s for r, s in used):
+            continue
+        used.add((rec.recording_id, start))
+        spans.append(Span(recording_id=rec.recording_id, animal=rec.animal,
+                          condition=rec.condition, start_s=start, stop_s=start + span_s))
+    if len(spans) < n_spans:
+        msg = (f"could only place {len(spans)} of {n_spans} non-overlapping spans "
+               f"of conditions {list(conditions)} across {len(usable)} recordings")
+        raise ValueError(msg)
+    return AuditPlan(
+        spans=tuple(spans), seed=seed,
+        provenance={"animals": sorted({s.animal for s in spans}),
+                    "conditions": sorted({s.condition for s in spans}),
+                    "conditions_requested": list(conditions),
+                    "recordings": sorted({s.recording_id for s in spans})},
     )
 
 

@@ -5,7 +5,8 @@ opened them, so Andrea could not start labelling - the human critical path to
 the 09 gate. This window is that entry point:
 
 * **The formal audit is a five-span PLAN**, drawn once by ``plan_audit`` (five
-  contiguous 2-min spans, stratified across 2-3 animals and conditions) with its
+  contiguous 2-min spans; animals rotated, conditions balanced across the gate's
+  eligible pool by ``recall.condition_plan``) with its
   seed and pool written to the store BEFORE the first span is shown. Each open
   advances through it ("span k of 5"); progress is read back from which spans
   have committed marks, so closing the window and returning resumes the plan.
@@ -200,7 +201,10 @@ class AuditWindow(QMainWindow):
             raise RuntimeError(msg)
         pool = self._assessable_pool()
         seed = secrets.randbits(32) if seed is None else int(seed)
-        drawn = plan_audit(pool, seed)
+        # Conditions are balanced across the gate's eligible pool (ruling 2026-09-29),
+        # from the composition of earlier eligible plans only - never their scores.
+        conditions = recall.condition_plan(self._store, N_SPANS)
+        drawn = plan_audit(pool, seed, conditions=conditions)
         plan_id = f"plan_{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}_{seed:08x}"
         record = {
             "plan_id": plan_id, "created_at": datetime.now(UTC).isoformat(),
@@ -208,6 +212,9 @@ class AuditWindow(QMainWindow):
             # Declared before any labelling (Andrea, 2026-09-28): one artifact is one
             # connected run of committed marks. The scorer reads it from here.
             "scoring_unit": recall.CURRENT_SCORING_UNIT,
+            "condition_rule": "each span takes the condition with fewer spans in the "
+                              "gate's eligible pool (ties alternate, baseline first); "
+                              "from earlier eligible plans' composition, never scores",
             "pool_rule": "eligible (non-excluded) baseline and stim_recovery recordings "
                          "with a recorded duration; stim_recovery loses 0 to "
                          "stim_duration + tolerance s; 20 s edge guards",
