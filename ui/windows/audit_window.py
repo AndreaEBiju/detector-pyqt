@@ -191,8 +191,9 @@ class AuditWindow(QMainWindow):
         if self.plan is not None:
             msg = f"plan {self.plan['plan_id']} is still open; finish it first"
             raise RuntimeError(msg)
-        # The sequential rule (task 09, pre-declared): a new round only once the
-        # last is scored and every miss is diagnosed and fixed in task 07.
+        # The sequential rule (task 09): a new round only once the last is scored and
+        # every miss is diagnosed and closed - fixed, not_target, or an accepted
+        # limitation (ruling 2026-09-29).
         allowed, why = recall.check_next_round(self._store, reveal_sha=bridge.reveal_sha())
         if not allowed:
             msg = f"a new audit round cannot be drawn yet: {why}"
