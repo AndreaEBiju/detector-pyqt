@@ -162,8 +162,33 @@ def _fake_recording(row: dict) -> Recording:
 
 
 def _window(store: GemsStore, tmp_path: Path):
+    """The window, after PROBING that this platform delivers shortcut keys at all.
+
+    The probe is Space on a throwaway window (it only moves the cursor). If it fails, the
+    platform cannot test keystrokes and the test is skipped for that reason alone; the
+    widen behaviour itself is then asserted unconditionally.
+    """
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication
+
     from ui.windows.adjudication_window import AdjudicationWindow
 
+    app = QApplication.instance()
+    (tmp_path / "probe").mkdir(exist_ok=True)
+    probe = AdjudicationWindow(_session(store, tmp_path / "probe"), load_fn=_fake_recording,
+                               async_traces=False)
+    probe.show()
+    probe.activateWindow()
+    app.processEvents()
+    before = probe.session.cursor
+    QTest.keyClick(probe, Qt.Key_Space)
+    app.processEvents()
+    delivered = probe.session.cursor != before
+    probe.session.close = lambda: []  # type: ignore[method-assign]
+    probe.close()
+    if not delivered:
+        pytest.skip("this platform does not deliver shortcut key events (Space probe)")
     w = AdjudicationWindow(_session(store, tmp_path), load_fn=_fake_recording,
                            async_traces=False)
     w.resize(1400, 900)
@@ -212,8 +237,7 @@ def test_shift_drag_then_1_records_motion_with_the_widen(qapp, store, tmp_path) 
     assert w.pending_widen[1] == pytest.approx(21.5, abs=0.05)
     assert w.pending_widen[0] == widen[0]
     _key(qapp, w, Qt.Key_1)
-    if w.session.position()[0] == 0:
-        pytest.skip("offscreen platform did not deliver shortcut key events")
+    assert w.session.position()[0] == 1
     assert w.pending_widen is None and w._widen_items == []
     w.close()
     rec = _shards(store).iloc[0]
@@ -235,8 +259,7 @@ def test_a_non_motion_key_is_refused_while_a_widen_is_pending(qapp, store, tmp_p
     assert w.press("2") is None and w.session.position()[0] == 0
     assert "only with motion" in w.status.text()
     _key(qapp, w, Qt.Key_Escape)
-    if w.pending_widen is not None:
-        pytest.skip("offscreen platform did not deliver shortcut key events")
+    assert w.pending_widen is None
     _key(qapp, w, Qt.Key_2)
     assert w.session.judgement_of(w.session.rows[0]) == "physiology"
 
@@ -251,8 +274,7 @@ def test_ctrl_z_clears_a_pending_widen_before_undoing_a_judgement(qapp, store, t
     _shift_drag(qapp, w, 54.0, 56.0)  # core 1 (55.5-55.6) widened
     assert w.pending_widen is not None
     _key(qapp, w, Qt.Key_Z, Qt.ControlModifier)
-    if w.pending_widen is not None:
-        pytest.skip("offscreen platform did not deliver shortcut key events")
+    assert w.pending_widen is None
     assert w.session.judgement_of(w.session.rows[0]) == "physiology"  # not undone yet
     _key(qapp, w, Qt.Key_Z, Qt.ControlModifier)
     assert w.session.judgement_of(w.session.rows[0]) is None
@@ -274,4 +296,47 @@ def test_a_drag_is_clipped_to_the_cores_region(qapp, store, tmp_path) -> None:
     qapp.processEvents()
     assert w.widen(2.0, 20.5) == pytest.approx((10.0, 20.5))  # region starts at 10 s
     w.clear_widen()
-    assert w.widen(20.03, 20.05) == pytest.approx((20.0, 20.12))  # never narrower than the core
+    assert w.widen(19.9, 20.05) == pytest.approx((19.9, 20.12))  # never narrower than the core
+
+
+@pytest.mark.parametrize("bad", [(float("-inf"), 21.0), (19.0, float("inf")),
+                                 (float("nan"), 21.0)])
+def test_a_non_finite_widen_is_refused(bad: tuple[float, float]) -> None:
+    with pytest.raises(ValueError, match=r"finite|contain"):
+        jd.make_record(_row(), "motion", user=USER, app_sha=None, queue_file="q",
+                       queue_sha256="0", widened=bad)
+
+
+def test_a_widen_outside_the_region_is_refused() -> None:
+    with pytest.raises(ValueError, match="region"):  # region of row 0 is 10-190 s
+        jd.make_record(_row(), "motion", user=USER, app_sha=None, queue_file="q",
+                       queue_sha256="0", widened=(5.0, 21.0))
+
+
+def test_a_drag_inside_the_core_stores_no_widen(qapp, store, tmp_path) -> None:
+    w = _window(store, tmp_path)
+    qapp.processEvents()
+    assert w.widen(20.03, 20.05) is None  # core is 20.00-20.12
+    assert w.pending_widen is None and w._widen_items == []
+
+
+def test_undo_is_enabled_while_a_widen_is_pending(qapp, store, tmp_path) -> None:
+    w = _window(store, tmp_path)
+    qapp.processEvents()
+    assert not w._undo_btn.isEnabled()
+    w.widen(19.0, 20.5)
+    assert w._undo_btn.isEnabled()
+    w._undo_btn.click()
+    assert w.pending_widen is None
+
+
+def test_a_half_widened_journal_line_is_dropped_and_logged(store, tmp_path, caplog) -> None:
+    s = _session(store, tmp_path)
+    s.judge("motion", widened=(19.0, 21.0))
+    line = json.loads(s.journal_path.read_text(encoding="utf-8").splitlines()[0])
+    del line["widened_stop_s"]
+    s.journal_path.write_text(json.dumps(line) + "\n", encoding="utf-8", newline="\n")
+    with caplog.at_level("WARNING"):
+        again = _session(store, tmp_path)
+    assert again.restored == 0 and again.dropped == [line["judgement_id"]]
+    assert "dropped on restore" in caplog.text

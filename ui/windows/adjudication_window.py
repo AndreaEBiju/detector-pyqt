@@ -318,20 +318,27 @@ class AdjudicationWindow(QMainWindow):
     def widen(self, lo: float, hi: float) -> tuple[float, float] | None:
         """Widen the on-screen core's boundary to cover ``[lo, hi)`` (recording seconds).
 
-        The pending widen is the union of the core, any earlier drag and this one,
-        clipped to the core's region. Returns it, or ``None`` if no core is on screen.
+        The pending widen is the HULL of the core, any earlier drag and this one, clipped
+        to the core's region: a drag that leaves a gap from the core fills the gap, and a
+        drag past the region's edge stops at the edge. A drag entirely inside the core
+        widens nothing (no widen is stored). Returns the pending widen, or ``None``.
         """
         row = self.session.current()
         if row is None or row["core_key"] != self._shown_key:
             self.status.setText("No core is on screen to widen.")
             return None
         r0, r1 = float(row["region_start_s"]), float(row["region_stop_s"])
+        c0, c1 = float(row["start_s"]), float(row["stop_s"])
+        if c0 <= min(lo, hi) and max(lo, hi) <= c1:
+            self.status.setText("That drag lies inside the core: nothing to widen.")
+            return self._widen
         a = min(float(row["start_s"]), max(r0, min(lo, hi)))
         b = max(float(row["stop_s"]), min(r1, max(lo, hi)))
         if self._widen is not None:
             a, b = min(a, self._widen[0]), max(b, self._widen[1])
         self._widen = (a, b)
         self._draw_widen()
+        self._undo_btn.setEnabled(True)  # Ctrl+Z / Undo clears a pending widen
         self.status.setText(f"Widened to {a:.3f}-{b:.3f} s. Press 1 to record motion with "
                             "it; Esc clears it.")
         return self._widen
@@ -390,7 +397,7 @@ class AdjudicationWindow(QMainWindow):
             self._skip_btn.setEnabled(False)
             return
         self._skip_btn.setEnabled(True)
-        self._undo_btn.setEnabled(self.session.can_undo())
+        self._undo_btn.setEnabled(self.session.can_undo() or self._widen is not None)
         self.core_info.setText(f"<b>Loading</b> {_breakable(str(row['recording']))} ...")
         try:
             self._ensure_recording(row)
@@ -483,7 +490,7 @@ class AdjudicationWindow(QMainWindow):
         lines.append(f"{self.session.pending} judgement(s) not yet written to the store "
                      f"({len(self.session.written)} shard(s) written this session)")
         self.progress.setText("<br>".join(lines))
-        self._undo_btn.setEnabled(self.session.can_undo())
+        self._undo_btn.setEnabled(self.session.can_undo() or self._widen is not None)
 
     # -- z-traces -------------------------------------------------------------
 

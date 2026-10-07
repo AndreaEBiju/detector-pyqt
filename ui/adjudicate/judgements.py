@@ -45,10 +45,11 @@ Crash safety
 Shards are written in batches, so between flushes each judgement and each undo is also
 appended to a LOCAL per-user journal (JSONL, outside the store, never synced). On reopen,
 journal judgements not undone and not found in any shard are restored as pending - only
-their judgement, time, id, user and commit are taken from the journal; every other field
-is rebuilt from the queue row. Journal lines are canonical ASCII JSON with absent keys
-for missing values; a torn last line (a crash mid-write) is terminated before anything
-new is appended, so it can never swallow the next event.
+their judgement, time, id, user, commit and widened boundary (:data:`JOURNAL_KEPT`) are
+taken from the journal; every other field is rebuilt from the queue row. Journal lines
+are canonical ASCII JSON with absent keys for missing values; a torn last line (a crash
+mid-write) is terminated before anything new is appended, so it can never swallow the
+next event.
 """
 
 from __future__ import annotations
@@ -84,10 +85,10 @@ __all__ = [
     "SHARD_COLUMNS",
     "app_commit",
     "check_writable",
-    "judgement_for_key",
-    "make_record",
     "journal_append",
     "journal_repair",
+    "judgement_for_key",
+    "make_record",
     "read_journal",
     "read_shards",
     "write_shard",
@@ -140,8 +141,9 @@ def make_record(row: Mapping[str, Any], judgement: str, *, user: str,
     """One shard row for ``row`` (a validated queue row) judged ``judgement``.
 
     ``widened`` is the labeller's widened boundary ``(start_s, stop_s)`` on the recording
-    timeline - only with ``motion``, and containing the core.
+    timeline - only with ``motion``, finite, containing the core, inside its region.
     """
+    _checked_widen(judgement, row, widened)
     if judgement not in JUDGEMENTS:
         msg = f"judgement must be one of {sorted(JUDGEMENTS)}, got {judgement!r}"
         raise ValueError(msg)
@@ -161,22 +163,30 @@ def make_record(row: Mapping[str, Any], judgement: str, *, user: str,
         "alias_table_sha256": _text_or_none(row.get("alias_table_sha256")),
         "widened_start_s": float(widened[0]) if widened is not None else math.nan,
         "widened_stop_s": float(widened[1]) if widened is not None else math.nan,
-    } | _checked_widen(judgement, row, widened)
+    }
 
 
 def _checked_widen(judgement: str, row: Mapping[str, Any],
-                   widened: tuple[float, float] | None) -> dict[str, Any]:
+                   widened: tuple[float, float] | None) -> None:
+    """Raise unless a widen goes with motion, is finite, contains the core and stays in
+    the core's region."""
     if widened is None:
-        return {}
+        return
     if judgement != "motion":
         msg = f"a widened boundary goes only with motion, not {judgement!r}"
         raise ValueError(msg)
     a, b = float(widened[0]), float(widened[1])
+    if not (math.isfinite(a) and math.isfinite(b)):
+        msg = f"a widened boundary must be finite, got [{a}, {b})"
+        raise ValueError(msg)
     if not (a <= float(row["start_s"]) and float(row["stop_s"]) <= b):
         msg = (f"a widened boundary must contain the core [{row['start_s']}, "
                f"{row['stop_s']}); got [{a}, {b})")
         raise ValueError(msg)
-    return {}
+    if not (float(row["region_start_s"]) <= a and b <= float(row["region_stop_s"])):
+        msg = (f"a widened boundary must stay inside the core's region "
+               f"[{row['region_start_s']}, {row['region_stop_s']}); got [{a}, {b})")
+        raise ValueError(msg)
 
 
 def _text_or_none(v: Any) -> str | None:
