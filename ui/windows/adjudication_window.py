@@ -12,6 +12,16 @@ negative. ``Space`` skips (the core stays unjudged and comes round again);
 ``Ctrl+Z`` / ``Backspace`` undoes the last judgement (up to the 20 still unwritten);
 ``Home`` re-centres; ``+`` / ``-`` widen or narrow the context.
 
+**Widening a boundary** ("where the extent is visibly wrong", task 16 Change 1):
+``Shift+drag`` on the plot widens the current core's boundary to cover the drag (the
+union with the core and any earlier drag, clipped to the core's region), drawn in red.
+The judged unit stays the core (R3): the widened span is stored as
+``widened_start_s`` / ``widened_stop_s`` beside it, never instead of it. A widened
+boundary goes only with **motion**: ``1`` records it; ``2`` / ``3`` / ``4`` are refused
+while one is pending (clear it first). ``Esc`` clears it; ``Ctrl+Z`` clears a pending
+widen first, then undoes judgements as before - and undoing a motion judgement withdraws
+its widened boundary with it.
+
 Band z-traces (the maximum over every signal, per band, with ``z_enter``) are
 available per recording but OFF by default: they mean running the detection chain over
 the core's whole assessable region (Night 1 measured about three minutes and several GB
@@ -46,7 +56,7 @@ from PySide6.QtWidgets import (
 )
 
 from ui.adjudicate import loaders
-from ui.adjudicate.judgements import KEY_TO_JUDGEMENT
+from ui.adjudicate.judgements import KEY_TO_JUDGEMENT, judgement_for_key
 from ui.adjudicate.session import AdjudicationSession
 from ui.audit import bridge
 from ui.audit.array_recording import ArrayRecording
@@ -114,6 +124,8 @@ class AdjudicationWindow(QMainWindow):
         self._jobs: list[_TraceJob] = []
         self._context = CONTEXT_S
         self._core_items: list[pg.LinearRegionItem] = []
+        self._widen: tuple[float, float] | None = None
+        self._widen_items: list[pg.LinearRegionItem] = []
         # The core_key actually on screen. Set only once its recording is loaded, its
         # details written and its band drawn; a judging key is refused unless it equals
         # the current core's key, so nothing can label a core the labeller never saw.
@@ -189,6 +201,7 @@ class AdjudicationWindow(QMainWindow):
         QShortcut(QKeySequence.Undo, self, activated=self._slot(self.undo))
         QShortcut(QKeySequence(Qt.Key_Backspace), self, activated=self._slot(self.undo))
         QShortcut(QKeySequence(Qt.Key_Home), self, activated=self._slot(self.recentre))
+        QShortcut(QKeySequence(Qt.Key_Escape), self, activated=self._slot(self.clear_widen))
         QShortcut(QKeySequence(Qt.Key_Plus), self, activated=self._slot(lambda: self.zoom(+1)))
         QShortcut(QKeySequence(Qt.Key_Equal), self, activated=self._slot(lambda: self.zoom(+1)))
         QShortcut(QKeySequence(Qt.Key_Minus), self, activated=self._slot(lambda: self.zoom(-1)))
@@ -232,7 +245,14 @@ class AdjudicationWindow(QMainWindow):
                 self.status.setText("This core is not on screen (its recording did not "
                                     "load), so it cannot be judged. Space skips it.")
             return None
-        rec = self.session.judge_key(key)
+        judgement = judgement_for_key(key)
+        if judgement is None:
+            return None
+        if self._widen is not None and judgement != "motion":
+            self.status.setText(f"A widened boundary goes only with motion: press 1 to record "
+                                f"motion with it, or Esc to clear it before judging {judgement}.")
+            return None
+        rec = self.session.judge_key(key, widened=self._widen)
         if rec is None:
             return None
         where = f"{before['recording']} {float(before['start_s']):.3f} s" if before else ""
@@ -246,7 +266,13 @@ class AdjudicationWindow(QMainWindow):
         self.show_current()
 
     def undo(self) -> None:
-        """Withdraw the newest unwritten judgement and show its core again."""
+        """Clear a pending widen; otherwise withdraw the newest unwritten judgement.
+
+        Undoing a motion judgement withdraws its widened boundary with it (one record).
+        """
+        if self._widen is not None:
+            self.clear_widen()
+            return
         rec = self.session.undo()
         if rec is None:
             self.status.setText("Nothing to undo: every judgement so far is already "
@@ -281,6 +307,63 @@ class AdjudicationWindow(QMainWindow):
         self.viewer.set_viewport(lo, hi)
         self._set_trace_range(lo, hi)
 
+    # -- widening ------------------------------------------------------------
+
+    def _on_widen_drag(self, lo: float, hi: float) -> None:
+        try:
+            self.widen(lo, hi)
+        except Exception as exc:  # noqa: BLE001 - shown, not swallowed
+            self._report(exc)
+
+    def widen(self, lo: float, hi: float) -> tuple[float, float] | None:
+        """Widen the on-screen core's boundary to cover ``[lo, hi)`` (recording seconds).
+
+        The pending widen is the union of the core, any earlier drag and this one,
+        clipped to the core's region. Returns it, or ``None`` if no core is on screen.
+        """
+        row = self.session.current()
+        if row is None or row["core_key"] != self._shown_key:
+            self.status.setText("No core is on screen to widen.")
+            return None
+        r0, r1 = float(row["region_start_s"]), float(row["region_stop_s"])
+        a = min(float(row["start_s"]), max(r0, min(lo, hi)))
+        b = max(float(row["stop_s"]), min(r1, max(lo, hi)))
+        if self._widen is not None:
+            a, b = min(a, self._widen[0]), max(b, self._widen[1])
+        self._widen = (a, b)
+        self._draw_widen()
+        self.status.setText(f"Widened to {a:.3f}-{b:.3f} s. Press 1 to record motion with "
+                            "it; Esc clears it.")
+        return self._widen
+
+    def clear_widen(self) -> None:
+        """Drop the pending widened boundary (nothing was recorded)."""
+        had = self._widen is not None
+        self._widen = None
+        self._draw_widen()
+        if had:
+            self.status.setText("Cleared the widened boundary.")
+
+    @property
+    def pending_widen(self) -> tuple[float, float] | None:
+        """The widened boundary waiting for its motion judgement, if any."""
+        return self._widen
+
+    def _draw_widen(self) -> None:
+        if self.viewer is not None:
+            for (plot, _c), item in zip(self.viewer.plots, self._widen_items, strict=False):
+                plot.removeItem(item)
+        self._widen_items = []
+        if self._widen is None or self.viewer is None:
+            return
+        for plot, _curve in self.viewer.plots:
+            item = pg.LinearRegionItem(values=self._widen, orientation="vertical",
+                                       movable=False, brush=pg.mkBrush(214, 39, 40, 40),
+                                       pen=pg.mkPen("#d62728", width=1))
+            item.setZValue(-6)
+            plot.addItem(item)
+            self._widen_items.append(item)
+
     # -- display --------------------------------------------------------------
 
     def _set_judging_enabled(self, enabled: bool) -> None:
@@ -294,6 +377,8 @@ class AdjudicationWindow(QMainWindow):
         load that fails leaves them disabled (Space still skips past it).
         """
         self._shown_key = None
+        self._widen = None  # a widen belongs to the core it was drawn on
+        self._draw_widen()
         self._set_judging_enabled(False)
         self._refresh_progress()
         row = self.session.current()
@@ -339,8 +424,11 @@ class AdjudicationWindow(QMainWindow):
         self.viewer = MultiChannelViewer(ArrayRecording(recording.data, recording.fs),
                                          channel_names=names,
                                          channel_colors=_COLOURS[: len(names)])
+        self.viewer.bad_interval_added.connect(self._on_widen_drag)
+        self.viewer.follow_mark_drag = True  # a widen may run past the viewport
         self._placeholder.hide()
         self._centre_lay.insertWidget(0, self.viewer, 1)
+        self._widen_items = []
         self._recording, self._rec_id = recording, rid
         self._core_items = []
         others = np.array([[r["start_s"], r["stop_s"]] for r in self.session.rows
