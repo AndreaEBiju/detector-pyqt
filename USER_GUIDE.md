@@ -441,10 +441,10 @@ The core is the yellow band; the queue's other cores in the same recording are
 shaded orange. A **TEST SET** tag means the judgement is stored as test data and
 never trains. Judgements are written to the GEMS store as your own write-once files,
 `labels/<animal>/events_<you>_<stamp>-adj-<cohort>-<label_set>-<n>.parquet`, in
-batches and when you close the window; until then a local journal keeps them, so a
+batches and when you close the window (or press *Write judgements to the store now*); until then a local journal keeps them, so a
 crash loses nothing - reopening the same queue restores them and resumes where you
 stopped. Old-cohort rows read `<rid>_notched.mat` under the Survivals folder
-(`--survivals-root`, or `GEMS_SURVIVALS_ROOT`). The queue's columns are documented in
+(`--survivals-root`, or `GEMS_SURVIVALS_ROOT`, or a `survivals_root = "..."` line in your gems `config.toml`). The queue's columns are documented in
 `ui/adjudicate/queue.py`.
 
 ## 6. Saving

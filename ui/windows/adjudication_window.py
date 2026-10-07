@@ -114,6 +114,10 @@ class AdjudicationWindow(QMainWindow):
         self._jobs: list[_TraceJob] = []
         self._context = CONTEXT_S
         self._core_items: list[pg.LinearRegionItem] = []
+        # The core_key actually on screen. Set only once its recording is loaded, its
+        # details written and its band drawn; a judging key is refused unless it equals
+        # the current core's key, so nothing can label a core the labeller never saw.
+        self._shown_key: str | None = None
         self.viewer: MultiChannelViewer | None = None
         self.last_error: str | None = None
 
@@ -192,8 +196,7 @@ class AdjudicationWindow(QMainWindow):
         if session.restored:
             self.status.setText(f"Restored {session.restored} judgement(s) from the local "
                                 "journal that had not reached the store yet.")
-        # Through the slot, so a recording that cannot load is shown, not raised.
-        self._slot(self.show_current)()
+        self.show_current()  # a recording that cannot load is reported, not raised
 
     # -- plumbing -------------------------------------------------------------
 
@@ -203,19 +206,32 @@ class AdjudicationWindow(QMainWindow):
             try:
                 action()
             except Exception as exc:  # noqa: BLE001 - shown, not swallowed
-                self.last_error = str(exc)
-                self.status.setText(f"Could not do that: {exc}")
-                box = QMessageBox(QMessageBox.Warning, "Candidate adjudication", str(exc),
-                                  parent=self)
-                box.setModal(False)
-                box.show()
+                self._report(exc)
         return slot
+
+    def _report(self, exc: Exception) -> None:
+        """Put a failure on screen (status line and a non-modal box) and remember it."""
+        self.last_error = str(exc)
+        self.status.setText(f"Could not do that: {exc}")
+        box = QMessageBox(QMessageBox.Warning, "Candidate adjudication", str(exc),
+                          parent=self)
+        box.setModal(False)
+        box.show()
 
     # -- actions --------------------------------------------------------------
 
     def press(self, key: str) -> dict[str, Any] | None:
-        """A judging keystroke. Unknown keys do nothing."""
+        """A judging keystroke. Unknown keys do nothing.
+
+        Refused unless the current core is the one on screen (:attr:`_shown_key`): after
+        a recording fails to load, the keys must not label a core nobody has seen.
+        """
         before = self.session.current()
+        if before is None or before["core_key"] != self._shown_key:
+            if before is not None:
+                self.status.setText("This core is not on screen (its recording did not "
+                                    "load), so it cannot be judged. Space skips it.")
+            return None
         rec = self.session.judge_key(key)
         if rec is None:
             return None
@@ -267,25 +283,41 @@ class AdjudicationWindow(QMainWindow):
 
     # -- display --------------------------------------------------------------
 
+    def _set_judging_enabled(self, enabled: bool) -> None:
+        for b in self._buttons.values():
+            b.setEnabled(enabled)
+
     def show_current(self) -> None:
-        """Load (if needed) and display the current core; or say the queue is done."""
+        """Load (if needed) and display the current core; or say the queue is done.
+
+        The judging keys and buttons are live only once the core is fully on screen; a
+        load that fails leaves them disabled (Space still skips past it).
+        """
+        self._shown_key = None
+        self._set_judging_enabled(False)
         self._refresh_progress()
         row = self.session.current()
         if row is None:
-            self.core_info.setText("<b>Queue finished.</b> Every core has a judgement.")
-            self.session.flush(force=True)
-            self._refresh_progress()
-            for b in self._buttons.values():
-                b.setEnabled(False)
+            # Written on close (or "Write judgements now"), not here, so the last
+            # judgements stay undoable until the labeller is done.
+            self.core_info.setText("<b>Queue finished.</b> Every core has a judgement. "
+                                   "Close the window to write the rest to the store.")
             self._skip_btn.setEnabled(False)
             return
-        for b in self._buttons.values():
-            b.setEnabled(True)
         self._skip_btn.setEnabled(True)
         self._undo_btn.setEnabled(self.session.can_undo())
-        self._ensure_recording(row)
-        self._describe(row)
-        self._highlight(row)
+        self.core_info.setText(f"<b>Loading</b> {_breakable(str(row['recording']))} ...")
+        try:
+            self._ensure_recording(row)
+            self._describe(row)
+            self._highlight(row)
+        except Exception as exc:  # noqa: BLE001 - shown; the keys stay disabled
+            self.core_info.setText(f"<b>Could not show this core</b> "
+                                   f"({_breakable(str(row['recording']))}). Space skips it.")
+            self._report(exc)
+            return
+        self._shown_key = row["core_key"]
+        self._set_judging_enabled(True)
         self.recentre()
         self._show_traces(row)
 
@@ -424,7 +456,11 @@ class AdjudicationWindow(QMainWindow):
     # -- closing ----------------------------------------------------------------
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt override
-        """Write everything pending before closing; on failure, keep the window open."""
+        """Write everything pending, then close.
+
+        If the write fails the window still closes, after saying so: the judgements are
+        in the local journal and are restored the next time this queue is opened.
+        """
         try:
             self.session.close()
         except Exception as exc:  # noqa: BLE001 - shown; the journal still holds them
@@ -465,7 +501,8 @@ def open_queue(queue_path: Path, store: GemsStore, *, user: str | None = None,
                    f"{loaders.SURVIVALS_ENV}")
             raise FileNotFoundError(msg)
         path = loaders.old_signal_path(root, str(row["folder"]), str(row["recording"]))
-        return loaders.load_old_signal(path, str(row["recording"]), str(row["animal"]))
+        return loaders.load_old_signal(path, str(row["recording"]), str(row["animal"]),
+                                       units=loaders.OLD_COHORT_UNITS)
 
     win = AdjudicationWindow(session, load_fn=load_fn)
     if not who.is_confident:

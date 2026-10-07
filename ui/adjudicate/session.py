@@ -114,16 +114,39 @@ class AdjudicationSession:
             if k in self._index}
         stored_ids = set(stored["judgement_id"].astype(str))
         self._pending: list[dict[str, Any]] = []
+        jd.journal_repair(self.journal_path)
         for rec in jd.read_journal(self.journal_path):
-            if rec["judgement_id"] in stored_ids:
-                continue
-            key = core_key(rec["recording"], rec["start_s"], rec["stop_s"])
-            if key in self._index:
-                self._pending.append(rec)
-                self._judged[key] = rec["judgement"]
+            restored = self._restore(rec, stored_ids)
+            if restored is not None:
+                self._pending.append(restored)
+                self._judged[restored["core_key"]] = restored["judgement"]
+                del restored["core_key"]
         self.restored = len(self._pending)
         self.cursor = 0
         self._advance_to_unjudged(0)
+
+    def _restore(self, rec: dict[str, Any], stored_ids: set[str]) -> dict[str, Any] | None:
+        """A journal record rebuilt from its queue row, or ``None`` if it does not apply.
+
+        Only :data:`judgements.JOURNAL_KEPT` comes from the journal; recording, times,
+        cohort, label_set, draw and the rest are the queue's, so a journal line can never
+        carry a field the queue does not say (e.g. a label_set the queue does not give).
+        """
+        try:
+            if rec["judgement_id"] in stored_ids or rec.get("by") != self.user:
+                return None
+            key = core_key(rec["recording"], rec["start_s"], rec["stop_s"])
+            if key not in self._index:
+                return None
+            out = jd.make_record(
+                self.rows[self._index[key]], rec["judgement"], user=self.user,
+                app_sha=rec.get("app_commit"), queue_file=self.queue_file,
+                queue_sha256=self.queue_sha256, at=datetime.fromisoformat(rec["at"]),
+                judgement_id=rec["judgement_id"])
+        except (KeyError, TypeError, ValueError):
+            return None  # a malformed journal line is not a judgement
+        out["core_key"] = key
+        return out
 
     # -- navigation -------------------------------------------------------
 
@@ -211,8 +234,12 @@ class AdjudicationSession:
     def flush(self, *, force: bool = False) -> list[Path]:
         """Write pending judgements as new shards.
 
-        Without ``force``: only once more than ``undo_depth + flush_batch`` are pending,
+        Without ``force``: only once at least ``undo_depth + flush_batch`` are pending,
         and then all but the newest ``undo_depth``. With ``force``: all of them.
+
+        Shards are written one ``(animal, cohort, label_set)`` group at a time, and each
+        group leaves the pending list (by ``judgement_id``) as soon as its shard lands -
+        so a failure part-way through never writes a group twice on the retry.
         """
         if force:
             batch = list(self._pending)
@@ -222,9 +249,14 @@ class AdjudicationSession:
             return []
         if not batch:
             return []
-        paths = jd.write_shards(self.store, batch, self.user)
-        del self._pending[: len(batch)]
-        self.written.extend(paths)
+        jd.check_writable(batch)
+        paths: list[Path] = []
+        for _key, rows in jd.shard_groups(batch):
+            path = jd.write_shard(self.store, rows, self.user)
+            ids = {r["judgement_id"] for r in rows}
+            self._pending = [r for r in self._pending if r["judgement_id"] not in ids]
+            self.written.append(path)
+            paths.append(path)
         return paths
 
     def close(self) -> list[Path]:

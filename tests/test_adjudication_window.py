@@ -33,6 +33,7 @@ from ui.audit.bridge import BandTrace
 
 FS = 2000.0
 USER = "tester"
+SEEDS = {"synth_a_rec1": 11, "synth_j_rec1": 12, "synth_old_1": 13}
 
 
 @pytest.fixture(scope="module")
@@ -50,7 +51,7 @@ def store(tmp_path: Path) -> GemsStore:
 def _fake_recording(row: dict) -> Recording:
     n_ch = 9 if row["cohort"] == "new" else 5
     dur = 200.0 if row["cohort"] == "new" else 60.0
-    rng = np.random.default_rng(abs(hash(row["recording"])) % 2**32)
+    rng = np.random.default_rng(SEEDS[row["recording"]])
     data = rng.standard_normal((int(dur * FS), n_ch)) * 10.0
     chans = [ChannelInfo(i, f"C{i}", "nerve", None, None, None, "independent")
              for i in range(n_ch)]
@@ -116,7 +117,9 @@ def test_a_synthetic_queue_is_judged_end_to_end_by_keystroke(qapp, store, tmp_pa
     qapp.processEvents()
     assert w.session.current() is None
     assert w.loads == ["synth_a_rec1", "synth_j_rec1", "synth_old_1"]  # one load each
-    out = _written(store)  # finishing the queue writes everything
+    assert w.session.pending == 5  # finishing does not write: the last stay undoable
+    w.close()
+    out = _written(store)  # closing writes everything
     assert sorted(out["judgement"]) == sorted(["motion", "physiology", "unsure",
                                                "line_noise", "motion"])
     assert out.loc[out["animal"] == "J", "label_set"].tolist() == ["test"]
@@ -211,13 +214,24 @@ def test_old_cohort_signal_is_declared_volts_converted_to_microvolts(tmp_path) -
     folder.mkdir(parents=True)
     savemat(folder / "M1_FOO_M1_bl_1200_notched.mat", {"y": y_v, "fs": 24414.0625})
     path = loaders.old_signal_path(tmp_path / "Survivals", "rat1", "M1_FOO_M1_bl_1200")
-    rec = loaders.load_old_signal(path, "M1_FOO_M1_bl_1200", "F")
+    rec = loaders.load_old_signal(path, "M1_FOO_M1_bl_1200", "F", units="V")
     assert rec.data == pytest.approx(y_v * 1e6)
     assert [c.name for c in rec.channels] == list(loaders.OLD_COHORT_CHANNELS)
     assert {c.config for c in rec.channels} == {"hw_tripole"}
     assert rec.fs == 24414.0625
     with pytest.raises(ValueError, match="units declared as 'uV'"):
         loaders.load_old_signal(path, "M1_FOO_M1_bl_1200", "F", units="uV")
+
+
+def test_old_cohort_units_must_be_declared_and_shape_is_never_guessed(tmp_path) -> None:
+    rng = np.random.default_rng(5)
+    path = tmp_path / "x_notched.mat"
+    savemat(path, {"y": rng.standard_normal((20_000, 5)) * 10e-6, "fs": 24414.0625})
+    with pytest.raises(TypeError, match="units"):
+        loaders.load_old_signal(path, "x", "F")  # type: ignore[call-arg]
+    savemat(path, {"y": rng.standard_normal((5, 20_000)) * 10e-6, "fs": 24414.0625})
+    with pytest.raises(ValueError, match="expected 5 channels"):
+        loaders.load_old_signal(path, "x", "F", units="V")
 
 
 def test_an_old_cohort_id_ending_in_notched_is_its_own_file_name(tmp_path) -> None:
@@ -240,14 +254,67 @@ def test_a_v73_old_cohort_file_is_transposed_not_reshaped(tmp_path) -> None:
     header = b"MATLAB 7.3 MAT-file, Platform: x".ljust(116, b" ") + b"\0" * 8 + b"\x00\x02IM"
     with path.open("r+b") as fh:
         fh.write(header)
-    rec = loaders.load_old_signal(path, "x", "F")
+    rec = loaders.load_old_signal(path, "x", "F", units="V")
     assert rec.data == pytest.approx(y_v * 1e6)
 
 
-def test_survivals_root_resolution_prefers_explicit_then_env(tmp_path, monkeypatch) -> None:
+def test_survivals_root_is_explicit_then_env_then_user_config_never_guessed(
+    tmp_path, monkeypatch
+) -> None:
+    cfg = tmp_path / "cfg" / "config.toml"
+    monkeypatch.setattr(loaders, "config_path", lambda: cfg)
+    monkeypatch.delenv(loaders.SURVIVALS_ENV, raising=False)
+    assert loaders.resolve_survivals_root() is None  # nothing configured: no guess
+    cfg.parent.mkdir()
+    cfg.write_text('gems_root = "x"\nsurvivals_root = "' + (tmp_path / "cfgroot").as_posix()
+                   + '"\n', encoding="utf-8")
+    assert loaders.resolve_survivals_root() == tmp_path / "cfgroot"
     monkeypatch.setenv(loaders.SURVIVALS_ENV, str(tmp_path / "env"))
-    assert loaders.resolve_survivals_root(tmp_path / "x") == tmp_path / "x"
     assert loaders.resolve_survivals_root() == tmp_path / "env"
+    assert loaders.resolve_survivals_root(tmp_path / "x") == tmp_path / "x"
+    assert not hasattr(loaders, "DEFAULT_SURVIVALS_ROOT")
+
+
+def test_keys_after_a_failed_load_do_not_label_the_unseen_core(qapp, store, tmp_path) -> None:
+    """A recording that fails to load leaves its core off screen; keys must not judge it."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    from ui.windows.adjudication_window import AdjudicationWindow
+
+    path = tmp_path / "queue.parquet"
+    example_queue().to_parquet(path, index=False)
+    session = AdjudicationSession(load_queue(path), store, USER,
+                                  journal_dir=tmp_path / "journal", queue_file=path.name,
+                                  queue_sha256="0" * 64, app_sha=None)
+
+    def load_fn(row):
+        if row["recording"] == "synth_j_rec1":
+            raise OSError("Drive file not available offline")
+        return _fake_recording(row)
+
+    w = AdjudicationWindow(session, load_fn=load_fn, async_traces=False)
+    w.show()
+    w.activateWindow()
+    qapp.processEvents()
+    for _ in range(3):
+        w.press("1")  # the three A cores, all on screen
+    j_row = w.session.current()
+    assert j_row["recording"] == "synth_j_rec1"
+    assert "offline" in (w.last_error or "")
+    assert not any(b.isEnabled() for b in w._buttons.values())
+    for key in "1234":
+        assert w.press(key) is None
+        w._buttons[key].click()  # disabled: does nothing
+        QTest.keyClick(w, getattr(Qt, f"Key_{key}"))
+    qapp.processEvents()
+    assert w.session.judgement_of(j_row) is None and w.session.pending == 3
+    w.skip()  # Space still moves past it
+    assert w.session.current()["cohort"] == "old"
+    assert all(b.isEnabled() for b in w._buttons.values())
+    w.press("2")
+    assert w.session.judgement_of(j_row) is None
+    assert w.session.counts() == {"motion": 3, "physiology": 1}
 
 
 def test_new_cohort_rows_load_through_meta_json_and_refuse_excluded(store, monkeypatch) -> None:

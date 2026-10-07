@@ -8,7 +8,8 @@ Required columns - a missing one raises :class:`QueueSchemaError` naming it:
                     ``gems_blanking_v2.io.channel_map.meta_path`` takes). Old cohort: the
                     recording id ``rid`` whose signal is ``<rid>_notched.mat`` (or
                     ``<rid>.mat`` when ``rid`` already ends in ``_notched``).
-``animal``          str. The animal letter the store files the recording under.
+``animal``          str. The animal letter the store files the recording under: exactly
+                    one upper-case letter (``^[A-Z]$``); ``"j"`` or ``"J "`` is refused.
 ``cohort``          ``"new"`` or ``"old"``.
 ``start_s``         float64 seconds, the core's start on the RECORDING's timeline
                     (0 = first sample), 0-based half-open ``[start_s, stop_s)``.
@@ -17,14 +18,22 @@ Required columns - a missing one raises :class:`QueueSchemaError` naming it:
 ``region_stop_s``   (the region z was referenced over). Must contain the core.
 ``draw``            ``"random"`` or ``"uncertainty"``: how the core entered the queue.
 ``label_set``       ``"train"`` or ``"test"``. Copied verbatim into every judgement.
-                    New-cohort I, J and K rows MUST be ``"test"`` (ruling 2026-10-07 (b)
-                    R1); a queue that says otherwise is refused.
+                    Rows for which ``gems_blanking_v2.model.labels.is_test_animal(cohort,
+                    animal)`` holds (new-cohort I, J, K; ruling 2026-10-07 (b) R1) MUST be
+                    ``"test"``; a queue that says otherwise is refused. Old-cohort letters
+                    are different rats (old JEL is also "J") and are not test animals.
 
 Optional columns:
 
 ``folder``          str, POSIX path RELATIVE to the old cohort's Survivals root, of the
                     folder holding ``<rid>_notched.mat``. **Required on every old row**
                     (null on new rows). Never absolute (cross-platform rule 2).
+``alias_table_sha256``
+                    str, 64 lower-case hex: sha256 of the bytes of the old-cohort animal
+                    alias table the ``animal`` letter came from. **Required on every old
+                    row** (the alias table is not yet confirmed by Andrea, so every
+                    old-cohort label records which version named its animal); null on
+                    new rows. Recorded on every judgement.
 ``score``           float64, the model's P(motion) for the core; shown, and recorded.
 ``peak_z``, ``peak_band``, ``peak_signal``
                     Night 1's per-core fields; shown beside the plot when present.
@@ -41,11 +50,13 @@ new-cohort recording is ~2 GB in memory and is loaded once per group.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path, PurePosixPath
 from typing import Final
 
 import numpy as np
 import pandas as pd
+from gems_blanking_v2.model.labels import is_test_animal
 
 __all__ = [
     "COHORTS",
@@ -66,7 +77,7 @@ REQUIRED_COLUMNS: Final[tuple[str, ...]] = (
     "region_start_s", "region_stop_s", "draw", "label_set",
 )
 OPTIONAL_COLUMNS: Final[tuple[str, ...]] = (
-    "folder", "score", "peak_z", "peak_band", "peak_signal",
+    "folder", "alias_table_sha256", "score", "peak_z", "peak_band", "peak_signal",
 )
 COHORTS: Final[frozenset[str]] = frozenset({"new", "old"})
 DRAWS: Final[frozenset[str]] = frozenset({"random", "uncertainty"})
@@ -92,10 +103,8 @@ def core_key(recording: str, start_s: float, stop_s: float) -> str:
     return f"{recording}|{lo}|{hi}"
 
 
-def _test_animals() -> frozenset[str]:
-    from gems_blanking_v2.model.labels import TEST_ANIMALS
-
-    return TEST_ANIMALS
+_ANIMAL_RE: Final = re.compile(r"[A-Z]")
+_SHA256_RE: Final = re.compile(r"[0-9a-f]{64}")
 
 
 def check_queue(df: pd.DataFrame) -> pd.DataFrame:
@@ -120,6 +129,12 @@ def check_queue(df: pd.DataFrame) -> pd.DataFrame:
         if bad:
             msg = f"column {col!r} has value(s) {bad}; allowed: {sorted(allowed)}"
             raise QueueSchemaError(msg)
+    bad_animal = sorted({a for a in df["animal"] if not (isinstance(a, str)
+                                                        and _ANIMAL_RE.fullmatch(a))}, key=repr)
+    if bad_animal:
+        msg = (f"column 'animal' must be one upper-case letter, got {bad_animal[:5]!r} "
+               "(no lower case, no whitespace)")
+        raise QueueSchemaError(msg)
     out = df.copy()
     for col in _TIME_COLUMNS:
         out[col] = pd.to_numeric(out[col], errors="raise").astype(np.float64)
@@ -148,13 +163,23 @@ def check_queue(df: pd.DataFrame) -> pd.DataFrame:
                 msg = (f"column 'folder' must be a POSIX path relative to the Survivals "
                        f"root, got {f!r}")
                 raise QueueSchemaError(msg)
-    # R1: no new-cohort I/J/K label may enter training.
-    leak = ((out["cohort"] == "new") & out["animal"].isin(_test_animals())
-            & (out["label_set"] != "test"))
+        if "alias_table_sha256" not in out.columns:
+            msg = "column 'alias_table_sha256' is required when the queue has old-cohort rows"
+            raise QueueSchemaError(msg)
+        bad_sha = [v for v in out.loc[old, "alias_table_sha256"]
+                   if not (isinstance(v, str) and _SHA256_RE.fullmatch(v))]
+        if bad_sha:
+            msg = (f"column 'alias_table_sha256' must be 64 lower-case hex on every old row; "
+                   f"{len(bad_sha)} row(s) are not, first {bad_sha[0]!r}")
+            raise QueueSchemaError(msg)
+    # R1: no test-animal label may enter training.
+    leak = np.array([is_test_animal(c, a) and ls != "test" for c, a, ls in
+                     zip(out["cohort"], out["animal"], out["label_set"], strict=True)],
+                    dtype=bool)
     if leak.any():
-        msg = (f"{int(leak.sum())} new-cohort row(s) from test animals "
-               f"{sorted(_test_animals())} have label_set != 'test' (ruling 2026-10-07 (b) "
-               "R1: I/J/K labels never enter training)")
+        msg = (f"{int(leak.sum())} row(s) for which is_test_animal(cohort, animal) holds "
+               "(new-cohort I/J/K) have label_set != 'test' (ruling 2026-10-07 (b) R1: "
+               "their labels never enter training)")
         raise QueueSchemaError(msg)
     out["core_key"] = [core_key(r, a, b) for r, a, b in
                        zip(out["recording"].astype(str), out["start_s"], out["stop_s"],
@@ -178,6 +203,10 @@ def load_queue(path: Path) -> pd.DataFrame:
     """Read, validate and order a queue parquet file."""
     df = pd.read_parquet(Path(path))
     return presentation_order(check_queue(df))
+
+
+EXAMPLE_ALIAS_SHA256: Final = "0" * 63 + "1"
+"""A placeholder alias-table hash for the synthetic old row (not a real table)."""
 
 
 def example_queue() -> pd.DataFrame:
@@ -205,5 +234,6 @@ def example_queue() -> pd.DataFrame:
         "region_stop_s": np.array([r[5][1] for r in rows], dtype=np.float64),
         "draw": [r[6] for r in rows], "label_set": [r[7] for r in rows],
         "folder": [r[8] for r in rows],
+        "alias_table_sha256": [EXAMPLE_ALIAS_SHA256 if r[2] == "old" else None for r in rows],
         "score": np.array([r[9] for r in rows], dtype=np.float64),
     })

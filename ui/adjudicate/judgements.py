@@ -21,14 +21,23 @@ Columns: ``gems_blanking_v2.model.labels.LABEL_COLUMNS`` (``source`` and ``label
 are ``"human"``, ``basis`` is ``"adjudicated"``) plus :data:`EXTRA_COLUMNS`: ``draw``,
 ``region_start_s``, ``region_stop_s``, ``score`` (NaN when the queue had none), ``by``
 (user id), ``at`` (UTC ISO-8601 with ``+00:00``), ``app_commit`` (this app's git commit,
-null if unknown), ``queue_file``, ``queue_sha256``, ``judgement_id`` (uuid4 hex).
+null if unknown), ``queue_file``, ``queue_sha256``, ``judgement_id`` (uuid4 hex) and
+``alias_table_sha256`` (old-cohort rows: the hash of the animal alias table the letter
+came from, which Andrea has not yet confirmed; null on new-cohort rows).
+
+Reading back (:func:`read_shards`) keeps only rows whose ``by`` is the user - a shard
+file pattern ``events_ann_*`` also matches ``events_ann_smith_*`` - and drops duplicate
+``judgement_id``s, so a shard that was written twice in a retry counts once.
 
 Crash safety
 ------------
 Shards are written in batches, so between flushes each judgement and each undo is also
 appended to a LOCAL per-user journal (JSONL, outside the store, never synced). On reopen,
-journal judgements not undone and not found in any shard are restored as pending.
-Journal lines are canonical ASCII JSON with absent keys for missing values.
+journal judgements not undone and not found in any shard are restored as pending - only
+their judgement, time, id, user and commit are taken from the journal; every other field
+is rebuilt from the queue row. Journal lines are canonical ASCII JSON with absent keys
+for missing values; a torn last line (a crash mid-write) is terminated before anything
+new is appended, so it can never swallow the next event.
 """
 
 from __future__ import annotations
@@ -52,7 +61,7 @@ from gems_blanking_v2.io.store import (
     utc_stamp,
     validate_component,
 )
-from gems_blanking_v2.model.labels import LABEL_COLUMNS
+from gems_blanking_v2.model.labels import LABEL_COLUMNS, is_test_animal
 
 from ui.adjudicate.queue import core_key
 
@@ -63,10 +72,14 @@ __all__ = [
     "KEY_TO_JUDGEMENT",
     "SHARD_COLUMNS",
     "app_commit",
+    "check_writable",
     "judgement_for_key",
     "make_record",
+    "journal_append",
+    "journal_repair",
     "read_journal",
     "read_shards",
+    "write_shard",
     "write_shards",
 ]
 
@@ -82,8 +95,10 @@ JUDGEMENTS: Final[frozenset[str]] = frozenset(KEY_TO_JUDGEMENT.values())
 BASIS: Final = "adjudicated"
 EXTRA_COLUMNS: Final[tuple[str, ...]] = (
     "draw", "region_start_s", "region_stop_s", "score", "by", "at", "app_commit",
-    "queue_file", "queue_sha256", "judgement_id",
+    "queue_file", "queue_sha256", "judgement_id", "alias_table_sha256",
 )
+JOURNAL_KEPT: Final[tuple[str, ...]] = ("judgement", "at", "judgement_id", "by", "app_commit")
+"""The fields a restored journal record contributes; the rest come from the queue row."""
 SHARD_COLUMNS: Final[tuple[str, ...]] = (*LABEL_COLUMNS, *EXTRA_COLUMNS)
 
 
@@ -106,7 +121,8 @@ def app_commit() -> str | None:
 
 def make_record(row: Mapping[str, Any], judgement: str, *, user: str,
                 app_sha: str | None, queue_file: str, queue_sha256: str,
-                at: datetime | None = None) -> dict[str, Any]:
+                at: datetime | None = None, judgement_id: str | None = None,
+                ) -> dict[str, Any]:
     """One shard row for ``row`` (a validated queue row) judged ``judgement``."""
     if judgement not in JUDGEMENTS:
         msg = f"judgement must be one of {sorted(JUDGEMENTS)}, got {judgement!r}"
@@ -123,8 +139,13 @@ def make_record(row: Mapping[str, Any], judgement: str, *, user: str,
         "region_stop_s": float(row["region_stop_s"]), "score": score_f,
         "by": user, "at": moment.isoformat(timespec="milliseconds"),
         "app_commit": app_sha, "queue_file": queue_file, "queue_sha256": queue_sha256,
-        "judgement_id": uuid.uuid4().hex,
+        "judgement_id": judgement_id or uuid.uuid4().hex,
+        "alias_table_sha256": _text_or_none(row.get("alias_table_sha256")),
     }
+
+
+def _text_or_none(v: Any) -> str | None:
+    return v if isinstance(v, str) and v else None
 
 
 # ---------------------------------------------------------------------------
@@ -139,40 +160,70 @@ def _frame(records: Iterable[Mapping[str, Any]]) -> pd.DataFrame:
     return df
 
 
-def write_shards(store: GemsStore, records: Sequence[Mapping[str, Any]], user: str,
-                 *, when: datetime | None = None) -> list[Path]:
-    """Write ``records`` as NEW shards, one per ``(animal, cohort, label_set)``.
-
-    Atomic (temp file in the same directory, then ``os.replace``) and write-once: a
-    shard is never rewritten, and a name already taken is skipped to the next sequence
-    number rather than replaced. Returns the paths written.
-    """
-    if not records:
-        return []
+def check_writable(records: Sequence[Mapping[str, Any]]) -> None:
+    """Raise unless every record may be written: judged, and R1-consistent."""
     for r in records:
         if r["judgement"] not in JUDGEMENTS:
             msg = f"refusing to write judgement {r['judgement']!r} (unjudged is never written)"
             raise ValueError(msg)
+        if is_test_animal(r["cohort"], r["animal"]) and r["label_set"] != "test":
+            msg = (f"refusing to write {r['cohort']} {r['animal']} with label_set "
+                   f"{r['label_set']!r}: a test animal's labels are 'test' (R1)")
+            raise ValueError(msg)
+
+
+def shard_groups(records: Sequence[Mapping[str, Any]]
+                 ) -> list[tuple[tuple[str, str, str], list[Mapping[str, Any]]]]:
+    """``records`` split by ``(animal, cohort, label_set)``, in a fixed order."""
     groups: dict[tuple[str, str, str], list[Mapping[str, Any]]] = {}
     for r in records:
         groups.setdefault((r["animal"], r["cohort"], r["label_set"]), []).append(r)
+    return sorted(groups.items())
+
+
+def write_shard(store: GemsStore, rows: Sequence[Mapping[str, Any]], user: str,
+                *, when: datetime | None = None) -> Path:
+    """Write ONE group's rows (one animal, cohort and label_set) as a new shard.
+
+    Atomic (temp file in the same directory, then ``os.replace``) and write-once: a
+    shard is never rewritten, and a name already taken is skipped to the next sequence
+    number rather than replaced. Refuses unjudged rows and test-animal rows not marked
+    ``test``.
+    """
+    if not rows:
+        msg = "write_shard needs at least one row"
+        raise ValueError(msg)
+    check_writable(rows)
+    keys = {(r["animal"], r["cohort"], r["label_set"]) for r in rows}
+    if len(keys) != 1:
+        msg = f"one shard holds one (animal, cohort, label_set); got {sorted(keys)}"
+        raise ValueError(msg)
+    ((animal, cohort, label_set),) = keys
+    buf = io.BytesIO()
+    _frame(rows).to_parquet(buf, index=False)
     stamp = utc_stamp(when)
-    written: list[Path] = []
-    for (animal, cohort, label_set), rows in sorted(groups.items()):
-        buf = io.BytesIO()
-        _frame(rows).to_parquet(buf, index=False)
-        data = buf.getvalue()
-        for seq in range(1000):
-            tag = validate_component(f"{stamp}-adj-{cohort}-{label_set}-{seq:03d}")
-            path = store.labels_path(animal, user, stamp=tag)
-            if not path.exists():
-                break
-        else:
-            msg = f"no free shard name for {animal}/{user} at {stamp}"
-            raise FileExistsError(msg)
-        _write_once(path, data)
-        written.append(path)
-    return written
+    for seq in range(1000):
+        tag = validate_component(f"{stamp}-adj-{cohort}-{label_set}-{seq:03d}")
+        path = store.labels_path(animal, user, stamp=tag)
+        if not path.exists():
+            break
+    else:
+        msg = f"no free shard name for {animal}/{user} at {stamp}"
+        raise FileExistsError(msg)
+    _write_once(path, buf.getvalue())
+    return path
+
+
+def write_shards(store: GemsStore, records: Sequence[Mapping[str, Any]], user: str,
+                 *, when: datetime | None = None) -> list[Path]:
+    """Write ``records`` as new shards, one per ``(animal, cohort, label_set)``.
+
+    Everything is checked before the first file is written. Returns the paths written.
+    """
+    if not records:
+        return []
+    check_writable(records)
+    return [write_shard(store, rows, user, when=when) for _k, rows in shard_groups(records)]
 
 
 def _write_once(path: Path, data: bytes) -> None:
@@ -202,13 +253,14 @@ def read_shards(store: GemsStore, user: str, animals: Iterable[str]) -> pd.DataF
             except Exception as exc:
                 msg = f"cannot read label shard {path}: {exc}"
                 raise OSError(msg) from exc
-            if "basis" not in df.columns:
+            if "basis" not in df.columns or "by" not in df.columns:
                 continue
-            frames.append(df.loc[df["basis"] == BASIS])
+            frames.append(df.loc[(df["basis"] == BASIS) & (df["by"] == user)])
     if not frames:
         out = _frame([])
     else:
         out = pd.concat(frames, ignore_index=True)
+        out = out.drop_duplicates(subset="judgement_id", keep="first", ignore_index=True)
     out["core_key"] = [core_key(r, a, b) for r, a, b in
                        zip(out["recording"].astype(str), out["start_s"], out["stop_s"],
                            strict=True)]
@@ -224,6 +276,23 @@ def _canonical(obj: Mapping[str, Any]) -> str:
     clean = {k: v for k, v in obj.items()
              if v is not None and not (isinstance(v, float) and math.isnan(v))}
     return json.dumps(clean, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+
+
+def journal_repair(path: Path) -> bool:
+    """Terminate a torn last line so the next append starts on its own line.
+
+    Returns whether a newline was added. Called once when a session opens its journal.
+    """
+    if not path.is_file() or path.stat().st_size == 0:
+        return False
+    with path.open("rb") as fh:
+        fh.seek(-1, 2)
+        last = fh.read(1)
+    if last == b"\n":
+        return False
+    with path.open("ab") as fh:
+        fh.write(b"\n")
+    return True
 
 
 def journal_append(path: Path, op: str, payload: Mapping[str, Any]) -> None:
@@ -244,9 +313,8 @@ def read_journal(path: Path) -> list[dict[str, Any]]:
             ev = json.loads(line)
         except json.JSONDecodeError:
             continue  # a torn last line from a crash; every earlier line is whole
-        if ev.get("op") == "judge":
+        if ev.get("op") == "judge" and "judgement_id" in ev:
             rec = {k: v for k, v in ev.items() if k != "op"}
-            rec.setdefault("score", math.nan)
             rec.setdefault("app_commit", None)
             judged[rec["judgement_id"]] = rec
         elif ev.get("op") == "undo":

@@ -58,7 +58,8 @@ def main() -> int:
     parser.add_argument(
         "--survivals-root", default=None,
         help="Local path of the old cohort's Survivals folder (for old-cohort "
-             "queue rows); else GEMS_SURVIVALS_ROOT, else the build machine's G: path.",
+             "queue rows). Otherwise GEMS_SURVIVALS_ROOT, otherwise survivals_root in "
+             "the per-user gems config.toml; with none, old-cohort rows will not load.",
     )
     parser.add_argument(
         "--user", default=None,

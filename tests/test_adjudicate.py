@@ -406,3 +406,164 @@ def test_progress_is_by_animal_and_cohort(store, tmp_path) -> None:
     prog = {(p.animal, p.cohort): (p.judged, p.total, p.unjudged) for p in s.progress()}
     assert prog == {("A", "new"): (2, 3, 1), ("J", "new"): (0, 1, 1), ("F", "old"): (0, 1, 1)}
     assert s.counts() == {"motion": 1, "unsure": 1}
+
+
+# ---------------------------------------------------------------------------
+# review fixes (2026-10-07): animal letters, R1 by cohort, alias hash, users, retries
+# ---------------------------------------------------------------------------
+
+ALIAS = "f" * 64
+
+
+def _mixed_j_queue() -> pd.DataFrame:
+    """Old-cohort J (JEL, a training rat) beside new-cohort J (a test animal)."""
+    return pd.DataFrame({
+        "recording": ["old_jel_1", "old_jel_1", "new_j_1"], "animal": ["J", "J", "J"],
+        "cohort": ["old", "old", "new"], "start_s": [5.0, 7.0, 30.0],
+        "stop_s": [5.1, 7.1, 30.2], "region_start_s": [0.0, 0.0, 10.0],
+        "region_stop_s": [60.0, 60.0, 190.0], "draw": "random",
+        "label_set": ["train", "train", "test"],
+        "folder": ["d/old_jel_1", "d/old_jel_1", None],
+        "alias_table_sha256": [ALIAS, ALIAS, None]})
+
+
+@pytest.mark.parametrize("bad", ["j", "J ", " J", "AB", "", "1"])
+def test_an_animal_that_is_not_one_upper_case_letter_is_refused(bad: str) -> None:
+    df = example_queue()
+    df.loc[2, "animal"] = bad
+    with pytest.raises(QueueSchemaError, match="one upper-case letter"):
+        check_queue(df)
+
+
+def test_old_j_trains_and_new_j_tests_in_separate_shards(store, tmp_path) -> None:
+    """R1 is new-cohort I/J/K only: old JEL ("J") is a training rat (is_test_animal)."""
+    s = _session(store, tmp_path, _mixed_j_queue())
+    s.judge_key("1")
+    s.judge_key("2")
+    s.judge_key("1")
+    s.close()
+    assert len(s.written) == 2
+    by_file = {p.name: pd.read_parquet(p) for p in s.written}
+    assert {(d["cohort"].iloc[0], d["label_set"].iloc[0], len(d)) for d in by_file.values()} \
+        == {("old", "train", 2), ("new", "test", 1)}
+    out = _shards(store)
+    kept = training_rows(out, old_tiers={"old_jel_1": "1"})
+    assert set(zip(kept["cohort"], kept["animal"], strict=True)) == {("old", "J")}
+    assert len(kept) == 2
+
+
+def test_new_j_marked_train_is_refused_but_old_j_train_is_not() -> None:
+    df = _mixed_j_queue()
+    check_queue(df)  # old J train + new J test: accepted
+    df.loc[2, "label_set"] = "train"
+    with pytest.raises(QueueSchemaError, match="R1"):
+        check_queue(df)
+
+
+def test_write_shards_refuses_a_test_animal_not_marked_test(store) -> None:
+    rec = jd.make_record(check_queue(_mixed_j_queue()).iloc[2].to_dict(), "motion",
+                         user=USER, app_sha=None, queue_file="q", queue_sha256="0")
+    rec["label_set"] = "train"
+    with pytest.raises(ValueError, match="R1"):
+        jd.write_shards(store, [rec], USER)
+    assert not list((store.root / "labels").rglob("*.parquet"))
+
+
+def test_old_rows_need_an_alias_table_hash_and_every_old_label_records_it(store,
+                                                                       tmp_path) -> None:
+    with pytest.raises(QueueSchemaError, match="alias_table_sha256"):
+        check_queue(_mixed_j_queue().drop(columns=["alias_table_sha256"]))
+    for bad in (None, "abc", "F" * 64):
+        df = _mixed_j_queue()
+        df.loc[0, "alias_table_sha256"] = bad
+        with pytest.raises(QueueSchemaError, match="alias_table_sha256"):
+            check_queue(df)
+    s = _session(store, tmp_path, _mixed_j_queue())
+    while s.current() is not None:
+        s.judge_key("1")
+    s.close()
+    out = _shards(store)
+    assert set(out.loc[out["cohort"] == "old", "alias_table_sha256"]) == {ALIAS}
+    assert out.loc[out["cohort"] == "new", "alias_table_sha256"].isna().all()
+
+
+def test_another_users_shards_do_not_mark_this_users_cores(store, tmp_path) -> None:
+    """events_tester_* also matches events_tester_smith_*: rows are filtered by ``by``."""
+    q, path = _queue(tmp_path)
+    other = AdjudicationSession(q, store, "tester_smith", journal_dir=tmp_path / "j2",
+                                queue_file=path.name, queue_sha256="cd" * 32, app_sha=None)
+    other.judge_key("1")
+    other.judge_key("1")
+    other.close()
+    mine = _session(store, tmp_path)
+    assert mine.position() == (0, len(mine.rows))
+
+
+def test_a_shard_present_twice_counts_once(store, tmp_path) -> None:
+    s = _session(store, tmp_path)
+    s.judge_key("1")
+    s.close()
+    (p,) = s.written
+    copy = p.with_name(p.name.replace("-000.parquet", "-001.parquet"))
+    copy.write_bytes(p.read_bytes())
+    assert len(jd.read_shards(store, USER, ["A"])) == 1
+
+
+def test_a_flush_failing_part_way_never_writes_a_group_twice(store, tmp_path,
+                                                             monkeypatch) -> None:
+    s = _session(store, tmp_path)
+    while s.current() is not None:
+        s.judge_key("1")  # A (new, train), J (new, test), F (old, train): three groups
+    real = jd.write_shard
+    calls = {"n": 0}
+
+    def flaky(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError("Drive went away")
+        return real(*a, **k)
+
+    monkeypatch.setattr(jd, "write_shard", flaky)
+    with pytest.raises(OSError, match="Drive went away"):
+        s.flush(force=True)
+    assert len(s.written) == 1 and s.pending == len(s.rows) - 3  # the A group landed
+    s.flush(force=True)
+    out = _shards(store)
+    assert len(out) == len(s.rows) and out["judgement_id"].is_unique
+
+
+def test_restored_journal_records_take_their_fields_from_the_queue(store, tmp_path) -> None:
+    import json
+
+    s = _session(store, tmp_path)
+    s.judge_key("1")
+    lines = s.journal_path.read_text(encoding="utf-8").splitlines()
+    ev = json.loads(lines[0])
+    ev.update({"label_set": "test", "draw": "uncertainty", "cohort": "old", "score": 0.0})
+    forged = dict(ev, judgement_id="f" * 32, by="someone_else")
+    s.journal_path.write_text(json.dumps(ev) + "\n" + json.dumps(forged) + "\n",
+                              encoding="utf-8", newline="\n")
+    again = _session(store, tmp_path)
+    assert again.restored == 1  # another user's line is not restored
+    again.close()
+    out = _shards(store)
+    row = check_queue(example_queue()).iloc[0]
+    assert (out["label_set"].iloc[0], out["draw"].iloc[0], out["cohort"].iloc[0]) == (
+        row["label_set"], row["draw"], row["cohort"])
+    assert out["score"].iloc[0] == row["score"]
+    assert out["judgement_id"].iloc[0] == ev["judgement_id"]
+
+
+def test_an_undo_after_a_torn_line_is_not_swallowed(store, tmp_path) -> None:
+    s = _session(store, tmp_path)
+    s.judge_key("1")
+    s.judge_key("4")
+    with s.journal_path.open("a", encoding="utf-8", newline="\n") as fh:
+        fh.write('{"op":"judge","recor')  # crash mid-line
+    again = _session(store, tmp_path)  # repairs the torn line on open
+    assert again.restored == 2
+    again.undo()  # withdraws line_noise; this line must parse
+    third = _session(store, tmp_path)
+    assert third.restored == 1
+    third.close()
+    assert list(_shards(store)["judgement"]) == ["motion"]
