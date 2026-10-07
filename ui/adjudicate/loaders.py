@@ -22,6 +22,17 @@ assumed: it comes from an explicit argument (``--survivals-root``), then the
 the per-user gems config file (``gems_blanking_v2.io.store.config_path()``, a
 ``platformdirs`` location). With none of these, old-cohort rows refuse to load. The
 queue stores only paths relative to it.
+
+**Beat trains** (for the spectrum panel's k×HR lines; :func:`old_beats`). Old cohort:
+Andrea's ``HR_BR_HRVAnalysis`` output beside the signal, ``<base>*_HRBR.mat`` in the
+row's folder (``<base>`` is the recording id without ``_notched``; matched
+case-insensitively), whose ``heartlocs`` are 1-BASED sample indices into the analysed
+signal. A file is used only if that signal is the whole recording - its ``t`` has
+exactly the recording's sample count - because an epoch file (``..._recovery_HRBR.mat``)
+indexes from the epoch start, which the file does not record. The exact name
+``<base>_HRBR.mat`` is tried first, then the others in sorted order. New cohort: none -
+the count-gated trains (ruling 2026-10-08 (b) 5) are not in the store, and nothing
+here estimates a heart rate from the signal.
 """
 
 from __future__ import annotations
@@ -29,6 +40,7 @@ from __future__ import annotations
 import json
 import os
 import tomllib
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Final
 
@@ -38,15 +50,17 @@ from gems_blanking_v2.io.chanlabels import assert_plausible_units
 from gems_blanking_v2.io.channel_map import Units, meta_path, scale_to_uv
 from gems_blanking_v2.io.store import GemsStore, config_path
 from gems_blanking_v2.types import ChannelInfo, Recording
-from scipy.io import loadmat
+from scipy.io import loadmat, whosmat
 
 from ui.audit import bridge
 
 __all__ = [
     "OLD_COHORT_CHANNELS",
     "OLD_COHORT_UNITS",
+    "BeatSource",
     "load_new_row",
     "load_old_signal",
+    "old_beats",
     "old_signal_path",
     "resolve_survivals_root",
 ]
@@ -158,3 +172,65 @@ def load_old_signal(path: Path, rid: str, animal: str, *, units: Units) -> Recor
     assert_plausible_units(y, units, scale, where=Path(path).name)
     return Recording(fs=fs, data=y * scale, channels=_channels(), animal=animal,
                      session=rid, path=Path(path))
+
+
+NEW_COHORT_NO_BEATS: Final = ("no stored beat train for the new cohort (the count-gated "
+                              "trains are not in the store)")
+
+
+@dataclass(frozen=True)
+class BeatSource:
+    """A recording's beat times (seconds on its timeline), or why there are none."""
+
+    beats_s: np.ndarray | None
+    source: str | None
+    """The file the beats came from (its name only)."""
+    reason: str | None
+
+
+def _hrbr_shape(path: Path) -> tuple[np.ndarray, int]:
+    """``(heartlocs, len(t))`` from an ``_HRBR.mat``: v7.3 via h5py, v5 via scipy."""
+    try:
+        with h5py.File(path, "r") as f:
+            return (np.asarray(f["heartlocs"], dtype=np.float64).ravel(),
+                    int(np.prod(f["t"].shape)))
+    except OSError:  # not HDF5: a v5 MAT-file
+        sizes = {name: shape for name, shape, _cls in whosmat(path)}
+        if "t" not in sizes:
+            msg = f"{path.name} has no t"
+            raise KeyError(msg) from None
+        m = loadmat(path, variable_names=["heartlocs"])
+        return np.asarray(m["heartlocs"], dtype=np.float64).ravel(), int(np.prod(sizes["t"]))
+
+
+def old_beats(survivals_root: Path, folder: str, rid: str, *, n_samples: int,
+              fs: float) -> BeatSource:
+    """The old-cohort beat train beside ``rid``'s signal (module docstring), or why not.
+
+    Beat ``k`` (1-based ``heartlocs``) is at ``(k - 1) / fs`` seconds (invariant 15).
+    """
+    folder_path = old_signal_path(survivals_root, folder, rid).parent
+    base = rid.removesuffix("_notched")
+    exact = f"{base}_HRBR.mat".lower()
+    try:
+        names = sorted(p.name for p in folder_path.iterdir()
+                       if p.name.lower().startswith(base.lower())
+                       and p.name.lower().endswith("_hrbr.mat"))
+    except OSError as exc:
+        return BeatSource(None, None, f"cannot list {folder}: {exc}")
+    if not names:
+        return BeatSource(None, None, f"no {base}*_HRBR.mat beside the signal")
+    names.sort(key=lambda n: n.lower() != exact)  # the exact name first, else sorted
+    refused = []
+    for name in names:
+        try:
+            heartlocs, n_t = _hrbr_shape(folder_path / name)
+        except (OSError, KeyError, ValueError) as exc:
+            refused.append(f"{name}: unreadable ({exc})")
+            continue
+        if n_t != n_samples:
+            refused.append(f"{name}: covers {n_t} samples, the recording {n_samples} "
+                           "(an epoch file)")
+            continue
+        return BeatSource((heartlocs - 1.0) / float(fs), name, None)
+    return BeatSource(None, None, "no whole-recording _HRBR.mat: " + "; ".join(refused))

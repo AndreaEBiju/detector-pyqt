@@ -51,6 +51,29 @@ thread. Arriving at it is then instant. Rules:
   window closes at once, but the Python process exits only when that load finishes
   (``ThreadPoolExecutor`` threads are joined at exit), up to ~30 s.
 
+**Vertical scale** (always on): each channel's limits come from the ±1 s around the
+core - median ± the 99.5th percentile of ``|x - median|`` there (the exact estimator is
+in ``ui.adjudicate.hum``) - not from the whole view, so a large event elsewhere does
+not flatten the highlight. Computed when the core changes and re-applied by ``Home``;
+panning and zooming in time never change it. Samples beyond the limits are drawn at
+the limit with a thick red mark, and the channel's corner label says ``CLIPPED (n)``
+(``ui.widgets.clipped_viewer``).
+
+**Hum panels** (for the hum add-on queue), each with its own toggle, both OFF by
+default; while a toggle is off its panel computes nothing (Welch is never called).
+Toggles last for this window only.
+
+* *Spectrum*: Welch PSD of the core's peak signal (the row's ``peak_signal``, built as
+  the detection chain builds it; or the channel picked in the selector when the row
+  has none) over the core's ±1 s, against a reference window of the same length 5-10 s
+  away (``ui.adjudicate.hum.place_reference``), with 60·k Hz lines and k×HR lines from
+  the recording's STORED beat train (old cohort: the ``_HRBR.mat`` beside the signal;
+  new cohort: none yet - the panel says "no beat train - k×HR not shown"). Computed on
+  a worker thread; the beat train is read once per recording, also off the GUI thread.
+* *100 ms zoom*: every raw channel over exactly 100 ms around the core's peak time
+  (``peak_s`` when the queue has it) or its centre, at the main plot's scale with the
+  same clipping marks, core shaded. A few thousand samples: drawn on the GUI thread.
+
 Judgements go to the store as per-user write-once shards (``ui.adjudicate.judgements``);
 the queue schema is in ``ui.adjudicate.queue``.
 """
@@ -80,18 +103,22 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ui.adjudicate import loaders
+from ui.adjudicate import hum, loaders
 from ui.adjudicate.judgements import KEY_TO_JUDGEMENT, judgement_for_key
 from ui.adjudicate.session import AdjudicationSession
 from ui.audit import bridge
 from ui.audit.array_recording import ArrayRecording
 from ui.audit.controller import seconds_to_samples
+from ui.widgets.clipped_viewer import ClippedChannelViewer
+from ui.widgets.hum_panels import SpectrumPanel, ZoomPanel
 from ui.widgets.signal_viewer import MultiChannelViewer
 from ui.widgets.ztrace_dock import ZTraceDock
 
 LoadFn = Callable[[dict[str, Any]], Any]
 """Queue row -> a ``Recording`` (``fs``, ``data`` in µV (n, ch), ``channels``)."""
 TracesFn = Callable[[Any, tuple[float, float]], tuple[np.ndarray, list[Any]]]
+BeatsFn = Callable[[dict[str, Any], Any], loaders.BeatSource]
+"""(queue row, its loaded recording) -> the recording's stored beat train, or why none."""
 
 CONTEXT_S = 2.0
 """Seconds shown either side of the core by default (the review panel's ±2 s)."""
@@ -145,18 +172,58 @@ class _TraceJob(QRunnable):
         self.signals.done.emit(self.key, intervals, traces)
 
 
+class _JobSignals(QObject):
+    done = Signal(str, object)  # token, result
+    failed = Signal(str, str)
+
+
+class _FnJob(QRunnable):
+    """``fn()`` on a pool thread; numpy in, numbers out - no Qt object touched."""
+
+    def __init__(self, token: str, fn: Callable[[], Any]) -> None:
+        super().__init__()
+        self.token, self.fn = token, fn
+        self.signals = _JobSignals()
+        self.finished = False
+        self.setAutoDelete(False)  # the window keeps the reference until it has run
+
+    def run(self) -> None:
+        try:
+            out = self.fn()
+        except Exception as exc:  # noqa: BLE001 - reported in the window
+            self.signals.failed.emit(self.token, str(exc))
+            return
+        else:
+            self.signals.done.emit(self.token, out)
+        finally:
+            self.finished = True
+
+
+def _no_beats(_row: dict[str, Any], _rec: Any) -> loaders.BeatSource:
+    return loaders.BeatSource(None, None, "no beat-train source configured")
+
+
 class AdjudicationWindow(QMainWindow):
     """Shows one queue core at a time and records one judgement per keystroke."""
 
     def __init__(self, session: AdjudicationSession, *, load_fn: LoadFn,
                  traces_fn: TracesFn | None = None, async_traces: bool = True,
-                 prefetch: bool = False, parent: QWidget | None = None) -> None:
+                 prefetch: bool = False, beats_fn: BeatsFn | None = None,
+                 async_panels: bool = True, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"Candidate adjudication - {session.queue_file}")
         self.session = session
         self._load_fn = load_fn
         self._traces_fn: TracesFn = traces_fn or bridge.reveal_for_region
         self._async_traces = async_traces
+        self._beats_fn: BeatsFn = beats_fn or _no_beats
+        self._async_panels = async_panels
+        self._scales: list[hum.ChannelScale | None] | None = None
+        self._beats: dict[str, loaders.BeatSource] = {}
+        self._beats_running: set[str] = set()
+        self._panel_jobs: list[_FnJob] = []
+        self._spectrum_token: str | None = None
+        self._spectrum_row: dict[str, Any] | None = None
         self._rec_id: str | None = None
         self._recording: Any = None
         self._traces_cache: dict[str, list[Any]] = {}
@@ -219,6 +286,15 @@ class AdjudicationWindow(QMainWindow):
                                    "assessable region, in the background, once per region.")
         self.traces_box.toggled.connect(self._slot(self._on_traces_toggled))
         self.traces_box.setFocusPolicy(Qt.NoFocus)  # Space toggles a focused checkbox
+        self.spectrum_box = QCheckBox("Spectrum vs reference (hum)")
+        self.spectrum_box.setToolTip("Welch PSD of the core's ±1 s against a reference "
+                                     "window 5-10 s away, with 60·k Hz and k×HR lines.")
+        self.zoom_box = QCheckBox("100 ms zoom")
+        self.zoom_box.setToolTip("Every channel over 100 ms around the core's peak (or "
+                                 "centre), at the main plot's scale.")
+        for box in (self.spectrum_box, self.zoom_box):
+            box.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            box.toggled.connect(self._slot(self._on_panels_toggled))
         left = QWidget()
         # Fixed-width side panel: the plot is what is being judged and gets the rest.
         left.setFixedWidth(360)
@@ -226,6 +302,8 @@ class AdjudicationWindow(QMainWindow):
         lay.addWidget(self.core_info)
         lay.addWidget(keys)
         lay.addWidget(self.traces_box)
+        lay.addWidget(self.spectrum_box)
+        lay.addWidget(self.zoom_box)
         lay.addWidget(self.progress)
         lay.addWidget(self.status)
         lay.addStretch(1)
@@ -246,6 +324,18 @@ class AdjudicationWindow(QMainWindow):
         self.addDockWidget(Qt.RightDockWidgetArea, dock)
         self._trace_dock = dock
         dock.hide()  # shown only while z-traces are ticked; the plot gets the room
+
+        self.spectrum = SpectrumPanel()
+        self.spectrum.channel.currentIndexChanged.connect(self._slot(self._on_channel_picked))
+        self._spectrum_dock = QDockWidget("Spectrum: core ±1 s vs reference", self)
+        self._spectrum_dock.setWidget(self.spectrum)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._spectrum_dock)
+        self._spectrum_dock.hide()
+        self.zoom_panel = ZoomPanel()
+        self._zoom_dock = QDockWidget("100 ms zoom", self)
+        self._zoom_dock.setWidget(self.zoom_panel)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._zoom_dock)
+        self._zoom_dock.hide()
 
         for key in KEY_TO_JUDGEMENT:
             QShortcut(QKeySequence(key), self, activated=self._slot(lambda k=key: self.press(k)))
@@ -356,6 +446,8 @@ class AdjudicationWindow(QMainWindow):
         dur = self.viewer.recording.duration_sec
         lo = max(0.0, float(row["start_s"]) - self._context)
         hi = min(dur, float(row["stop_s"]) + self._context)
+        if self._scales is not None and isinstance(self.viewer, ClippedChannelViewer):
+            self.viewer.set_scales(self._scales, redraw=False)
         self.viewer.set_viewport(lo, hi)
         self._set_trace_range(lo, hi)
 
@@ -446,6 +538,7 @@ class AdjudicationWindow(QMainWindow):
         self._refresh_progress()
         row = self.session.current()
         if row is None:
+            self.spectrum.show_pending("Queue finished.")
             # Written on close (or "Write judgements now"), not here, so the last
             # judgements stay undoable until the labeller is done.
             self.core_info.setText("<b>Queue finished.</b> Every core has a judgement. "
@@ -460,6 +553,9 @@ class AdjudicationWindow(QMainWindow):
                 return  # its prefetch is still running: _poll_prefetch comes back here
             self._describe(row)
             self._highlight(row)
+            rec = self._recording
+            self._scales = hum.channel_scales(rec.data, float(rec.fs), float(row["start_s"]),
+                                              float(row["stop_s"]))
         except Exception as exc:  # noqa: BLE001 - shown; the keys stay disabled
             self.core_info.setText(f"<b>Could not show this core</b> "
                                    f"({_breakable(str(row['recording']))}). Space skips it.")
@@ -469,6 +565,7 @@ class AdjudicationWindow(QMainWindow):
         self._set_judging_enabled(True)
         self.recentre()
         self._show_traces(row)
+        self._update_panels(row)
         self._start_prefetch()
 
     def _ensure_recording(self, row: dict[str, Any]) -> bool:
@@ -496,6 +593,8 @@ class AdjudicationWindow(QMainWindow):
         else:
             self._discard_prefetch()
         # One recording on screen at a time (plus at most one prefetched).
+        self.zoom_panel.release()
+        self._scales = None
         if self.viewer is not None:
             old, self.viewer = self.viewer, None
             _release_viewer(old)
@@ -506,10 +605,11 @@ class AdjudicationWindow(QMainWindow):
             self.status.setText(f"Loading {rid} ...")
             recording = self._load_fn(row)
         names = tuple(c.name for c in recording.channels)
-        self.viewer = MultiChannelViewer(ArrayRecording(recording.data, recording.fs,
-                                                        copy_to_float32=False),
-                                         channel_names=names,
-                                         channel_colors=_COLOURS[: len(names)])
+        self.viewer = ClippedChannelViewer(ArrayRecording(recording.data, recording.fs,
+                                                          copy_to_float32=False),
+                                           channel_names=names,
+                                           channel_colors=_COLOURS[: len(names)])
+        self.spectrum.set_channels(names)
         self.viewer.bad_interval_added.connect(self._on_widen_drag)
         self.viewer.follow_mark_drag = True  # a widen may run past the viewport
         self._placeholder.hide()
@@ -611,6 +711,106 @@ class AdjudicationWindow(QMainWindow):
                      f"({len(self.session.written)} shard(s) written this session)")
         self.progress.setText("<br>".join(lines))
         self._undo_btn.setEnabled(self.session.can_undo() or self._widen is not None)
+
+    # -- hum panels -----------------------------------------------------------
+
+    def _on_panels_toggled(self, *_a: object) -> None:
+        self._spectrum_dock.setVisible(self.spectrum_box.isChecked())
+        self._zoom_dock.setVisible(self.zoom_box.isChecked())
+        if not self.zoom_box.isChecked():
+            self.zoom_panel.release()  # holds nothing while off
+        if not self.spectrum_box.isChecked():
+            self._spectrum_token = None  # a result still on its way is dropped
+        row = self.session.current()
+        if row is not None and row["core_key"] == self._shown_key:
+            self._update_panels(row)
+
+    def _on_channel_picked(self, *_a: object) -> None:
+        row = self.session.current()
+        if (self.spectrum_box.isChecked() and row is not None
+                and row["core_key"] == self._shown_key):
+            self._start_spectrum(row)
+
+    def _update_panels(self, row: dict[str, Any]) -> None:
+        """Refresh whichever panels are ticked for the core on screen; nothing else."""
+        if self.zoom_box.isChecked():
+            self._show_zoom(row)
+        if self.spectrum_box.isChecked():
+            self._start_spectrum(row)
+
+    def _show_zoom(self, row: dict[str, Any]) -> None:
+        rec = self._recording
+        if rec is None or self._scales is None:
+            return
+        if self.zoom_panel.recording is not rec:
+            names = [c.name for c in rec.channels]
+            self.zoom_panel.set_recording(rec, names, _COLOURS[: len(names)])
+        self.zoom_panel.show_core(hum.zoom_window(row),
+                                  (float(row["start_s"]), float(row["stop_s"])), self._scales)
+
+    def _run_job(self, token: str, fn: Callable[[], Any],
+                 done: Callable[[str, object], None]) -> None:
+        job = _FnJob(token, fn)
+        job.signals.done.connect(done)
+        job.signals.failed.connect(self._on_panel_failed)
+        if self._async_panels:
+            # Hold every job until it has run (autoDelete is off); drop the finished ones.
+            self._panel_jobs = [*(j for j in self._panel_jobs if not j.finished), job]
+            QThreadPool.globalInstance().start(job)
+        else:
+            job.run()
+
+    def _start_spectrum(self, row: dict[str, Any]) -> None:
+        rec, rows, selected = self._recording, self.session.rows, self.spectrum.selected
+        token = f"spectrum|{row['core_key']}|{selected}"
+        self._spectrum_token, self._spectrum_row = token, row
+        self.spectrum.show_pending("Computing the spectrum ...")
+        rid = str(row["recording"])
+        if rid not in self._beats and rid not in self._beats_running:
+            self._beats_running.add(rid)
+            self._run_job(f"beats|{rid}", lambda: self._beats_fn(row, rec), self._on_beats_done)
+        self._run_job(token, lambda: hum.compute_spectrum(rec, row, rows, selected),
+                      self._on_spectrum_done)
+
+    def _heart_rate(self, rid: str, window_s: tuple[float, float],
+                    ) -> tuple[hum.HeartRate | None, str | None]:
+        src = self._beats.get(rid)
+        if src is None:
+            return None, ("reading the beat train ..." if rid in self._beats_running
+                          else None)
+        if src.beats_s is None:
+            return None, src.reason
+        return hum.mean_hr_hz(src.beats_s, *window_s), f"from {src.source}"
+
+    def _on_spectrum_done(self, token: str, result: object) -> None:
+        row = self._spectrum_row
+        if token != self._spectrum_token or row is None or not self.spectrum_box.isChecked():
+            return  # superseded: another core, another channel, or the panel was closed
+        assert isinstance(result, hum.SpectrumResult)
+        hr, note = self._heart_rate(str(row["recording"]), result.window_s)
+        self.spectrum.show_result(result, hr, note)
+
+    def _on_beats_done(self, token: str, result: object) -> None:
+        rid = token.split("|", 1)[1]
+        self._beats_running.discard(rid)
+        assert isinstance(result, loaders.BeatSource)
+        self._beats[rid] = result
+        row, res = self._spectrum_row, self.spectrum.result
+        if row is not None and res is not None and str(row["recording"]) == rid:
+            self.spectrum.set_hr(*self._heart_rate(rid, res.window_s))
+
+    def _on_panel_failed(self, token: str, why: str) -> None:
+        self.last_error = why
+        if token.startswith("beats|"):
+            rid = token.split("|", 1)[1]
+            self._beats_running.discard(rid)
+            self._beats[rid] = loaders.BeatSource(None, None, f"could not read it: {why}")
+            row, res = self._spectrum_row, self.spectrum.result
+            if row is not None and res is not None and str(row["recording"]) == rid:
+                self.spectrum.set_hr(*self._heart_rate(rid, res.window_s))
+            return
+        if token == self._spectrum_token:
+            self.spectrum.show_pending(f"Spectrum unavailable: {why}")
 
     # -- z-traces -------------------------------------------------------------
 
@@ -723,7 +923,16 @@ def open_queue(queue_path: Path, store: GemsStore, *, user: str | None = None,
         return loaders.load_old_signal(path, str(row["recording"]), str(row["animal"]),
                                        units=loaders.OLD_COHORT_UNITS)
 
-    win = AdjudicationWindow(session, load_fn=load_fn, prefetch=True)
+    def beats_fn(row: dict[str, Any], recording: Any) -> loaders.BeatSource:
+        if row["cohort"] == "new":
+            return loaders.BeatSource(None, None, loaders.NEW_COHORT_NO_BEATS)
+        if root is None:
+            return loaders.BeatSource(None, None, "no Survivals root")
+        return loaders.old_beats(root, str(row["folder"]), str(row["recording"]),
+                                 n_samples=int(recording.data.shape[0]),
+                                 fs=float(recording.fs))
+
+    win = AdjudicationWindow(session, load_fn=load_fn, prefetch=True, beats_fn=beats_fn)
     if not who.is_confident:
         win.status.setText(f"Labelling as '{who.user_id}' (from the OS account - set git "
                            "user.email to record who judged).")

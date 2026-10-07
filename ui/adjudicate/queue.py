@@ -37,6 +37,9 @@ Optional columns:
 ``score``           float64, the model's P(motion) for the core; shown, and recorded.
 ``peak_z``, ``peak_band``, ``peak_signal``
                     Night 1's per-core fields; shown beside the plot when present.
+``peak_s``          float64 seconds on the recording's timeline, the core's peak time.
+                    No queue built so far carries it; when present and inside the core,
+                    the 100 ms zoom panel centres on it (else on the core centre).
 
 Rules enforced by :func:`check_queue`: no nulls in required columns; enumerations as
 above; every time finite with ``region_start_s <= start_s < stop_s <= region_stop_s``;
@@ -77,7 +80,7 @@ REQUIRED_COLUMNS: Final[tuple[str, ...]] = (
     "region_start_s", "region_stop_s", "draw", "label_set",
 )
 OPTIONAL_COLUMNS: Final[tuple[str, ...]] = (
-    "folder", "alias_table_sha256", "score", "peak_z", "peak_band", "peak_signal",
+    "folder", "alias_table_sha256", "score", "peak_z", "peak_band", "peak_signal", "peak_s",
 )
 COHORTS: Final[frozenset[str]] = frozenset({"new", "old"})
 DRAWS: Final[frozenset[str]] = frozenset({"random", "uncertainty"})
