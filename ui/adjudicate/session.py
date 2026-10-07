@@ -103,13 +103,19 @@ class AdjudicationSession:
         This app's commit, recorded on every row (``None`` if unknown).
     clock
         Returns the judgement time; injectable for tests.
+    rejudge
+        Re-judge mode: only judgements made from THIS queue file (``queue_file``) count
+        as done, so cores judged earlier from another queue are shown again. Nothing
+        stored is changed or hidden; the new judgement is simply newer, and the newest
+        judgement of a core is the one in force.
     """
 
     def __init__(self, queue: pd.DataFrame, store: GemsStore, user: str, *,
                  journal_dir: Path, queue_file: str, queue_sha256: str,
                  app_sha: str | None, undo_depth: int = UNDO_DEPTH,
                  flush_batch: int = FLUSH_BATCH,
-                 clock: Callable[[], datetime] | None = None) -> None:
+                 clock: Callable[[], datetime] | None = None,
+                 rejudge: bool = False) -> None:
         if "core_key" not in queue.columns:
             msg = "queue must come from load_queue/check_queue (no core_key column)"
             raise ValueError(msg)
@@ -130,7 +136,10 @@ class AdjudicationSession:
         self.written: list[Path] = []
         self.dropped: list[str] = []
 
+        self.rejudge = bool(rejudge)
         stored = jd.read_shards(store, self.user, {r["animal"] for r in self.rows})
+        if self.rejudge:
+            stored = stored.loc[stored["queue_file"].astype(str) == str(queue_file)]
         # The newest stored judgement of a core is the one in force.
         stored = stored.sort_values("at", kind="stable")
         self._judged: dict[str, str] = {

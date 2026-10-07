@@ -922,7 +922,7 @@ class AdjudicationWindow(QMainWindow):
 
 def open_queue(queue_path: Path, store: GemsStore, *, user: str | None = None,
                journal_dir: Path | None = None, survivals_root: Path | None = None,
-               ) -> AdjudicationWindow:
+               rejudge: bool = False) -> AdjudicationWindow:
     """Build the session and window for ``queue_path`` with the production loaders."""
     from gems_blanking_v2.io.store import cache_dir, resolve_user_id
 
@@ -937,7 +937,7 @@ def open_queue(queue_path: Path, store: GemsStore, *, user: str | None = None,
         queue, store, who.user_id,
         journal_dir=journal_dir or (cache_dir() / "adjudication"),
         queue_file=queue_path.name, queue_sha256=file_sha256(queue_path),
-        app_sha=app_commit())
+        app_sha=app_commit(), rejudge=rejudge)
     root = loaders.resolve_survivals_root(survivals_root)
 
     def load_fn(row: dict[str, Any]) -> Any:
