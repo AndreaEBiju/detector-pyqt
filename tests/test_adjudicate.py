@@ -567,3 +567,53 @@ def test_an_undo_after_a_torn_line_is_not_swallowed(store, tmp_path) -> None:
     assert third.restored == 1
     third.close()
     assert list(_shards(store)["judgement"]) == ["motion"]
+
+
+def test_rejudge_mode_shows_cores_judged_from_another_queue(store, tmp_path) -> None:
+    first = _session(store, tmp_path)
+    n = len(first.rows)
+    while not first.done:
+        first.judge("unsure")
+    first.close()
+    # same cores, judged: a normal session on the same queue has nothing left
+    assert _session(store, tmp_path).done
+    # re-judge from a different queue file: every core comes back
+    q, _p = _queue(tmp_path)
+    later = [datetime(2026, 10, 8, 15, 0, tzinfo=UTC)]
+
+    def clock() -> datetime:
+        later[0] += timedelta(seconds=1)
+        return later[0]
+
+    re = AdjudicationSession(q, store, USER, journal_dir=tmp_path / "journal2",
+                             queue_file="rejudge.parquet", queue_sha256="cd" * 32,
+                             app_sha="c0ffee", clock=clock, rejudge=True)
+    assert not re.done
+    seen = 0
+    while not re.done:
+        re.judge("motion")
+        seen += 1
+    re.close()
+    assert seen == n
+    # resuming the re-judge queue counts only its own judgements: nothing left
+    again = AdjudicationSession(q, store, USER, journal_dir=tmp_path / "journal3",
+                                queue_file="rejudge.parquet", queue_sha256="cd" * 32,
+                                app_sha="c0ffee", rejudge=True)
+    assert again.done
+    # both judgements stay in the store; the newer one is motion
+    stored = jd.read_shards(store, USER, {r["animal"] for r in q.to_dict("records")})
+    newest = stored.sort_values("at", kind="stable").groupby("core_key")["judgement"].last()
+    assert set(newest) == {"motion"}
+    assert (stored["judgement"] == "unsure").sum() == n
+
+
+def test_rejudge_is_off_by_default(store, tmp_path) -> None:
+    first = _session(store, tmp_path)
+    while not first.done:
+        first.judge("physiology")
+    first.close()
+    q, _p = _queue(tmp_path)
+    other = AdjudicationSession(q, store, USER, journal_dir=tmp_path / "j2",
+                                queue_file="other.parquet", queue_sha256="ef" * 32,
+                                app_sha="c0ffee")
+    assert other.done

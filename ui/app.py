@@ -62,6 +62,12 @@ def main() -> int:
              "the per-user gems config.toml; with none, old-cohort rows will not load.",
     )
     parser.add_argument(
+        "--rejudge", action="store_true",
+        help="Re-judge mode: show every core of the queue even if judged earlier from "
+             "another queue (only judgements from this queue file count as done). The "
+             "newest judgement of a core is the one in force.",
+    )
+    parser.add_argument(
         "--user", default=None,
         help="Who is judging (default: git user.email, then the OS account).",
     )
@@ -99,7 +105,8 @@ def _run_adjudication(app: QApplication, args: argparse.Namespace) -> int:
         return 2
     store = GemsStore(find_gems_root())
     root = Path(args.survivals_root).expanduser() if args.survivals_root else None
-    window = open_queue(queue, store, user=args.user, survivals_root=root)
+    window = open_queue(queue, store, user=args.user, survivals_root=root,
+                        rejudge=args.rejudge)
     window.resize(1600, 950)
     window.show()
     return app.exec()
