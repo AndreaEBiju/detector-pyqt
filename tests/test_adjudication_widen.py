@@ -189,7 +189,7 @@ def _window(store: GemsStore, tmp_path: Path):
     QTest.keyClick(probe, Qt.Key_Space)
     app.processEvents()
     delivered = probe.session.cursor != before
-    probe.session.close = lambda: []  # type: ignore[method-assign]
+    probe.session.close = list  # type: ignore[method-assign, assignment]
     probe.close()
     if not delivered:
         pytest.skip("this platform does not deliver shortcut key events (Space probe)")
@@ -321,7 +321,7 @@ def test_a_drag_is_clipped_to_the_cores_region(qapp, store, tmp_path) -> None:
 @pytest.mark.parametrize("bad", [(float("-inf"), 21.0), (19.0, float("inf")),
                                  (float("nan"), 21.0)])
 def test_a_non_finite_widen_is_refused(bad: tuple[float, float]) -> None:
-    with pytest.raises(ValueError, match=r"finite|contain"):
+    with pytest.raises(ValueError, match="finite"):
         jd.make_record(_row(), "motion", user=USER, app_sha=None, queue_file="q",
                        queue_sha256="0", widened=bad)
 

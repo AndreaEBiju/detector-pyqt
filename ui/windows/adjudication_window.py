@@ -657,7 +657,7 @@ class AdjudicationWindow(QMainWindow):
 
     # -- closing ----------------------------------------------------------------
 
-    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt override
+    def closeEvent(self, event: QCloseEvent) -> None:
         """Write everything pending, then close.
 
         If the write fails the window still closes, after saying so: the judgements are
