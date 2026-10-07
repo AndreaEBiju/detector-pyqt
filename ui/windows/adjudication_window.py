@@ -27,6 +27,22 @@ available per recording but OFF by default: they mean running the detection chai
 the core's whole assessable region (Night 1 measured about three minutes and several GB
 per new-cohort recording), so they are computed in the background only when ticked.
 
+**Prefetch** (``prefetch=True``, what ``open_queue`` uses): while the labeller judges a
+recording, the NEXT recording in the queue (the first later core, not yet judged, from a
+different recording; never past the end, never wrapping) is loaded on one background
+thread. Arriving at it is then instant. Rules:
+
+* at most one prefetched recording is held (memory: ~2.3 GB for a 20-min new-cohort
+  file; the viewer serves the loaded array without a float32 copy, so current +
+  prefetched stays near 5 GB);
+* the loader only reads files and builds numpy arrays - no Qt object is touched off the
+  GUI thread; the result is picked up on the GUI thread by a polling ``QTimer``;
+* arriving before it finishes shows "loading" and waits for THAT load (keys disabled),
+  never starting a second one, and the GUI thread never blocks on it;
+* a prefetch that failed falls back to a normal load, with the error shown;
+* moving to any other recording discards the prefetch (a load already running cannot be
+  interrupted; its result is dropped when it finishes).
+
 Judgements go to the store as per-user write-once shards (``ui.adjudicate.judgements``);
 the queue schema is in ``ui.adjudicate.queue``.
 """
@@ -35,13 +51,14 @@ from __future__ import annotations
 
 import gc
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pyqtgraph as pg
 from gems_blanking_v2.io.store import GemsStore
-from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, Signal
+from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QCloseEvent, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -78,6 +95,21 @@ _COLOURS = ("#4c9be8", "#6bb3f0", "#9ccbf5", "#e8834c", "#f0a06b", "#f5bf9c",
             "#5cc98a", "#7fd6a3", "#a6e3bf")
 
 
+def _release_viewer(viewer: MultiChannelViewer) -> None:
+    """Drop a viewer AND the recording it holds, now - not at the next DeferredDelete.
+
+    ``deleteLater`` alone leaves the viewer holding its ``recording`` (and the curves
+    slices of it) until Qt gets round to the deletion, so the old recording stayed
+    resident across transitions (measured: +2.2 GB per recording on set A). Dropping
+    the plots and the recording frees the array as soon as Python drops it.
+    """
+    viewer.plots = []
+    viewer.clear()
+    viewer.recording = None  # type: ignore[assignment]
+    viewer.setParent(None)
+    viewer.deleteLater()
+
+
 def _breakable(name: str) -> str:
     """Let a long underscore-joined id wrap in a label (zero-width space after ``_``)."""
     return name.replace("_", "_" + chr(0x200B))
@@ -110,7 +142,7 @@ class AdjudicationWindow(QMainWindow):
 
     def __init__(self, session: AdjudicationSession, *, load_fn: LoadFn,
                  traces_fn: TracesFn | None = None, async_traces: bool = True,
-                 parent: QWidget | None = None) -> None:
+                 prefetch: bool = False, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"Candidate adjudication - {session.queue_file}")
         self.session = session
@@ -132,6 +164,18 @@ class AdjudicationWindow(QMainWindow):
         self._shown_key: str | None = None
         self.viewer: MultiChannelViewer | None = None
         self.last_error: str | None = None
+        # Prefetch of the next recording (see the module docstring).
+        self._pool = (ThreadPoolExecutor(max_workers=1, thread_name_prefix="adj-prefetch")
+                      if prefetch else None)
+        self._pf_rid: str | None = None
+        self._pf_future: Future[Any] | None = None
+        self._waiting_for: str | None = None
+        self.prefetch_log: list[str] = []
+        """What the prefetch did, in order: ``start`` / ``hit`` / ``wait`` / ``fail`` /
+        ``discard`` followed by the recording id. For tests and the status line."""
+        self._pf_timer = QTimer(self)
+        self._pf_timer.setInterval(50)
+        self._pf_timer.timeout.connect(self._poll_prefetch)
 
         # -- left: the core, the keys, progress
         self.core_info = QLabel("")
@@ -242,8 +286,8 @@ class AdjudicationWindow(QMainWindow):
         before = self.session.current()
         if before is None or before["core_key"] != self._shown_key:
             if before is not None:
-                self.status.setText("This core is not on screen (its recording did not "
-                                    "load), so it cannot be judged. Space skips it.")
+                self.status.setText("This core is not on screen yet (its recording is still "
+                                    "loading, or did not load), so it cannot be judged.")
             return None
         judgement = judgement_for_key(key)
         if judgement is None:
@@ -400,7 +444,8 @@ class AdjudicationWindow(QMainWindow):
         self._undo_btn.setEnabled(self.session.can_undo() or self._widen is not None)
         self.core_info.setText(f"<b>Loading</b> {_breakable(str(row['recording']))} ...")
         try:
-            self._ensure_recording(row)
+            if not self._ensure_recording(row):
+                return  # its prefetch is still running: _poll_prefetch comes back here
             self._describe(row)
             self._highlight(row)
         except Exception as exc:  # noqa: BLE001 - shown; the keys stay disabled
@@ -412,23 +457,45 @@ class AdjudicationWindow(QMainWindow):
         self._set_judging_enabled(True)
         self.recentre()
         self._show_traces(row)
+        self._start_prefetch()
 
-    def _ensure_recording(self, row: dict[str, Any]) -> None:
+    def _ensure_recording(self, row: dict[str, Any]) -> bool:
+        """Put ``row``'s recording on screen. False while its prefetch is still running."""
         rid = str(row["recording"])
         if rid == self._rec_id and self.viewer is not None:
-            return
-        # One recording in memory at a time: a new-cohort file is ~2 GB as float64.
+            return True
+        self._waiting_for = None
+        recording = None
+        if rid == self._pf_rid and self._pf_future is not None:
+            if not self._pf_future.done():
+                self._waiting_for = rid
+                self.prefetch_log.append(f"wait {rid}")
+                self.status.setText(f"Loading {rid} ... (already on its way)")
+                self._pf_timer.start()
+                return False
+            future, self._pf_rid, self._pf_future = self._pf_future, None, None
+            try:
+                recording = future.result()
+                self.prefetch_log.append(f"hit {rid}")
+            except Exception as exc:  # noqa: BLE001 - shown; a normal load follows
+                self.prefetch_log.append(f"fail {rid}")
+                self.last_error = str(exc)
+                self.status.setText(f"Prefetch of {rid} failed ({exc}); loading it now ...")
+        else:
+            self._discard_prefetch()
+        # One recording on screen at a time (plus at most one prefetched).
         if self.viewer is not None:
-            self.viewer.setParent(None)
-            self.viewer.deleteLater()
-            self.viewer = None
+            old, self.viewer = self.viewer, None
+            _release_viewer(old)
         self._recording = None
         self._rec_id = None
         gc.collect()
-        self.status.setText(f"Loading {rid} ...")
-        recording = self._load_fn(row)
+        if recording is None:
+            self.status.setText(f"Loading {rid} ...")
+            recording = self._load_fn(row)
         names = tuple(c.name for c in recording.channels)
-        self.viewer = MultiChannelViewer(ArrayRecording(recording.data, recording.fs),
+        self.viewer = MultiChannelViewer(ArrayRecording(recording.data, recording.fs,
+                                                        copy_to_float32=False),
                                          channel_names=names,
                                          channel_colors=_COLOURS[: len(names)])
         self.viewer.bad_interval_added.connect(self._on_widen_drag)
@@ -442,6 +509,46 @@ class AdjudicationWindow(QMainWindow):
                            if str(r["recording"]) == rid], dtype=np.float64).reshape(-1, 2)
         self.viewer.set_model_intervals(seconds_to_samples(others, float(recording.fs)))
         self.status.setText(f"Loaded {rid}.")
+        return True
+
+    # -- prefetch ---------------------------------------------------------------
+
+    def _next_recording_row(self) -> dict[str, Any] | None:
+        """The first later unjudged core from another recording; never past the end."""
+        rows = self.session.rows
+        for r in rows[self.session.cursor + 1:]:
+            if str(r["recording"]) != self._rec_id and self.session.judgement_of(r) is None:
+                return r
+        return None
+
+    def _start_prefetch(self) -> None:
+        if self._pool is None:
+            return
+        nxt = self._next_recording_row()
+        rid = None if nxt is None else str(nxt["recording"])
+        if rid == self._pf_rid:
+            return
+        self._discard_prefetch()
+        if nxt is None or rid is None:
+            return
+        self._pf_rid, self._pf_future = rid, self._pool.submit(self._load_fn, nxt)
+        self.prefetch_log.append(f"start {rid}")
+
+    def _discard_prefetch(self) -> None:
+        if self._pf_future is not None:
+            self._pf_future.cancel()  # a load already running finishes; its result is dropped
+            self.prefetch_log.append(f"discard {self._pf_rid}")
+        self._pf_rid, self._pf_future = None, None
+
+    def _poll_prefetch(self) -> None:
+        """GUI-thread poll: when the awaited prefetch is done, show its core."""
+        if self._waiting_for is None:
+            self._pf_timer.stop()
+            return
+        if self._pf_future is None or self._pf_future.done():
+            self._pf_timer.stop()
+            self._waiting_for = None
+            self.show_current()
 
     def _highlight(self, row: dict[str, Any]) -> None:
         """The current core, drawn above everything on every channel."""
@@ -556,6 +663,10 @@ class AdjudicationWindow(QMainWindow):
         If the write fails the window still closes, after saying so: the judgements are
         in the local journal and are restored the next time this queue is opened.
         """
+        self._pf_timer.stop()
+        self._discard_prefetch()
+        if self._pool is not None:
+            self._pool.shutdown(wait=False, cancel_futures=True)
         try:
             self.session.close()
         except Exception as exc:  # noqa: BLE001 - shown; the journal still holds them
@@ -599,7 +710,7 @@ def open_queue(queue_path: Path, store: GemsStore, *, user: str | None = None,
         return loaders.load_old_signal(path, str(row["recording"]), str(row["animal"]),
                                        units=loaders.OLD_COHORT_UNITS)
 
-    win = AdjudicationWindow(session, load_fn=load_fn)
+    win = AdjudicationWindow(session, load_fn=load_fn, prefetch=True)
     if not who.is_confident:
         win.status.setText(f"Labelling as '{who.user_id}' (from the OS account - set git "
                            "user.email to record who judged).")

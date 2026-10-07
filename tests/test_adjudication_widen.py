@@ -175,12 +175,16 @@ def _window(store: GemsStore, tmp_path: Path):
     from ui.windows.adjudication_window import AdjudicationWindow
 
     app = QApplication.instance()
+    # A window left visible by an earlier test keeps the focus and swallows the shortcuts;
+    # hide (not close: no store writes) every other top-level window first.
+    for other in app.topLevelWidgets():
+        if other.isVisible():
+            other.hide()
     (tmp_path / "probe").mkdir(exist_ok=True)
     probe = AdjudicationWindow(_session(store, tmp_path / "probe"), load_fn=_fake_recording,
                                async_traces=False)
     probe.show()
-    probe.activateWindow()
-    app.processEvents()
+    _activate(probe)
     before = probe.session.cursor
     QTest.keyClick(probe, Qt.Key_Space)
     app.processEvents()
@@ -193,8 +197,23 @@ def _window(store: GemsStore, tmp_path: Path):
                            async_traces=False)
     w.resize(1400, 900)
     w.show()
-    w.activateWindow()
+    _activate(w)
     return w
+
+
+def _activate(win) -> bool:
+    """Make ``win`` the active window. Offscreen, the first activation after the previous
+    active window was hidden can be dropped, so it is retried."""
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication
+
+    for _ in range(5):
+        win.raise_()
+        win.activateWindow()
+        QApplication.instance().processEvents()
+        if QTest.qWaitForWindowActive(win, 400):
+            return True
+    return False
 
 
 def _shift_drag(qapp, w, x0: float, x1: float) -> None:
