@@ -11,6 +11,7 @@ Run with:
 After `pip install -e .`:
     detector-pyqt
     detector-pyqt path/to/recording.mat
+    detector-pyqt --adjudicate queue.parquet   # task 16 Change 1, straight in
 """
 
 from __future__ import annotations
@@ -49,6 +50,20 @@ def main() -> int:
         "recording", nargs="?", default=None,
         help="Path to a `.mat` or `.h5` recording (optional).",
     )
+    parser.add_argument(
+        "--adjudicate", metavar="QUEUE", default=None,
+        help="Open candidate adjudication (task 16 Change 1) on a queue parquet "
+             "file; schema in ui/adjudicate/queue.py.",
+    )
+    parser.add_argument(
+        "--survivals-root", default=None,
+        help="Local path of the old cohort's Survivals folder (for old-cohort "
+             "queue rows); else GEMS_SURVIVALS_ROOT, else the build machine's G: path.",
+    )
+    parser.add_argument(
+        "--user", default=None,
+        help="Who is judging (default: git user.email, then the OS account).",
+    )
     args = parser.parse_args()
 
     app = QApplication.instance() or QApplication(sys.argv)
@@ -64,7 +79,27 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
+    if args.adjudicate:
+        return _run_adjudication(app, args)
     window = MainWindow(recording_path=recording_path)
+    window.show()
+    return app.exec()
+
+
+def _run_adjudication(app: QApplication, args: argparse.Namespace) -> int:
+    """Open the adjudication window on ``args.adjudicate`` against the GEMS store."""
+    from gems_blanking_v2.io.store import GemsStore, find_gems_root
+
+    from ui.windows.adjudication_window import open_queue
+
+    queue = Path(args.adjudicate).expanduser()
+    if not queue.is_file():
+        print(f"error: queue not found at {queue}", file=sys.stderr)
+        return 2
+    store = GemsStore(find_gems_root())
+    root = Path(args.survivals_root).expanduser() if args.survivals_root else None
+    window = open_queue(queue, store, user=args.user, survivals_root=root)
+    window.resize(1600, 950)
     window.show()
     return app.exec()
 

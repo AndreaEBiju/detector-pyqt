@@ -101,6 +101,11 @@ class ZTraceDock(QWidget):
             self._verdict.setText("z-traces appear after you commit your marks.")
             self._detail.setText("")
 
+    def set_x_range(self, t_start_s: float, t_stop_s: float) -> None:
+        """Show ``[t_start_s, t_stop_s)`` on every band (the plots are x-linked)."""
+        if t_stop_s > t_start_s:
+            self._plots[BAND_ORDER[0]].setXRange(t_start_s, t_stop_s, padding=0)
+
     def n_curves_with_data(self) -> int:
         """How many band curves actually hold points. For the offscreen test."""
         return sum(

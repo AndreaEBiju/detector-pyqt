@@ -418,6 +418,35 @@ Produces `review_summary.json` with `true_artifact_count`,
 
 ---
 
+### 5c. Candidate adjudication (task 16 Change 1)
+
+Judge a queue of candidate cores, one keystroke each. Open it with
+**Tools → Candidate adjudication…** (pick the queue `.parquet`), or straight from a shell:
+
+```
+detector-pyqt --adjudicate path/to/queue.parquet [--survivals-root PATH] [--user NAME]
+```
+
+| Key | Judgement |
+|---|---|
+| `1` | motion |
+| `2` | physiology (not motion) |
+| `3` | unsure |
+| `4` | line noise (not motion; counts as a negative) |
+| `Space` | skip - the core stays unjudged and comes round again |
+| `Ctrl+Z` / `Backspace` | undo the last judgement (up to the 20 not yet written) |
+| `Home`, `+`, `-` | re-centre on the core; widen / narrow the context |
+
+The core is the yellow band; the queue's other cores in the same recording are
+shaded orange. A **TEST SET** tag means the judgement is stored as test data and
+never trains. Judgements are written to the GEMS store as your own write-once files,
+`labels/<animal>/events_<you>_<stamp>-adj-<cohort>-<label_set>-<n>.parquet`, in
+batches and when you close the window; until then a local journal keeps them, so a
+crash loses nothing - reopening the same queue restores them and resumes where you
+stopped. Old-cohort rows read `<rid>_notched.mat` under the Survivals folder
+(`--survivals-root`, or `GEMS_SURVIVALS_ROOT`). The queue's columns are documented in
+`ui/adjudicate/queue.py`.
+
 ## 6. Saving
 
 `File → Save` (`Ctrl+S`) writes four artifacts next to the source
