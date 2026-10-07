@@ -22,6 +22,24 @@ assumed: it comes from an explicit argument (``--survivals-root``), then the
 the per-user gems config file (``gems_blanking_v2.io.store.config_path()``, a
 ``platformdirs`` location). With none of these, old-cohort rows refuse to load. The
 queue stores only paths relative to it.
+
+**Beat trains** (for the spectrum panel's k×HR lines). Nothing here estimates a heart
+rate from the signal; a recording without a usable stored train gets none.
+
+* Old cohort (:func:`old_beats`): Andrea's ``HR_BR_HRVAnalysis`` output beside the
+  signal, ``<base>_HRBR.mat`` or ``<base>_*_HRBR.mat`` in the row's folder (``<base>`` is the recording id
+  without ``_notched``, followed by ``_``; matched case-insensitively), whose
+  ``heartlocs`` are 1-BASED sample indices into the analysed signal. A file is used
+  only if that signal is the whole recording at the recording's rate: its ``t`` has
+  exactly the recording's sample count, starts at 0 and steps by ``1/fs``. An epoch
+  file (``..._recovery_HRBR.mat``) indexes from the epoch start, which it does not
+  record, and is refused. The exact name ``<base>_HRBR.mat`` is tried first, then the
+  others in sorted order. (A v5 file's ``t`` is read whole to check its spacing: up to
+  ~250 MB for a 20-min file, once per recording, off the GUI thread.)
+* New cohort (:func:`new_beats`): the HRV-grade count-gated train in the store,
+  ``<rid>_beats.mat`` beside the session's ``meta.json``, read with
+  ``gems_blanking_v2.emit.hr_beats`` (beat times, ``gapAfter``, ``blankSpans``). The
+  mask-grade ``<rid>_peri_r_beats.mat`` is for the peri-R mask only and is never read.
 """
 
 from __future__ import annotations
@@ -29,24 +47,33 @@ from __future__ import annotations
 import json
 import os
 import tomllib
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Final
 
 import h5py
 import numpy as np
+from gems_blanking_v2.emit.hr_beats import (
+    read_blank_spans,
+    read_gap_after,
+    read_hr_beats,
+)
 from gems_blanking_v2.io.chanlabels import assert_plausible_units
 from gems_blanking_v2.io.channel_map import Units, meta_path, scale_to_uv
 from gems_blanking_v2.io.store import GemsStore, config_path
 from gems_blanking_v2.types import ChannelInfo, Recording
-from scipy.io import loadmat
+from scipy.io import loadmat, whosmat
 
 from ui.audit import bridge
 
 __all__ = [
     "OLD_COHORT_CHANNELS",
     "OLD_COHORT_UNITS",
+    "BeatSource",
     "load_new_row",
     "load_old_signal",
+    "new_beats",
+    "old_beats",
     "old_signal_path",
     "resolve_survivals_root",
 ]
@@ -158,3 +185,130 @@ def load_old_signal(path: Path, rid: str, animal: str, *, units: Units) -> Recor
     assert_plausible_units(y, units, scale, where=Path(path).name)
     return Recording(fs=fs, data=y * scale, channels=_channels(), animal=animal,
                      session=rid, path=Path(path))
+
+
+NEW_COHORT_BEATS_SUFFIX: Final = "_beats.mat"
+"""``<rid>_beats.mat``: the HRV-grade train. Never ``_peri_r_beats.mat`` (mask only)."""
+NEW_COHORT_NO_BEATS: Final = ("no HRV-grade count-gated beat train (<rid>_beats.mat) in the "
+                              "store for this recording")
+
+
+@dataclass(frozen=True)
+class BeatSource:
+    """A recording's beat times (seconds on its timeline), or why there are none."""
+
+    beats_s: np.ndarray | None
+    source: str | None
+    """The file the beats came from (its name only)."""
+    reason: str | None
+    gap_after: np.ndarray | None = None
+    """Per beat (aligned with ``beats_s``): the interval after it spans a tagged gap."""
+    blank_spans: np.ndarray | None = None
+    """``(k, 2)`` half-open seconds whose beats were removed (rejected stretches)."""
+
+
+_FS_RTOL: Final = 1e-6
+
+
+def _h5_values(ds: Any) -> np.ndarray:
+    """A v7.3 variable as a flat float array; MATLAB's ``[]`` (``MATLAB_empty``) is empty.
+
+    MATLAB stores an empty array as its SHAPE with ``MATLAB_empty = 1``; read naively,
+    ``zeros(0, 1)`` would come back as two "beats" at samples 0 and 1.
+    """
+    if int(np.asarray(ds.attrs.get("MATLAB_empty", 0)).ravel()[0]) == 1:
+        return np.zeros(0)
+    return np.asarray(ds, dtype=np.float64).ravel()
+
+
+def _hrbr_read(path: Path) -> tuple[np.ndarray, int, np.ndarray]:
+    """``(heartlocs, len(t), t[:2])`` from an ``_HRBR.mat``: v7.3 via h5py, v5 via scipy."""
+    try:
+        with h5py.File(path, "r") as f:
+            t = f["t"]
+            empty = int(np.asarray(t.attrs.get("MATLAB_empty", 0)).ravel()[0]) == 1
+            n_t = 0 if empty else int(np.prod(t.shape))
+            head = (np.zeros(0) if empty else
+                    np.asarray(t[0, :2] if t.shape[0] == 1 else t[:2, 0], dtype=np.float64))
+            return _h5_values(f["heartlocs"]), n_t, head
+    except OSError:  # not HDF5: a v5 MAT-file
+        sizes = {name: shape for name, shape, _cls in whosmat(path)}
+        if "t" not in sizes:
+            msg = f"{path.name} has no t"
+            raise KeyError(msg) from None
+        m = loadmat(path, variable_names=["heartlocs", "t"])
+        t_all = np.asarray(m["t"], dtype=np.float64).ravel()
+        return (np.asarray(m["heartlocs"], dtype=np.float64).ravel(), int(t_all.size),
+                t_all[:2].copy())
+
+
+def _fs_differs(file_fs: float, fs: float) -> bool:
+    return not abs(file_fs - fs) <= _FS_RTOL * fs
+
+
+def old_beats(survivals_root: Path, folder: str, rid: str, *, n_samples: int,
+              fs: float) -> BeatSource:
+    """The old-cohort beat train beside ``rid``'s signal (module docstring), or why not.
+
+    Beat ``k`` (1-based ``heartlocs``) is at ``(k - 1) / fs`` seconds (invariant 15).
+    """
+    folder_path = old_signal_path(survivals_root, folder, rid).parent
+    base = rid.removesuffix("_notched")
+    exact = f"{base}_HRBR.mat".lower()
+    try:
+        names = sorted(p.name for p in folder_path.iterdir()
+                       if p.name.lower().startswith(base.lower() + "_")
+                       and p.name.lower().endswith("_hrbr.mat"))
+    except OSError as exc:
+        return BeatSource(None, None, f"cannot list {folder}: {exc}")
+    if not names:
+        return BeatSource(None, None, f"no {base}_HRBR.mat or {base}_*_HRBR.mat beside "
+                                      "the signal")
+    names.sort(key=lambda n: n.lower() != exact)  # the exact name first, else sorted
+    refused = []
+    for name in names:
+        try:
+            heartlocs, n_t, head = _hrbr_read(folder_path / name)
+        except (OSError, KeyError, ValueError) as exc:
+            refused.append(f"{name}: unreadable ({exc})")
+            continue
+        if n_t != n_samples:
+            refused.append(f"{name}: covers {n_t} samples, the recording {n_samples} "
+                           "(an epoch file)")
+            continue
+        if head.size < 2 or abs(head[0]) > 0.5 / fs or _fs_differs(1.0 / (head[1] - head[0]),
+                                                                  fs):
+            got = (f"starts at {head[0]:.6g} s, steps {head[1] - head[0]:.6g} s"
+                   if head.size >= 2 else "has no usable t")
+            refused.append(f"{name}: its t {got}; the recording is sampled at {fs:.6g} Hz "
+                           "from 0")
+            continue
+        if heartlocs.size == 0:
+            refused.append(f"{name}: holds no beats")
+            continue
+        return BeatSource((heartlocs - 1.0) / float(fs), name, None)
+    return BeatSource(None, None, "no whole-recording _HRBR.mat: " + "; ".join(refused))
+
+
+def new_beats(store: GemsStore, animal: str, rid: str, *, fs: float) -> BeatSource:
+    """The new-cohort HRV-grade train beside ``rid``'s ``meta.json`` (module docstring).
+
+    Beat times come back on the recording's timeline (``epochStart_s`` applied by
+    ``read_hr_beats``), with the file's ``gapAfter`` tags and ``blankSpans``. A file whose
+    ``fs`` is not the recording's is refused.
+    """
+    path = meta_path(store, animal, rid).parent / f"{rid}{NEW_COHORT_BEATS_SUFFIX}"
+    if not path.is_file():
+        return BeatSource(None, None, NEW_COHORT_NO_BEATS)
+    beats, file_fs = read_hr_beats(path)
+    if _fs_differs(file_fs, fs):
+        return BeatSource(None, None, f"{path.name} is at {file_fs:.6g} Hz, the recording at "
+                                      f"{fs:.6g} Hz")
+    if beats.size == 0:
+        return BeatSource(None, None, f"{path.name} holds no beats")
+    gaps = read_gap_after(path)
+    if gaps is not None and gaps.size != beats.size:
+        return BeatSource(None, None, f"{path.name}: {gaps.size} gapAfter tags for "
+                                      f"{beats.size} beats")
+    return BeatSource(beats, path.name, None, gap_after=gaps,
+                      blank_spans=read_blank_spans(path))
