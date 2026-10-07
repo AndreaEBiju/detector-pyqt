@@ -16,7 +16,9 @@ import numpy as np
 class ArrayRecording:
     """``(n_samples, n_channels)`` samples at ``fs``, served like ``LazyRecording``."""
 
-    def __init__(self, data: np.ndarray, fs: float) -> None:
+    def __init__(self, data: np.ndarray, fs: float, *, copy_to_float32: bool = True) -> None:
+        """``copy_to_float32=False`` serves ``data`` as it is, in its own dtype (float64
+        from the loaders) - no second copy in memory."""
         arr = np.asarray(data)
         if arr.ndim != 2:  # (samples, channels)
             msg = f"expected (n_samples, n_channels), got shape {arr.shape}"
@@ -24,7 +26,7 @@ class ArrayRecording:
         if not fs > 0:
             msg = f"fs must be positive, got {fs}"
             raise ValueError(msg)
-        self._y = arr.astype(np.float32, copy=False)
+        self._y = arr.astype(np.float32, copy=False) if copy_to_float32 else arr
         self.fs = float(fs)
         self.n_samples, self.n_channels = self._y.shape
         self.duration_sec = self.n_samples / self.fs
@@ -35,7 +37,10 @@ class ArrayRecording:
         return False
 
     def get_range(self, t_start: float, t_end: float) -> np.ndarray:
-        """Samples in ``[t_start, t_end)`` as ``(n, n_ch)`` float32, clipped to bounds."""
+        """Samples in ``[t_start, t_end)`` as ``(n, n_ch)``, clipped to bounds.
+
+        float32 by default; the data's own dtype with ``copy_to_float32=False``.
+        """
         i0 = max(0, int(np.floor(t_start * self.fs)))
         i1 = min(self.n_samples, int(np.ceil(t_end * self.fs)))
         if i1 <= i0:

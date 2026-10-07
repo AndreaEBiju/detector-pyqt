@@ -23,7 +23,18 @@ are ``"human"``, ``basis`` is ``"adjudicated"``) plus :data:`EXTRA_COLUMNS`: ``d
 (user id), ``at`` (UTC ISO-8601 with ``+00:00``), ``app_commit`` (this app's git commit,
 null if unknown), ``queue_file``, ``queue_sha256``, ``judgement_id`` (uuid4 hex) and
 ``alias_table_sha256`` (old-cohort rows: the hash of the animal alias table the letter
-came from, which Andrea has not yet confirmed; null on new-cohort rows).
+came from, which Andrea has not yet confirmed; null on new-cohort rows), and
+``widened_start_s`` / ``widened_stop_s``.
+
+Widened boundaries (task 16 Change 1, "widen a boundary where the extent is visibly
+wrong")
+---------------------------------------------------------------------------------------
+The judged unit stays the CORE (ruling 2026-10-07 (b) R3): ``start_s``, ``stop_s`` and the
+core key are never changed. A widened boundary is two optional fields on the judgement it
+accompanies, the labeller's statement of the event's visible extent. It goes only with
+``motion`` (an extent belongs to motion); ``check_writable`` refuses it on any other
+judgement, refuses one that does not contain the core, and refuses one with only one of
+the two fields. Absent (journal) / null (parquet) when the core was not widened.
 
 Reading back (:func:`read_shards`) keeps only rows whose ``by`` is the user - a shard
 file pattern ``events_ann_*`` also matches ``events_ann_smith_*`` - and drops duplicate
@@ -34,10 +45,11 @@ Crash safety
 Shards are written in batches, so between flushes each judgement and each undo is also
 appended to a LOCAL per-user journal (JSONL, outside the store, never synced). On reopen,
 journal judgements not undone and not found in any shard are restored as pending - only
-their judgement, time, id, user and commit are taken from the journal; every other field
-is rebuilt from the queue row. Journal lines are canonical ASCII JSON with absent keys
-for missing values; a torn last line (a crash mid-write) is terminated before anything
-new is appended, so it can never swallow the next event.
+their judgement, time, id, user, commit and widened boundary (:data:`JOURNAL_KEPT`) are
+taken from the journal; every other field is rebuilt from the queue row. Journal lines
+are canonical ASCII JSON with absent keys for missing values; a torn last line (a crash
+mid-write) is terminated before anything new is appended, so it can never swallow the
+next event.
 """
 
 from __future__ import annotations
@@ -73,10 +85,10 @@ __all__ = [
     "SHARD_COLUMNS",
     "app_commit",
     "check_writable",
-    "judgement_for_key",
-    "make_record",
     "journal_append",
     "journal_repair",
+    "judgement_for_key",
+    "make_record",
     "read_journal",
     "read_shards",
     "write_shard",
@@ -96,8 +108,10 @@ BASIS: Final = "adjudicated"
 EXTRA_COLUMNS: Final[tuple[str, ...]] = (
     "draw", "region_start_s", "region_stop_s", "score", "by", "at", "app_commit",
     "queue_file", "queue_sha256", "judgement_id", "alias_table_sha256",
+    "widened_start_s", "widened_stop_s",
 )
-JOURNAL_KEPT: Final[tuple[str, ...]] = ("judgement", "at", "judgement_id", "by", "app_commit")
+JOURNAL_KEPT: Final[tuple[str, ...]] = ("judgement", "at", "judgement_id", "by", "app_commit",
+                                        "widened_start_s", "widened_stop_s")
 """The fields a restored journal record contributes; the rest come from the queue row."""
 SHARD_COLUMNS: Final[tuple[str, ...]] = (*LABEL_COLUMNS, *EXTRA_COLUMNS)
 
@@ -122,8 +136,14 @@ def app_commit() -> str | None:
 def make_record(row: Mapping[str, Any], judgement: str, *, user: str,
                 app_sha: str | None, queue_file: str, queue_sha256: str,
                 at: datetime | None = None, judgement_id: str | None = None,
+                widened: tuple[float, float] | None = None,
                 ) -> dict[str, Any]:
-    """One shard row for ``row`` (a validated queue row) judged ``judgement``."""
+    """One shard row for ``row`` (a validated queue row) judged ``judgement``.
+
+    ``widened`` is the labeller's widened boundary ``(start_s, stop_s)`` on the recording
+    timeline - only with ``motion``, finite, containing the core, inside its region.
+    """
+    _checked_widen(judgement, row, widened)
     if judgement not in JUDGEMENTS:
         msg = f"judgement must be one of {sorted(JUDGEMENTS)}, got {judgement!r}"
         raise ValueError(msg)
@@ -141,7 +161,32 @@ def make_record(row: Mapping[str, Any], judgement: str, *, user: str,
         "app_commit": app_sha, "queue_file": queue_file, "queue_sha256": queue_sha256,
         "judgement_id": judgement_id or uuid.uuid4().hex,
         "alias_table_sha256": _text_or_none(row.get("alias_table_sha256")),
+        "widened_start_s": float(widened[0]) if widened is not None else math.nan,
+        "widened_stop_s": float(widened[1]) if widened is not None else math.nan,
     }
+
+
+def _checked_widen(judgement: str, row: Mapping[str, Any],
+                   widened: tuple[float, float] | None) -> None:
+    """Raise unless a widen goes with motion, is finite, contains the core and stays in
+    the core's region."""
+    if widened is None:
+        return
+    if judgement != "motion":
+        msg = f"a widened boundary goes only with motion, not {judgement!r}"
+        raise ValueError(msg)
+    a, b = float(widened[0]), float(widened[1])
+    if not (math.isfinite(a) and math.isfinite(b)):
+        msg = f"a widened boundary must be finite, got [{a}, {b})"
+        raise ValueError(msg)
+    if not (a <= float(row["start_s"]) and float(row["stop_s"]) <= b):
+        msg = (f"a widened boundary must contain the core [{row['start_s']}, "
+               f"{row['stop_s']}); got [{a}, {b})")
+        raise ValueError(msg)
+    if not (float(row["region_start_s"]) <= a and b <= float(row["region_stop_s"])):
+        msg = (f"a widened boundary must stay inside the core's region "
+               f"[{row['region_start_s']}, {row['region_stop_s']}); got [{a}, {b})")
+        raise ValueError(msg)
 
 
 def _text_or_none(v: Any) -> str | None:
@@ -155,7 +200,8 @@ def _text_or_none(v: Any) -> str | None:
 
 def _frame(records: Iterable[Mapping[str, Any]]) -> pd.DataFrame:
     df = pd.DataFrame(list(records), columns=list(SHARD_COLUMNS))
-    for col in ("start_s", "stop_s", "region_start_s", "region_stop_s", "score"):
+    for col in ("start_s", "stop_s", "region_start_s", "region_stop_s", "score",
+                "widened_start_s", "widened_stop_s"):
         df[col] = df[col].astype("float64")
     return df
 
@@ -170,6 +216,13 @@ def check_writable(records: Sequence[Mapping[str, Any]]) -> None:
             msg = (f"refusing to write {r['cohort']} {r['animal']} with label_set "
                    f"{r['label_set']!r}: a test animal's labels are 'test' (R1)")
             raise ValueError(msg)
+        ws, we = r.get("widened_start_s"), r.get("widened_stop_s")
+        has = [v is not None and not (isinstance(v, float) and math.isnan(v)) for v in (ws, we)]
+        if any(has):
+            if not all(has):
+                msg = "a widened boundary needs both widened_start_s and widened_stop_s"
+                raise ValueError(msg)
+            _checked_widen(r["judgement"], r, (float(ws), float(we)))  # type: ignore[arg-type]
 
 
 def shard_groups(records: Sequence[Mapping[str, Any]]

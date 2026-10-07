@@ -12,10 +12,44 @@ negative. ``Space`` skips (the core stays unjudged and comes round again);
 ``Ctrl+Z`` / ``Backspace`` undoes the last judgement (up to the 20 still unwritten);
 ``Home`` re-centres; ``+`` / ``-`` widen or narrow the context.
 
+**Widening a boundary** ("where the extent is visibly wrong", task 16 Change 1):
+``Shift+drag`` on the plot widens the current core's boundary to cover the drag (the
+union with the core and any earlier drag, clipped to the core's region), drawn in red.
+The judged unit stays the core (R3): the widened span is stored as
+``widened_start_s`` / ``widened_stop_s`` beside it, never instead of it. A widened
+boundary goes only with **motion**: ``1`` records it; ``2`` / ``3`` / ``4`` are refused
+while one is pending (clear it first). ``Esc`` clears it; ``Ctrl+Z`` clears a pending
+widen first, then undoes judgements as before - and undoing a motion judgement withdraws
+its widened boundary with it.
+
 Band z-traces (the maximum over every signal, per band, with ``z_enter``) are
 available per recording but OFF by default: they mean running the detection chain over
 the core's whole assessable region (Night 1 measured about three minutes and several GB
 per new-cohort recording), so they are computed in the background only when ticked.
+
+**Prefetch** (``prefetch=True``, what ``open_queue`` uses): while the labeller judges a
+recording, the NEXT recording in the queue (the first later core, not yet judged, from a
+different recording; never past the end, never wrapping) is loaded on one background
+thread. Arriving at it is then instant. Rules:
+
+* at most one prefetched recording is held (memory: ~2.3 GB for a 20-min new-cohort
+  file; the viewer serves the loaded array without a float32 copy, so current +
+  prefetched stays near 5 GB);
+* the loader only reads files and builds numpy arrays - no Qt object is touched off the
+  GUI thread; the result is picked up on the GUI thread by a polling ``QTimer``;
+* arriving before it finishes shows "loading" and waits for THAT load (keys disabled),
+  never starting a second one, and the GUI thread never blocks on it;
+* a prefetch that failed falls back to a normal load, with the error shown;
+* moving to any other recording discards the prefetch. A load already running cannot be
+  interrupted: it runs to the end and its result is dropped. Until then it still holds
+  memory, and h5py serialises file access process-wide, so a jump made during a prefetch
+  can take up to the prefetch's remaining time (~8-30 s) on top of its own load;
+* showing any core cancels a wait for a prefetch (e.g. undo back to the previous
+  recording while the next one loads), so its finishing never re-renders what is on
+  screen or wipes a pending widen;
+* closing the window during a prefetch cancels it if it has not started. If it has, the
+  window closes at once, but the Python process exits only when that load finishes
+  (``ThreadPoolExecutor`` threads are joined at exit), up to ~30 s.
 
 Judgements go to the store as per-user write-once shards (``ui.adjudicate.judgements``);
 the queue schema is in ``ui.adjudicate.queue``.
@@ -25,13 +59,14 @@ from __future__ import annotations
 
 import gc
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pyqtgraph as pg
 from gems_blanking_v2.io.store import GemsStore
-from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, Signal
+from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QCloseEvent, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -46,7 +81,7 @@ from PySide6.QtWidgets import (
 )
 
 from ui.adjudicate import loaders
-from ui.adjudicate.judgements import KEY_TO_JUDGEMENT
+from ui.adjudicate.judgements import KEY_TO_JUDGEMENT, judgement_for_key
 from ui.adjudicate.session import AdjudicationSession
 from ui.audit import bridge
 from ui.audit.array_recording import ArrayRecording
@@ -66,6 +101,21 @@ _LABELS = {"motion": "1  Motion", "physiology": "2  Physiology (not motion)",
            "unsure": "3  Unsure", "line_noise": "4  Line noise (not motion)"}
 _COLOURS = ("#4c9be8", "#6bb3f0", "#9ccbf5", "#e8834c", "#f0a06b", "#f5bf9c",
             "#5cc98a", "#7fd6a3", "#a6e3bf")
+
+
+def _release_viewer(viewer: MultiChannelViewer) -> None:
+    """Drop a viewer AND the recording it holds, now - not at the next DeferredDelete.
+
+    ``deleteLater`` alone leaves the viewer holding its ``recording`` (and the curves
+    slices of it) until Qt gets round to the deletion, so the old recording stayed
+    resident across transitions (measured: +2.2 GB per recording on set A). Dropping
+    the plots and the recording frees the array as soon as Python drops it.
+    """
+    viewer.plots = []
+    viewer.clear()
+    viewer.recording = None  # type: ignore[assignment]
+    viewer.setParent(None)
+    viewer.deleteLater()
 
 
 def _breakable(name: str) -> str:
@@ -100,7 +150,7 @@ class AdjudicationWindow(QMainWindow):
 
     def __init__(self, session: AdjudicationSession, *, load_fn: LoadFn,
                  traces_fn: TracesFn | None = None, async_traces: bool = True,
-                 parent: QWidget | None = None) -> None:
+                 prefetch: bool = False, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"Candidate adjudication - {session.queue_file}")
         self.session = session
@@ -114,12 +164,26 @@ class AdjudicationWindow(QMainWindow):
         self._jobs: list[_TraceJob] = []
         self._context = CONTEXT_S
         self._core_items: list[pg.LinearRegionItem] = []
+        self._widen: tuple[float, float] | None = None
+        self._widen_items: list[pg.LinearRegionItem] = []
         # The core_key actually on screen. Set only once its recording is loaded, its
         # details written and its band drawn; a judging key is refused unless it equals
         # the current core's key, so nothing can label a core the labeller never saw.
         self._shown_key: str | None = None
         self.viewer: MultiChannelViewer | None = None
         self.last_error: str | None = None
+        # Prefetch of the next recording (see the module docstring).
+        self._pool = (ThreadPoolExecutor(max_workers=1, thread_name_prefix="adj-prefetch")
+                      if prefetch else None)
+        self._pf_rid: str | None = None
+        self._pf_future: Future[Any] | None = None
+        self._waiting_for: str | None = None
+        self.prefetch_log: list[str] = []
+        """What the prefetch did, in order: ``start`` / ``hit`` / ``wait`` / ``fail`` /
+        ``discard`` followed by the recording id. For tests and the status line."""
+        self._pf_timer = QTimer(self)
+        self._pf_timer.setInterval(50)
+        self._pf_timer.timeout.connect(self._poll_prefetch)
 
         # -- left: the core, the keys, progress
         self.core_info = QLabel("")
@@ -189,6 +253,7 @@ class AdjudicationWindow(QMainWindow):
         QShortcut(QKeySequence.Undo, self, activated=self._slot(self.undo))
         QShortcut(QKeySequence(Qt.Key_Backspace), self, activated=self._slot(self.undo))
         QShortcut(QKeySequence(Qt.Key_Home), self, activated=self._slot(self.recentre))
+        QShortcut(QKeySequence(Qt.Key_Escape), self, activated=self._slot(self.clear_widen))
         QShortcut(QKeySequence(Qt.Key_Plus), self, activated=self._slot(lambda: self.zoom(+1)))
         QShortcut(QKeySequence(Qt.Key_Equal), self, activated=self._slot(lambda: self.zoom(+1)))
         QShortcut(QKeySequence(Qt.Key_Minus), self, activated=self._slot(lambda: self.zoom(-1)))
@@ -229,10 +294,17 @@ class AdjudicationWindow(QMainWindow):
         before = self.session.current()
         if before is None or before["core_key"] != self._shown_key:
             if before is not None:
-                self.status.setText("This core is not on screen (its recording did not "
-                                    "load), so it cannot be judged. Space skips it.")
+                self.status.setText("This core is not on screen yet (its recording is still "
+                                    "loading, or did not load), so it cannot be judged.")
             return None
-        rec = self.session.judge_key(key)
+        judgement = judgement_for_key(key)
+        if judgement is None:
+            return None
+        if self._widen is not None and judgement != "motion":
+            self.status.setText(f"A widened boundary goes only with motion: press 1 to record "
+                                f"motion with it, or Esc to clear it before judging {judgement}.")
+            return None
+        rec = self.session.judge_key(key, widened=self._widen)
         if rec is None:
             return None
         where = f"{before['recording']} {float(before['start_s']):.3f} s" if before else ""
@@ -246,7 +318,13 @@ class AdjudicationWindow(QMainWindow):
         self.show_current()
 
     def undo(self) -> None:
-        """Withdraw the newest unwritten judgement and show its core again."""
+        """Clear a pending widen; otherwise withdraw the newest unwritten judgement.
+
+        Undoing a motion judgement withdraws its widened boundary with it (one record).
+        """
+        if self._widen is not None:
+            self.clear_widen()
+            return
         rec = self.session.undo()
         if rec is None:
             self.status.setText("Nothing to undo: every judgement so far is already "
@@ -281,6 +359,70 @@ class AdjudicationWindow(QMainWindow):
         self.viewer.set_viewport(lo, hi)
         self._set_trace_range(lo, hi)
 
+    # -- widening ------------------------------------------------------------
+
+    def _on_widen_drag(self, lo: float, hi: float) -> None:
+        try:
+            self.widen(lo, hi)
+        except Exception as exc:  # noqa: BLE001 - shown, not swallowed
+            self._report(exc)
+
+    def widen(self, lo: float, hi: float) -> tuple[float, float] | None:
+        """Widen the on-screen core's boundary to cover ``[lo, hi)`` (recording seconds).
+
+        The pending widen is the HULL of the core, any earlier drag and this one, clipped
+        to the core's region: a drag that leaves a gap from the core fills the gap, and a
+        drag past the region's edge stops at the edge. A drag entirely inside the core
+        widens nothing (no widen is stored). Returns the pending widen, or ``None``.
+        """
+        row = self.session.current()
+        if row is None or row["core_key"] != self._shown_key:
+            self.status.setText("No core is on screen to widen.")
+            return None
+        r0, r1 = float(row["region_start_s"]), float(row["region_stop_s"])
+        c0, c1 = float(row["start_s"]), float(row["stop_s"])
+        if c0 <= min(lo, hi) and max(lo, hi) <= c1:
+            self.status.setText("That drag lies inside the core: nothing to widen.")
+            return self._widen
+        a = min(float(row["start_s"]), max(r0, min(lo, hi)))
+        b = max(float(row["stop_s"]), min(r1, max(lo, hi)))
+        if self._widen is not None:
+            a, b = min(a, self._widen[0]), max(b, self._widen[1])
+        self._widen = (a, b)
+        self._draw_widen()
+        self._undo_btn.setEnabled(True)  # Ctrl+Z / Undo clears a pending widen
+        self.status.setText(f"Widened to {a:.3f}-{b:.3f} s. Press 1 to record motion with "
+                            "it; Esc clears it.")
+        return self._widen
+
+    def clear_widen(self) -> None:
+        """Drop the pending widened boundary (nothing was recorded)."""
+        had = self._widen is not None
+        self._widen = None
+        self._draw_widen()
+        if had:
+            self.status.setText("Cleared the widened boundary.")
+
+    @property
+    def pending_widen(self) -> tuple[float, float] | None:
+        """The widened boundary waiting for its motion judgement, if any."""
+        return self._widen
+
+    def _draw_widen(self) -> None:
+        if self.viewer is not None:
+            for (plot, _c), item in zip(self.viewer.plots, self._widen_items, strict=False):
+                plot.removeItem(item)
+        self._widen_items = []
+        if self._widen is None or self.viewer is None:
+            return
+        for plot, _curve in self.viewer.plots:
+            item = pg.LinearRegionItem(values=self._widen, orientation="vertical",
+                                       movable=False, brush=pg.mkBrush(214, 39, 40, 40),
+                                       pen=pg.mkPen("#d62728", width=1))
+            item.setZValue(-6)
+            plot.addItem(item)
+            self._widen_items.append(item)
+
     # -- display --------------------------------------------------------------
 
     def _set_judging_enabled(self, enabled: bool) -> None:
@@ -293,7 +435,13 @@ class AdjudicationWindow(QMainWindow):
         The judging keys and buttons are live only once the core is fully on screen; a
         load that fails leaves them disabled (Space still skips past it).
         """
+        # Whatever is shown now supersedes any wait for a prefetch: its finishing must not
+        # come back here and re-render (wiping a widen drawn meanwhile).
+        self._waiting_for = None
+        self._pf_timer.stop()
         self._shown_key = None
+        self._widen = None  # a widen belongs to the core it was drawn on
+        self._draw_widen()
         self._set_judging_enabled(False)
         self._refresh_progress()
         row = self.session.current()
@@ -305,10 +453,11 @@ class AdjudicationWindow(QMainWindow):
             self._skip_btn.setEnabled(False)
             return
         self._skip_btn.setEnabled(True)
-        self._undo_btn.setEnabled(self.session.can_undo())
+        self._undo_btn.setEnabled(self.session.can_undo() or self._widen is not None)
         self.core_info.setText(f"<b>Loading</b> {_breakable(str(row['recording']))} ...")
         try:
-            self._ensure_recording(row)
+            if not self._ensure_recording(row):
+                return  # its prefetch is still running: _poll_prefetch comes back here
             self._describe(row)
             self._highlight(row)
         except Exception as exc:  # noqa: BLE001 - shown; the keys stay disabled
@@ -320,33 +469,99 @@ class AdjudicationWindow(QMainWindow):
         self._set_judging_enabled(True)
         self.recentre()
         self._show_traces(row)
+        self._start_prefetch()
 
-    def _ensure_recording(self, row: dict[str, Any]) -> None:
+    def _ensure_recording(self, row: dict[str, Any]) -> bool:
+        """Put ``row``'s recording on screen. False while its prefetch is still running."""
         rid = str(row["recording"])
         if rid == self._rec_id and self.viewer is not None:
-            return
-        # One recording in memory at a time: a new-cohort file is ~2 GB as float64.
+            return True
+        recording = None
+        pf_failed: str | None = None
+        if rid == self._pf_rid and self._pf_future is not None:
+            if not self._pf_future.done():
+                self._waiting_for = rid
+                self.prefetch_log.append(f"wait {rid}")
+                self.status.setText(f"Loading {rid} ... (already on its way)")
+                self._pf_timer.start()
+                return False
+            future, self._pf_rid, self._pf_future = self._pf_future, None, None
+            try:
+                recording = future.result()
+                self.prefetch_log.append(f"hit {rid}")
+            except Exception as exc:  # noqa: BLE001 - shown; a normal load follows
+                self.prefetch_log.append(f"fail {rid}")
+                self.last_error = pf_failed = str(exc)
+                self.status.setText(f"Prefetch of {rid} failed ({exc}); loading it now ...")
+        else:
+            self._discard_prefetch()
+        # One recording on screen at a time (plus at most one prefetched).
         if self.viewer is not None:
-            self.viewer.setParent(None)
-            self.viewer.deleteLater()
-            self.viewer = None
+            old, self.viewer = self.viewer, None
+            _release_viewer(old)
         self._recording = None
         self._rec_id = None
         gc.collect()
-        self.status.setText(f"Loading {rid} ...")
-        recording = self._load_fn(row)
+        if recording is None:
+            self.status.setText(f"Loading {rid} ...")
+            recording = self._load_fn(row)
         names = tuple(c.name for c in recording.channels)
-        self.viewer = MultiChannelViewer(ArrayRecording(recording.data, recording.fs),
+        self.viewer = MultiChannelViewer(ArrayRecording(recording.data, recording.fs,
+                                                        copy_to_float32=False),
                                          channel_names=names,
                                          channel_colors=_COLOURS[: len(names)])
+        self.viewer.bad_interval_added.connect(self._on_widen_drag)
+        self.viewer.follow_mark_drag = True  # a widen may run past the viewport
         self._placeholder.hide()
         self._centre_lay.insertWidget(0, self.viewer, 1)
+        self._widen_items = []
         self._recording, self._rec_id = recording, rid
         self._core_items = []
         others = np.array([[r["start_s"], r["stop_s"]] for r in self.session.rows
                            if str(r["recording"]) == rid], dtype=np.float64).reshape(-1, 2)
         self.viewer.set_model_intervals(seconds_to_samples(others, float(recording.fs)))
-        self.status.setText(f"Loaded {rid}.")
+        self.status.setText(f"Loaded {rid}." if pf_failed is None
+                            else f"Loaded {rid} (prefetch failed: {pf_failed}).")
+        return True
+
+    # -- prefetch ---------------------------------------------------------------
+
+    def _next_recording_row(self) -> dict[str, Any] | None:
+        """The first later unjudged core from another recording; never past the end."""
+        rows = self.session.rows
+        for r in rows[self.session.cursor + 1:]:
+            if str(r["recording"]) != self._rec_id and self.session.judgement_of(r) is None:
+                return r
+        return None
+
+    def _start_prefetch(self) -> None:
+        if self._pool is None:
+            return
+        nxt = self._next_recording_row()
+        rid = None if nxt is None else str(nxt["recording"])
+        if rid == self._pf_rid:
+            return
+        self._discard_prefetch()
+        if nxt is None or rid is None:
+            return
+        self._pf_rid, self._pf_future = rid, self._pool.submit(self._load_fn, nxt)
+        self.prefetch_log.append(f"start {rid}")
+
+    def _discard_prefetch(self) -> None:
+        if self._pf_future is not None:
+            self._pf_future.cancel()  # a load already running finishes; its result is dropped
+            self.prefetch_log.append(f"discard {self._pf_rid}")
+        self._pf_rid, self._pf_future = None, None
+
+    def _poll_prefetch(self) -> None:
+        """GUI-thread poll: when the awaited prefetch is done, show its core."""
+        if self._waiting_for is None:
+            self._pf_timer.stop()
+            return
+        if self._pf_future is None or self._pf_future.done():
+            self._pf_timer.stop()
+            self._waiting_for = None
+            self.show_current()
 
     def _highlight(self, row: dict[str, Any]) -> None:
         """The current core, drawn above everything on every channel."""
@@ -395,7 +610,7 @@ class AdjudicationWindow(QMainWindow):
         lines.append(f"{self.session.pending} judgement(s) not yet written to the store "
                      f"({len(self.session.written)} shard(s) written this session)")
         self.progress.setText("<br>".join(lines))
-        self._undo_btn.setEnabled(self.session.can_undo())
+        self._undo_btn.setEnabled(self.session.can_undo() or self._widen is not None)
 
     # -- z-traces -------------------------------------------------------------
 
@@ -455,12 +670,16 @@ class AdjudicationWindow(QMainWindow):
 
     # -- closing ----------------------------------------------------------------
 
-    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt override
+    def closeEvent(self, event: QCloseEvent) -> None:
         """Write everything pending, then close.
 
         If the write fails the window still closes, after saying so: the judgements are
         in the local journal and are restored the next time this queue is opened.
         """
+        self._pf_timer.stop()
+        self._discard_prefetch()
+        if self._pool is not None:
+            self._pool.shutdown(wait=False, cancel_futures=True)
         try:
             self.session.close()
         except Exception as exc:  # noqa: BLE001 - shown; the journal still holds them
@@ -504,7 +723,7 @@ def open_queue(queue_path: Path, store: GemsStore, *, user: str | None = None,
         return loaders.load_old_signal(path, str(row["recording"]), str(row["animal"]),
                                        units=loaders.OLD_COHORT_UNITS)
 
-    win = AdjudicationWindow(session, load_fn=load_fn)
+    win = AdjudicationWindow(session, load_fn=load_fn, prefetch=True)
     if not who.is_confident:
         win.status.setText(f"Labelling as '{who.user_id}' (from the OS account - set git "
                            "user.email to record who judged).")

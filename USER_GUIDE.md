@@ -436,6 +436,9 @@ detector-pyqt --adjudicate path/to/queue.parquet [--survivals-root PATH] [--user
 | `Space` | skip - the core stays unjudged and comes round again |
 | `Ctrl+Z` / `Backspace` | undo the last judgement (up to the 20 not yet written) |
 | `Home`, `+`, `-` | re-centre on the core; widen / narrow the context |
+| `Shift`+drag | widen the core's boundary where the extent is visibly wrong (red); then `1` records motion with it, `Esc` clears it |
+
+A widened boundary is stored beside the core (`widened_start_s` / `widened_stop_s`), never instead of it, and only with motion: `2`/`3`/`4` are refused while one is pending, and `Ctrl+Z` clears a pending widen before it undoes a judgement.
 
 The core is the yellow band; the queue's other cores in the same recording are
 shaded orange. A **TEST SET** tag means the judgement is stored as test data and

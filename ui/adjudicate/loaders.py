@@ -28,12 +28,12 @@ from __future__ import annotations
 
 import json
 import os
+import tomllib
 from pathlib import Path, PurePosixPath
 from typing import Any, Final
 
 import h5py
 import numpy as np
-import tomllib
 from gems_blanking_v2.io.chanlabels import assert_plausible_units
 from gems_blanking_v2.io.channel_map import Units, meta_path, scale_to_uv
 from gems_blanking_v2.io.store import GemsStore, config_path
@@ -138,7 +138,7 @@ def _read_y(path: Path) -> tuple[np.ndarray, float]:
             y = np.asarray(f["y"], dtype=np.float64).T
             fs = float(np.asarray(f["fs"]).ravel()[0])
     n_ch = len(OLD_COHORT_CHANNELS)
-    if y.ndim != 2:  # noqa: PLR2004
+    if y.ndim != 2:
         msg = f"{path.name}: y has shape {y.shape}, expected (n, {n_ch})"
         raise ValueError(msg)
     if y.shape[1] != n_ch:

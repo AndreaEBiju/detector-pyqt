@@ -15,6 +15,7 @@ written when the app last stopped.
 from __future__ import annotations
 
 import hashlib
+import logging
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -27,6 +28,8 @@ from gems_blanking_v2.io.store import GemsStore, safe_component
 
 from ui.adjudicate import judgements as jd
 from ui.adjudicate.queue import core_key
+
+_log = logging.getLogger(__name__)
 
 __all__ = ["FLUSH_BATCH", "UNDO_DEPTH", "AdjudicationSession", "AnimalProgress"]
 
@@ -61,8 +64,28 @@ def file_sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+def _widened_of(rec: dict[str, Any]) -> tuple[float, float] | None:
+    """A journal record's widened boundary, or ``None`` (absent keys).
+
+    A line carrying only one of the two keys is malformed: it raises (the caller drops the
+    line and logs it) rather than restoring a judgement with half a boundary.
+    """
+    a, b = rec.get("widened_start_s"), rec.get("widened_stop_s")
+    if a is None and b is None:
+        return None
+    if a is None or b is None:
+        msg = f"journal line {rec.get('judgement_id')} carries half a widened boundary"
+        raise ValueError(msg)
+    return float(a), float(b)
+
+
 class AdjudicationSession:
     """Walks a validated, ordered queue and records one judgement per core.
+
+    What survives a crash: every judgement (and its widened boundary) in the journal. A
+    widen that is only PENDING - drawn but not yet recorded with key 1 - lives in the
+    window and is lost with it. A journal line that cannot be restored (e.g. half a
+    widened boundary) is dropped, logged, and listed in :attr:`dropped`.
 
     Parameters
     ----------
@@ -105,6 +128,7 @@ class AdjudicationSession:
         self._keys = [r["core_key"] for r in self.rows]
         self._index = {k: i for i, k in enumerate(self._keys)}
         self.written: list[Path] = []
+        self.dropped: list[str] = []
 
         stored = jd.read_shards(store, self.user, {r["animal"] for r in self.rows})
         # The newest stored judgement of a core is the one in force.
@@ -142,9 +166,13 @@ class AdjudicationSession:
                 self.rows[self._index[key]], rec["judgement"], user=self.user,
                 app_sha=rec.get("app_commit"), queue_file=self.queue_file,
                 queue_sha256=self.queue_sha256, at=datetime.fromisoformat(rec["at"]),
-                judgement_id=rec["judgement_id"])
-        except (KeyError, TypeError, ValueError):
-            return None  # a malformed journal line is not a judgement
+                judgement_id=rec["judgement_id"], widened=_widened_of(rec))
+        except (KeyError, TypeError, ValueError) as exc:
+            # A malformed journal line is not a judgement; say so rather than drop it quietly.
+            _log.warning("journal line %s dropped on restore: %s",
+                         rec.get("judgement_id", "?"), exc)
+            self.dropped.append(str(rec.get("judgement_id", "?")))
+            return None
         out["core_key"] = key
         return out
 
@@ -183,21 +211,27 @@ class AdjudicationSession:
 
     # -- judging ------------------------------------------------------------
 
-    def judge_key(self, key: str) -> dict[str, Any] | None:
+    def judge_key(self, key: str, *, widened: tuple[float, float] | None = None
+                  ) -> dict[str, Any] | None:
         """Judge the current core by keystroke; a non-judging key does nothing."""
         judgement = jd.judgement_for_key(key)
         if judgement is None:
             return None
-        return self.judge(judgement)
+        return self.judge(judgement, widened=widened)
 
-    def judge(self, judgement: str) -> dict[str, Any] | None:
-        """Record ``judgement`` for the current core and advance. Returns the record."""
+    def judge(self, judgement: str, *, widened: tuple[float, float] | None = None
+              ) -> dict[str, Any] | None:
+        """Record ``judgement`` for the current core and advance. Returns the record.
+
+        ``widened`` (recording-timeline seconds, containing the core) goes only with
+        ``motion``; it is stored beside the core, never instead of it.
+        """
         row = self.current()
         if row is None:
             return None
         rec = jd.make_record(row, judgement, user=self.user, app_sha=self.app_sha,
                             queue_file=self.queue_file, queue_sha256=self.queue_sha256,
-                            at=self._clock() if self._clock else None)
+                            at=self._clock() if self._clock else None, widened=widened)
         jd.journal_append(self.journal_path, "judge", rec)
         self._pending.append(rec)
         self._judged[row["core_key"]] = judgement
