@@ -452,8 +452,11 @@ stopped. Old-cohort rows read `<rid>_notched.mat` under the Survivals folder
 
 **Vertical scale.** Each channel's height is set from the **±1 s around the yellow
 core**, not from everything on screen, so a big event elsewhere in the view does not
-squash the core flat. The rule: the median of that ±1 s, plus and minus the 99.5th
-percentile of the distance from it (|x − median|). It is fixed when a core comes up;
+squash the core flat. The rule: the median of that ±1 s, plus and minus **1.5 ×** the
+99.5th percentile of the distance from it (|x − median|). The 1.5 leaves room for the
+core itself: on real recordings the core's own peak is cut off on about 2 % of channels
+(it was 40 % without it), so clipping mostly marks something *else* in the view that is
+much larger than the core - which is what it is for. It is fixed when a core comes up;
 panning or zooming in time does not change it, and `Home` puts it back. Anything
 taller than the scale is **clipped at the plot edge and marked**: a thick **red line**
 runs along the top or bottom edge wherever the trace is cut off, and the channel's
@@ -472,17 +475,24 @@ stay as you set them until the window closes (they are not saved).
   µV²/Hz on a log scale against Hz) of the core's ±1 s in **yellow**, and in **grey** a
   reference stretch of the same length 5–10 s away from the core (5 s after it if that
   is clean, else 5 s before, then 5.5 s, 6 s, … up to 10 s), chosen inside the core's
-  region and away from the queue's other cores. If no such stretch exists the panel
-  says what it used instead (or that there is none). Dotted **blue** lines mark 60 Hz
-  and its multiples, dashed **green** lines multiples of the heart rate. The signal is
+  region and away from the queue's other cores. Only cores in *this queue* are avoided:
+  candidates that were never queued, and earlier labels, are not known to the screen.
+  If no such stretch exists the panel says what it used instead, or why there is none
+  (not enough recording on either side, or the stretch is masked). Dotted **blue**
+  lines mark 60 Hz and its multiples, dashed **green** lines the first 20 multiples of
+  the heart rate. The signal is
   the one the core peaked on (`L_T`, `ANT1`, ... - shown above the plot); for a core
   with no recorded peak signal, pick a channel in the *Signal* box. The view opens at
   0–3000 Hz; the mouse wheel zooms in frequency and the *0-3000 Hz* button resets it.
-  The heart rate is the mean rate of the recording's **stored** beats within the
-  core's ±1 s, never estimated from the signal: old-cohort recordings use the
-  `_HRBR.mat` next to the signal when it covers the whole recording; new-cohort
-  recordings have no stored beat train yet, so the panel says
-  "no beat train — k×HR not shown".
+  The heart rate comes from the recording's **stored** beats, never from the signal:
+  1 / the median beat-to-beat interval within ±10 s of the core, leaving out intervals
+  the beat file marks as gaps, intervals across a blanked stretch, and intervals
+  outside 80–500 ms (750–120 bpm). The panel says how many intervals it used and
+  refused; with fewer than 2 usable ones it shows no heart-rate lines and says why.
+  Old-cohort recordings use the `_HRBR.mat` next to the signal when it covers the
+  whole recording at the recording's sampling rate; new-cohort recordings use the
+  count-gated train in the store (`<recording>_beats.mat` beside its `meta.json`).
+  Without one the panel says "no beat train — k×HR not shown".
 * **100 ms zoom** — every channel over exactly 100 ms centred on the core (on its peak
   time when the queue provides one), at the same vertical scale and with the same red
   clipping marks as the main plot, the core shaded yellow. 60 Hz hum is six cycles

@@ -52,8 +52,8 @@ thread. Arriving at it is then instant. Rules:
   (``ThreadPoolExecutor`` threads are joined at exit), up to ~30 s.
 
 **Vertical scale** (always on): each channel's limits come from the ±1 s around the
-core - median ± the 99.5th percentile of ``|x - median|`` there (the exact estimator is
-in ``ui.adjudicate.hum``) - not from the whole view, so a large event elsewhere does
+core - median ± 1.5 × the 99.5th percentile of ``|x - median|`` there (the exact
+estimator is in ``ui.adjudicate.hum``) - not from the whole view, so a large event elsewhere does
 not flatten the highlight. Computed when the core changes and re-applied by ``Home``;
 panning and zooming in time never change it. Samples beyond the limits are drawn at
 the limit with a thick red mark, and the channel's corner label says ``CLIPPED (n)``
@@ -66,10 +66,13 @@ Toggles last for this window only.
 * *Spectrum*: Welch PSD of the core's peak signal (the row's ``peak_signal``, built as
   the detection chain builds it; or the channel picked in the selector when the row
   has none) over the core's ±1 s, against a reference window of the same length 5-10 s
-  away (``ui.adjudicate.hum.place_reference``), with 60·k Hz lines and k×HR lines from
-  the recording's STORED beat train (old cohort: the ``_HRBR.mat`` beside the signal;
-  new cohort: none yet - the panel says "no beat train - k×HR not shown"). Computed on
-  a worker thread; the beat train is read once per recording, also off the GUI thread.
+  away, avoiding the queue's other cores (``ui.adjudicate.hum.place_reference``), with
+  60·k Hz lines and k×HR lines (k <= 20) from the recording's STORED beat train - old
+  cohort: the whole-recording ``_HRBR.mat`` beside the signal; new cohort: the HRV-grade
+  ``<rid>_beats.mat`` in the store; HR = 1 / median of the valid RR intervals within
+  ±10 s of the core (``ui.adjudicate.hum.heart_rate``). Without one the panel says
+  "no beat train - k×HR not shown". Computed on a worker thread; the beat train is
+  read once per recording, also off the GUI thread.
 * *100 ms zoom*: every raw channel over exactly 100 ms around the core's peak time
   (``peak_s`` when the queue has it) or its centre, at the main plot's scale with the
   same clipping marks, core shaded. A few thousand samples: drawn on the GUI thread.
@@ -196,6 +199,8 @@ class _FnJob(QRunnable):
         else:
             self.signals.done.emit(self.token, out)
         finally:
+            # The closure holds the recording (~2 GB): a finished job must not keep it.
+            self.fn = None  # type: ignore[assignment]
             self.finished = True
 
 
@@ -294,7 +299,8 @@ class AdjudicationWindow(QMainWindow):
                                  "centre), at the main plot's scale.")
         for box in (self.spectrum_box, self.zoom_box):
             box.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            box.toggled.connect(self._slot(self._on_panels_toggled))
+        self.spectrum_box.toggled.connect(self._slot(self._on_spectrum_toggled))
+        self.zoom_box.toggled.connect(self._slot(self._on_zoom_toggled))
         left = QWidget()
         # Fixed-width side panel: the plot is what is being judged and gets the rest.
         left.setFixedWidth(360)
@@ -532,6 +538,12 @@ class AdjudicationWindow(QMainWindow):
         self._waiting_for = None
         self._pf_timer.stop()
         self._shown_key = None
+        # Nothing of the previous core stays in the panels: whatever path this takes
+        # (queue finished, waiting for a prefetch, a failure) they show no stale result,
+        # and a result still on its way for the previous core is dropped on arrival.
+        self._spectrum_token = self._spectrum_row = None
+        self.spectrum.show_pending("")
+        self.zoom_panel.clear()
         self._widen = None  # a widen belongs to the core it was drawn on
         self._draw_widen()
         self._set_judging_enabled(False)
@@ -594,6 +606,7 @@ class AdjudicationWindow(QMainWindow):
             self._discard_prefetch()
         # One recording on screen at a time (plus at most one prefetched).
         self.zoom_panel.release()
+        self._panel_jobs = [j for j in self._panel_jobs if not j.finished]
         self._scales = None
         if self.viewer is not None:
             old, self.viewer = self.viewer, None
@@ -714,21 +727,33 @@ class AdjudicationWindow(QMainWindow):
 
     # -- hum panels -----------------------------------------------------------
 
-    def _on_panels_toggled(self, *_a: object) -> None:
-        self._spectrum_dock.setVisible(self.spectrum_box.isChecked())
-        self._zoom_dock.setVisible(self.zoom_box.isChecked())
-        if not self.zoom_box.isChecked():
-            self.zoom_panel.release()  # holds nothing while off
-        if not self.spectrum_box.isChecked():
-            self._spectrum_token = None  # a result still on its way is dropped
+    def _shown_row(self) -> dict[str, Any] | None:
         row = self.session.current()
-        if row is not None and row["core_key"] == self._shown_key:
-            self._update_panels(row)
+        return row if row is not None and row["core_key"] == self._shown_key else None
+
+    def _on_spectrum_toggled(self, *_a: object) -> None:
+        """Only the spectrum: the zoom is neither recomputed nor touched."""
+        on = self.spectrum_box.isChecked()
+        self._spectrum_dock.setVisible(on)
+        row = self._shown_row()
+        if not on:
+            self._spectrum_token = None  # a result still on its way is dropped
+        elif row is not None:
+            self._start_spectrum(row)
+
+    def _on_zoom_toggled(self, *_a: object) -> None:
+        """Only the zoom: the spectrum is neither recomputed nor touched."""
+        on = self.zoom_box.isChecked()
+        self._zoom_dock.setVisible(on)
+        row = self._shown_row()
+        if not on:
+            self.zoom_panel.release()  # holds nothing while off
+        elif row is not None:
+            self._show_zoom(row)
 
     def _on_channel_picked(self, *_a: object) -> None:
-        row = self.session.current()
-        if (self.spectrum_box.isChecked() and row is not None
-                and row["core_key"] == self._shown_key):
+        row = self._shown_row()
+        if self.spectrum_box.isChecked() and row is not None:
             self._start_spectrum(row)
 
     def _update_panels(self, row: dict[str, Any]) -> None:
@@ -772,23 +797,26 @@ class AdjudicationWindow(QMainWindow):
         self._run_job(token, lambda: hum.compute_spectrum(rec, row, rows, selected),
                       self._on_spectrum_done)
 
-    def _heart_rate(self, rid: str, window_s: tuple[float, float],
-                    ) -> tuple[hum.HeartRate | None, str | None]:
+    def _heart_rate(self, row: dict[str, Any]) -> tuple[hum.HeartRate | None, str | None]:
+        """HR from ``row``'s recording's stored beats, ±``HR_WINDOW_S`` around the core."""
+        rid = str(row["recording"])
         src = self._beats.get(rid)
         if src is None:
             return None, ("reading the beat train ..." if rid in self._beats_running
                           else None)
         if src.beats_s is None:
             return None, src.reason
-        return hum.mean_hr_hz(src.beats_s, *window_s), f"from {src.source}"
+        hr = hum.heart_rate(src.beats_s, float(row["start_s"]) - hum.HR_WINDOW_S,
+                            float(row["stop_s"]) + hum.HR_WINDOW_S,
+                            gap_after=src.gap_after, blank_spans=src.blank_spans)
+        return hr, f"from {src.source}"
 
     def _on_spectrum_done(self, token: str, result: object) -> None:
         row = self._spectrum_row
         if token != self._spectrum_token or row is None or not self.spectrum_box.isChecked():
             return  # superseded: another core, another channel, or the panel was closed
         assert isinstance(result, hum.SpectrumResult)
-        hr, note = self._heart_rate(str(row["recording"]), result.window_s)
-        self.spectrum.show_result(result, hr, note)
+        self.spectrum.show_result(result, *self._heart_rate(row))
 
     def _on_beats_done(self, token: str, result: object) -> None:
         rid = token.split("|", 1)[1]
@@ -797,7 +825,7 @@ class AdjudicationWindow(QMainWindow):
         self._beats[rid] = result
         row, res = self._spectrum_row, self.spectrum.result
         if row is not None and res is not None and str(row["recording"]) == rid:
-            self.spectrum.set_hr(*self._heart_rate(rid, res.window_s))
+            self.spectrum.set_hr(*self._heart_rate(row))
 
     def _on_panel_failed(self, token: str, why: str) -> None:
         self.last_error = why
@@ -807,7 +835,7 @@ class AdjudicationWindow(QMainWindow):
             self._beats[rid] = loaders.BeatSource(None, None, f"could not read it: {why}")
             row, res = self._spectrum_row, self.spectrum.result
             if row is not None and res is not None and str(row["recording"]) == rid:
-                self.spectrum.set_hr(*self._heart_rate(rid, res.window_s))
+                self.spectrum.set_hr(*self._heart_rate(row))
             return
         if token == self._spectrum_token:
             self.spectrum.show_pending(f"Spectrum unavailable: {why}")
@@ -925,7 +953,8 @@ def open_queue(queue_path: Path, store: GemsStore, *, user: str | None = None,
 
     def beats_fn(row: dict[str, Any], recording: Any) -> loaders.BeatSource:
         if row["cohort"] == "new":
-            return loaders.BeatSource(None, None, loaders.NEW_COHORT_NO_BEATS)
+            return loaders.new_beats(store, str(row["animal"]), str(row["recording"]),
+                                     fs=float(recording.fs))
         if root is None:
             return loaders.BeatSource(None, None, "no Survivals root")
         return loaders.old_beats(root, str(row["folder"]), str(row["recording"]),

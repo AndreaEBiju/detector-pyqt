@@ -3,8 +3,8 @@
 :class:`SpectrumPanel` draws a :class:`ui.adjudicate.hum.SpectrumResult`: the Welch PSD
 of the core's ±1 s window (yellow) and of its reference window (grey), µV²/Hz on a log
 axis against Hz, 0-3000 Hz by default (mouse wheel zooms in frequency; the button puts
-0-3000 Hz back). Mains lines at 60·k Hz are dotted blue; k×HR lines dashed green, only
-when a stored beat train gives a heart rate. Everything the panel cannot show it SAYS,
+0-3000 Hz back). Mains lines at 60·k Hz are dotted blue; k×HR lines (k <= 20) dashed
+green, only when a stored beat train gives a heart rate. Everything the panel cannot show it SAYS,
 in the text above the plot (no beat train, a reference window that overlaps another
 core or leaves the region, a signal that could not be built).
 
@@ -35,6 +35,8 @@ from PySide6.QtWidgets import (
 
 from ui.adjudicate.hum import (
     F_MAX_HZ,
+    HR_K_MAX,
+    HR_WINDOW_S,
     PEAK_SIGNAL,
     ChannelScale,
     HeartRate,
@@ -169,9 +171,11 @@ class SpectrumPanel(QWidget):
             return
         if hr is not None and hr.hz is not None:
             self.hr_x = hr_lines(hr.hz)
-            hr_text = (f"HR {hr.hz:.2f} Hz ({60 * hr.hz:.0f} bpm, mean of {hr.n_beats} "
-                       f"stored beats in the window{'; ' + beats_note if beats_note else ''})"
-                       f": k×HR lines dashed green")
+            refused = f", {hr.n_refused} refused" if hr.n_refused else ""
+            hr_text = (f"HR {hr.hz:.2f} Hz ({60 * hr.hz:.0f} bpm): 1/median of {hr.n_rr} "
+                       f"valid RR intervals within ±{HR_WINDOW_S:.0f} s{refused}"
+                       f"{'; ' + beats_note if beats_note else ''}. k×HR lines (k ≤ "
+                       f"{HR_K_MAX}) dashed green")
         else:
             self.hr_x = np.zeros(0)
             why = (hr.reason if hr is not None else None) or beats_note
@@ -216,6 +220,17 @@ class ZoomPanel(QWidget):
                                            channel_colors=tuple(colours))
         self._lay.addWidget(self.viewer, 1)
 
+    def clear(self) -> None:
+        """Show nothing (a new core is coming, or none); keep the viewer for reuse."""
+        if self.viewer is not None:
+            self.viewer.hide()
+        self.info.setText("")
+
+    @property
+    def showing(self) -> bool:
+        """Whether a core is on show (not cleared, not released)."""
+        return self.viewer is not None and not self.viewer.isHidden()
+
     def release(self) -> None:
         """Drop the viewer and the recording it holds."""
         if self.viewer is not None:
@@ -243,6 +258,7 @@ class ZoomPanel(QWidget):
         self._core_items = []
         self.viewer.set_scales(scales)
         self.viewer.set_viewport(lo, hi)
+        self.viewer.show()
         for plot, _curve in self.viewer.plots:
             item = pg.LinearRegionItem(values=core, orientation="vertical", movable=False,
                                        brush=pg.mkBrush(255, 230, 0, 70),

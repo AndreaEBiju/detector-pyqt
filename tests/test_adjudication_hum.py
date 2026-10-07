@@ -11,7 +11,11 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import gc
 import math
+import threading
+import time
+import weakref
 from pathlib import Path
 from typing import Any
 
@@ -45,8 +49,9 @@ def test_the_estimator_is_the_documented_one(make_recording) -> None:
     s = np.percentile(np.abs(x - med), 99.5)
     sc = hum.channel_scales(rec.data, FS, 30.0, 30.05)[3]
     assert sc is not None and not sc.flat
-    assert sc.centre_uv == pytest.approx(med) and sc.half_range_uv == pytest.approx(s)
-    assert (sc.lo, sc.hi) == pytest.approx((med - s, med + s))
+    assert hum.SCALE_HEADROOM == 1.5  # Andrea, 2026-10-08
+    assert sc.centre_uv == pytest.approx(med) and sc.half_range_uv == pytest.approx(1.5 * s)
+    assert (sc.lo, sc.hi) == pytest.approx((med - 1.5 * s, med + 1.5 * s))
 
 
 def test_the_scale_ignores_a_huge_event_1_5_s_away(make_recording, add_burst) -> None:
@@ -211,12 +216,8 @@ def test_mains_and_heart_rate_lines_sit_at_60k_and_k_hr(make_hum_window, make_re
     w.spectrum_box.setChecked(True)
     sp = w.spectrum
     assert sp.mains_x == pytest.approx(60.0 * np.arange(1, 51))
-    i0, i1 = hum.core_window(30.0, 30.05, 8000.0, rec.n_samples)
-    inside = beats[(beats >= i0 / 8000.0) & (beats < i1 / 8000.0)]
-    expect = (inside.size - 1) / (inside[-1] - inside[0])
-    assert expect == pytest.approx(hr)
-    assert sp.hr_x.size == 500  # 6, 12, ..., 3000 Hz
-    assert sp.hr_x == pytest.approx(expect * np.arange(1, 501))
+    assert sp.hr_x.size == hum.HR_K_MAX == 20  # 6, 12, ..., 120 Hz: capped at k = 20
+    assert sp.hr_x == pytest.approx(hr * np.arange(1, 21))
     x, _y = sp.hr_item.getData()
     assert np.array_equal(np.unique(x), np.unique(sp.hr_x))
     assert "r1_HRBR.mat" in sp.message and NO_BEATS not in sp.message
@@ -236,13 +237,45 @@ def test_without_a_beat_train_the_panel_says_so(make_hum_window, make_recording,
     assert w.spectrum.mains_x.size == 50
 
 
-def test_mean_heart_rate_needs_two_stored_beats() -> None:
-    beats = np.array([1.0, 1.17, 1.34, 1.51, 5.0])
-    hr = hum.mean_hr_hz(beats, 1.0, 1.6)
-    assert hr.hz == pytest.approx(1 / 0.17) and hr.n_beats == 4
-    one = hum.mean_hr_hz(beats, 4.0, 6.0)
-    assert one.hz is None and "k×HR not shown" in (one.reason or "")
+def test_heart_rate_is_the_median_of_valid_rr_not_a_mean_across_a_blanked_gap() -> None:
+    """The review's example: beats dropped in a blanked stretch around a core at 30 s."""
+    beats = np.array([29.0, 29.15, 30.9, 31.0])
+    old_mean = (beats.size - 1) / (beats[-1] - beats[0])
+    assert old_mean == pytest.approx(1.5)            # what the first version reported
+    hr = hum.heart_rate(beats, 30.0 - hum.HR_WINDOW_S, 30.05 + hum.HR_WINDOW_S)
+    assert hr.hz == pytest.approx(1 / 0.125)          # median of 0.15 and 0.10
+    assert (hr.n_rr, hr.n_refused) == (2, 1)          # 1.75 s is outside 80-500 ms
+    tagged = hum.heart_rate(beats, 20.0, 40.0, gap_after=[True, False, False, False])
+    assert tagged.hz is None and tagged.n_rr == 1
+    assert "1 valid RR" in (tagged.reason or "") and "k×HR not shown" in (tagged.reason or "")
+
+
+def test_heart_rate_refuses_gaps_blank_spans_and_implausible_rr() -> None:
+    reg = np.round(np.arange(20.0, 40.0, 0.15), 6)
+    assert hum.heart_rate(reg, 20.0, 40.0).hz == pytest.approx(1 / 0.15)
+    # a blank span refuses every interval it overlaps, even a plausible one
+    span = [[30.0, 30.2]]
+    across = int(np.sum((reg[:-1] < 30.2) & (reg[1:] > 30.0)))
+    b = hum.heart_rate(reg, 20.0, 40.0, blank_spans=span)
+    assert b.n_refused == across >= 2 and b.hz == pytest.approx(1 / 0.15)
+    # gap tags follow the beats as given, even unsorted
+    shuffled = reg[::-1].copy()
+    tags = np.zeros(reg.size, dtype=bool)
+    tags[-1] = True                                   # shuffled[-1] is reg[0]
+    g = hum.heart_rate(shuffled, 20.0, 40.0, gap_after=tags)
+    assert g.n_refused == 1
+    # an implausible interval (600 ms) and beats outside the window are ignored
+    odd = np.concatenate([reg[reg < 25.0], reg[reg >= 25.6]])
+    o = hum.heart_rate(odd, 20.0, 40.0)
+    assert o.n_refused == 1 and o.hz == pytest.approx(1 / 0.15)
+    # an untagged missed beat (one 300 ms interval) cannot pull the median down
+    missed = np.delete(reg, 40)
+    m = hum.heart_rate(missed, 20.0, 40.0)
+    assert m.n_refused == 0 and m.hz == pytest.approx(1 / 0.15)
+    far = np.concatenate([reg, np.arange(50.0, 60.0, 0.4)])
+    assert hum.heart_rate(far, 20.0, 40.0).hz == pytest.approx(1 / 0.15)
     assert hum.hr_lines(float("nan")).size == 0
+    assert hum.hr_lines(6.0, k_max=100).size == 100 and hum.hr_lines(6.0).size == 20
 
 
 # -- the reference window -----------------------------------------------------
@@ -297,8 +330,19 @@ def test_the_panel_names_a_missing_reference(make_hum_window, make_recording,
     rec = make_recording(seed=10, session="r1", dur_s=8.0)
     w = make_hum_window([queue_row("r1", 3.0, 3.05, region=(0.0, 8.0))], {"r1": rec})
     w.spectrum_box.setChecked(True)
-    assert "no reference window" in w.spectrum.message
+    assert "no reference window: it needs 7.0 s clear on one side" in w.spectrum.message
+    assert "5.0 s after it and 3.0 s before it" in w.spectrum.message
     assert w.spectrum.result.ref is None and w.spectrum.result.core is not None
+
+
+def test_a_masked_reference_window_is_named_as_such(make_hum_window, make_recording,
+                                                    queue_row) -> None:
+    rec = make_recording(seed=17, session="r1")
+    rec.data[round(25.0 * FS):round(27.2 * FS), :] = np.nan   # where the reference goes
+    w = make_hum_window([queue_row("r1", 20.0, 20.05)], {"r1": rec})
+    w.spectrum_box.setChecked(True)
+    assert "reference window found, but it has no NaN-free Welch segment" in w.spectrum.message
+    assert "no reference window:" not in w.spectrum.message
 
 
 # -- the spectrum's signal and Welch ------------------------------------------
@@ -392,15 +436,21 @@ def test_the_zoom_panel_shows_100_ms_at_the_main_scale(make_hum_window, make_rec
 # ---------------------------------------------------------------------------
 
 
-def _write_hrbr_v5(path: Path, heartlocs: np.ndarray, n: int) -> None:
+def _write_hrbr_v5(path: Path, heartlocs: np.ndarray, n: int, *, t_fs: float = FS,
+                   t0: float = 0.0) -> None:
     savemat(path, {"heartlocs": heartlocs.reshape(-1, 1).astype(float),
-                   "t": (np.arange(n) / FS).reshape(-1, 1)})
+                   "t": (t0 + np.arange(n) / t_fs).reshape(-1, 1)})
 
 
-def _write_hrbr_v73(path: Path, heartlocs: np.ndarray, n: int) -> None:
+def _write_hrbr_v73(path: Path, heartlocs: np.ndarray, n: int, *, t_fs: float = FS,
+                    t0: float = 0.0, empty: bool = False) -> None:
     with h5py.File(path, "w", userblock_size=512) as f:
-        f["heartlocs"] = heartlocs.reshape(1, -1).astype(float)
-        f["t"] = (np.arange(n) / FS).reshape(1, -1)
+        if empty:  # MATLAB writes [] as its shape, flagged MATLAB_empty
+            ds = f.create_dataset("heartlocs", data=np.array([0, 1], dtype=np.uint64))
+            ds.attrs["MATLAB_empty"] = np.uint8(1)
+        else:
+            f["heartlocs"] = heartlocs.reshape(1, -1).astype(float)
+        f["t"] = (t0 + np.arange(n) / t_fs).reshape(1, -1)
     header = b"MATLAB 7.3 MAT-file, Platform: x".ljust(116, b" ") + b"\0" * 8 + b"\x00\x02IM"
     with path.open("r+b") as fh:
         fh.write(header)
@@ -420,7 +470,69 @@ def test_old_beats_read_the_whole_recording_hrbr_and_refuse_an_epoch_file(tmp_pa
     assert got.source == "REC1_HRBR.mat"
     assert got.beats_s == pytest.approx(np.array([0.0, 340.0, 680.0]) / FS)  # 1-based
     none = loaders.old_beats(tmp_path / "root", "f/rec1", "other", n_samples=n, fs=FS)
-    assert none.beats_s is None and "no other*_HRBR.mat" in (none.reason or "")
+    assert none.beats_s is None and "no other_HRBR.mat" in (none.reason or "")
+
+
+@pytest.mark.parametrize("writer", [_write_hrbr_v5, _write_hrbr_v73])
+def test_old_beats_check_the_file_rate_and_start_and_the_name_prefix(tmp_path,
+                                                                    writer) -> None:
+    folder = tmp_path / "root" / "f" / "rec1"
+    folder.mkdir(parents=True)
+    n = 20_000
+    hl = np.array([1.0, 341.0, 681.0])
+    writer(folder / "rec10_HRBR.mat", hl, n)       # another recording: rec1 + "0"
+    got = loaders.old_beats(tmp_path / "root", "f/rec1", "rec1", n_samples=n, fs=FS)
+    assert got.beats_s is None and "no rec1_HRBR.mat" in (got.reason or "")
+    writer(folder / "rec1_HRBR.mat", hl, n, t_fs=2 * FS)   # same length, another rate
+    got = loaders.old_beats(tmp_path / "root", "f/rec1", "rec1", n_samples=n, fs=FS)
+    assert got.beats_s is None and "steps 0.00025" in (got.reason or "")
+    writer(folder / "rec1_HRBR.mat", hl, n, t0=120.0)      # an epoch that starts later
+    got = loaders.old_beats(tmp_path / "root", "f/rec1", "rec1", n_samples=n, fs=FS)
+    assert got.beats_s is None and "starts at 120" in (got.reason or "")
+    writer(folder / "rec1_HRBR.mat", hl, n)
+    got = loaders.old_beats(tmp_path / "root", "f/rec1", "rec1", n_samples=n, fs=FS)
+    assert got.source == "rec1_HRBR.mat" and got.beats_s.size == 3
+
+
+def test_v73_matlab_empty_heartlocs_are_no_beats_not_two(tmp_path) -> None:
+    folder = tmp_path / "root" / "f" / "rec1"
+    folder.mkdir(parents=True)
+    _write_hrbr_v73(folder / "rec1_HRBR.mat", np.zeros(0), 20_000, empty=True)
+    got = loaders.old_beats(tmp_path / "root", "f/rec1", "rec1", n_samples=20_000, fs=FS)
+    assert got.beats_s is None and "holds no beats" in (got.reason or "")
+
+
+def test_new_beats_read_the_hrv_grade_train_from_the_store_never_the_mask_grade(
+        tmp_path) -> None:
+    from gems_blanking_v2.emit.hr_beats import write_hr_beats, write_mask_beats
+    from gems_blanking_v2.io.channel_map import meta_path
+    from gems_blanking_v2.io.store import GemsStore
+
+    store = GemsStore.initialise(tmp_path / "gems")
+    rid, n = "synth_a_rec1", 120_000
+    folder = meta_path(store, "A", rid).parent
+    folder.mkdir(parents=True)
+    beats = np.round(np.arange(1.0, 50.0, 0.15) * FS) / FS
+    beats = beats[(beats < 20.0) | (beats >= 21.0)]
+    assert loaders.new_beats(store, "A", rid, fs=FS).reason == loaders.NEW_COHORT_NO_BEATS
+    write_mask_beats(folder / f"{rid}_peri_r_beats.mat", beats, fs=FS, epoch_start_s=0.0,
+                     n_samples=n, channel="L_T", source="test")
+    assert loaders.new_beats(store, "A", rid, fs=FS).beats_s is None  # mask grade: never
+    gaps = np.zeros(beats.size, dtype=bool)
+    gaps[5] = True
+    write_hr_beats(folder / f"{rid}_beats.mat", beats, fs=FS, epoch_start_s=0.0, n_samples=n,
+                   channel="LVN2-RVN2", source="test", gap_after=gaps,
+                   blank_spans_s=[[20.0, 21.0]])
+    got = loaders.new_beats(store, "A", rid, fs=FS)
+    assert got.source == f"{rid}_beats.mat"
+    assert got.beats_s == pytest.approx(beats)
+    assert np.array_equal(got.gap_after, gaps)
+    assert got.blank_spans == pytest.approx(np.array([[20.0, 21.0]]), abs=1 / FS)
+    hr = hum.heart_rate(got.beats_s, 10.0, 30.0, gap_after=got.gap_after,
+                        blank_spans=got.blank_spans)
+    assert hr.hz == pytest.approx(1 / 0.15, rel=1e-3) and hr.n_refused == 1  # across 20-21
+    wrong = loaders.new_beats(store, "A", rid, fs=2 * FS)
+    assert wrong.beats_s is None and "Hz" in (wrong.reason or "")
 
 
 def test_open_queue_wires_the_beat_source_per_cohort(tmp_path, monkeypatch) -> None:
@@ -449,8 +561,13 @@ def test_open_queue_wires_the_beat_source_per_cohort(tmp_path, monkeypatch) -> N
         data = np.zeros((10, 5))
         fs = FS
 
-    new = beats_fn({"cohort": "new", "recording": "x"}, Rec())
+    new = beats_fn({"cohort": "new", "animal": "A", "recording": "x"}, Rec())
     assert new.beats_s is None and new.reason == loaders.NEW_COHORT_NO_BEATS
+    seen_new: list[tuple[str, str]] = []
+    monkeypatch.setattr(loaders, "new_beats", lambda _s, a, r, fs: seen_new.append((a, r))
+                        or BeatSource(None, None, "x"))
+    beats_fn({"cohort": "new", "animal": "B", "recording": "y"}, Rec())
+    assert seen_new == [("B", "y")]
     folder = tmp_path / "synth_folder" / "synth_old_1"
     folder.mkdir(parents=True)
     _write_hrbr_v5(folder / "synth_old_1_HRBR.mat", np.array([3.0]), 10)
@@ -472,3 +589,140 @@ def test_window_builds_do_not_repeat_the_derivation_warnings(make_recording, cap
         assert not [r for r in caplog.records if r.name == name]
         build_derivations(rec)
         assert any("stomach_ref" in r.getMessage() for r in caplog.records if r.name == name)
+
+
+
+# ---------------------------------------------------------------------------
+# review fixes: stale results, held recordings, independent toggles
+# ---------------------------------------------------------------------------
+
+
+def _until(cond, timeout: float = 20.0) -> None:
+    from PySide6.QtWidgets import QApplication
+
+    t0 = time.monotonic()
+    while not cond():
+        QApplication.processEvents()
+        time.sleep(0.005)
+        assert time.monotonic() - t0 < timeout, "timed out"
+    for _ in range(3):
+        QApplication.processEvents()
+
+
+def test_a_spectrum_still_running_never_lands_on_another_core(make_hum_window, make_recording,
+                                                             queue_row, monkeypatch) -> None:
+    gates: dict[float, threading.Event] = {s: threading.Event() for s in (10.0, 20.0, 30.0)}
+    real = hum.compute_spectrum
+
+    def held(rec, row, rows, selected):
+        gates[float(row["start_s"])].wait(30)
+        return real(rec, row, rows, selected)
+
+    monkeypatch.setattr(hum, "compute_spectrum", held)
+    rec = make_recording(seed=18, session="r1")
+    w = make_hum_window([queue_row("r1", t, t + 0.05) for t in (10.0, 20.0, 30.0)],
+                        {"r1": rec}, async_panels=True)
+    try:
+        w.spectrum_box.setChecked(True)            # core 10: held
+        w.press("1")                               # core 20: held too
+        gates[10.0].set()
+        _until(lambda: any(j.finished and "|10000000|" in j.token for j in w._panel_jobs))
+        assert w.spectrum.result is None           # core 10's result was dropped
+        gates[20.0].set()
+        _until(lambda: w.spectrum.result is not None)
+        assert w.spectrum.result.core_key == w.session.current()["core_key"]
+        w.press("1")                               # core 30: held
+        w.press("1")                               # queue finished while it runs
+        assert w.session.current() is None
+        gates[30.0].set()
+        _until(lambda: all(j.finished for j in w._panel_jobs))
+        assert w.spectrum.result is None and w.spectrum.message == "Queue finished."
+    finally:
+        for g in gates.values():
+            g.set()
+
+
+
+def test_failures_and_the_end_of_the_queue_leave_no_stale_panel(make_hum_window,
+                                                                make_recording,
+                                                                queue_row) -> None:
+    recs = {"r1": make_recording(seed=19, session="r1")}
+    w = make_hum_window([queue_row("r1", 10.0, 10.05), queue_row("r2", 10.0, 10.05)], recs)
+    w.spectrum_box.setChecked(True)
+    w.zoom_box.setChecked(True)
+    assert w.spectrum.result is not None and w.zoom_panel.showing
+    w.press("1")                                   # r2 is not in recs: the load fails
+    assert w.last_error and w.spectrum.result is None and not w.zoom_panel.showing
+    assert w.spectrum.hr_x.size == 0 and w.spectrum.mains_x.size == 0
+    w2 = make_hum_window([queue_row("r1", 10.0, 10.05)],
+                         {"r1": make_recording(seed=23, session="r1")})
+    w2.spectrum_box.setChecked(True)
+    w2.zoom_box.setChecked(True)
+    assert w2.spectrum.result is not None and w2.zoom_panel.showing
+    w2.press("1")
+    assert w2.session.current() is None
+    assert w2.spectrum.result is None and not w2.zoom_panel.showing
+    assert w2.spectrum.message == "Queue finished."
+
+
+def test_a_finished_panel_job_does_not_keep_the_recording_alive(make_hum_window,
+                                                               make_recording,
+                                                               queue_row) -> None:
+    recs = {"r1": make_recording(seed=20, session="r1"),
+            "r2": make_recording(seed=21, session="r2")}
+    w = make_hum_window([queue_row("r1", 10.0, 10.05), queue_row("r2", 10.0, 10.05)], recs,
+                        async_panels=True)
+    w.spectrum_box.setChecked(True)
+    w.zoom_box.setChecked(True)
+    _until(lambda: w.spectrum.result is not None and all(j.finished for j in w._panel_jobs))
+    first_jobs = list(w._panel_jobs)
+    assert first_jobs and all(j.fn is None for j in first_jobs)   # the closure is gone
+    data_ref = weakref.ref(recs["r1"].data)  # the ~2 GB; Recording itself has slots
+    del recs["r1"]
+    w.spectrum_box.setChecked(False)               # so no new job prunes them instead
+    w.press("1")                                   # on to r2
+    assert w._panel_jobs == []                     # pruned on the recording change
+    del first_jobs
+    gc.collect()
+    assert data_ref() is None
+
+
+def test_toggling_one_panel_does_not_recompute_the_other(make_hum_window, make_recording,
+                                                         queue_row, monkeypatch) -> None:
+    calls: list[str] = []
+    real_spec, real_zoom = hum.compute_spectrum, hum.zoom_window
+    monkeypatch.setattr(hum, "compute_spectrum", lambda *a: calls.append("spectrum")
+                        or real_spec(*a))
+    monkeypatch.setattr(hum, "zoom_window", lambda *a: calls.append("zoom") or real_zoom(*a))
+    w = make_hum_window([queue_row("r1", 10.0, 10.05)],
+                        {"r1": make_recording(seed=22, session="r1")})
+    w.spectrum_box.setChecked(True)
+    assert calls == ["spectrum"]
+    w.zoom_box.setChecked(True)
+    assert calls == ["spectrum", "zoom"]
+    w.spectrum_box.setChecked(False)
+    w.spectrum_box.setChecked(True)
+    assert calls == ["spectrum", "zoom", "spectrum"]
+    w.zoom_box.setChecked(False)
+    assert calls == ["spectrum", "zoom", "spectrum"]
+
+
+
+def test_the_panel_takes_the_rate_from_10_s_either_side(make_hum_window, make_recording,
+                                                        queue_row) -> None:
+    """No beat within the core's ±1 s (a blanked stretch); the ±10 s still give the rate."""
+    rec = make_recording(seed=24, session="r1")
+    beats = np.round(np.arange(20.5, 28.9, 0.15), 6)
+
+    tags = np.zeros(beats.size, dtype=bool)
+    tags[3] = True                                  # the file's own gap tag
+    span = np.array([[25.0, 25.2]])                 # and a blank span
+    across = int(np.sum((beats[:-1] < 25.2) & (beats[1:] > 25.0)))
+    w = make_hum_window([queue_row("r1", 30.0, 30.05)], {"r1": rec},
+                        beats_fn=lambda _r, _x: BeatSource(beats, "r1_beats.mat", None,
+                                                           gap_after=tags, blank_spans=span))
+    w.spectrum_box.setChecked(True)
+    assert w.spectrum.hr_x[0] == pytest.approx(1 / 0.15)
+    n_ok = beats.size - 1 - 1 - across
+    assert (f"{n_ok} valid RR intervals within ±10 s, {1 + across} refused"
+            in w.spectrum.message)

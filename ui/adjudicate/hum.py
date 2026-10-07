@@ -11,7 +11,7 @@ filled)::
 
     centre = median(x)
     S      = percentile(|x - centre|, 99.5)          (numpy's default, linear)
-    limits = centre +/- SCALE_HEADROOM * S            (SCALE_HEADROOM = 1.0)
+    limits = centre +/- SCALE_HEADROOM * S            (SCALE_HEADROOM = 1.5)
 
 A channel whose ``S`` is 0 (flat over the range) gets ``centre +/- FLAT_HALF_RANGE_UV``
 (1 µV) and is reported flat; a channel with no finite sample in the range has no scale
@@ -21,9 +21,9 @@ limits are drawn AT the limit (:func:`clip_to_scale`; NaN stays NaN) and marked.
 
 **Spectrum.** Welch PSD (:func:`welch_psd`) of one signal over the core's ±1 s window,
 against a reference window of the same length placed by :func:`place_reference`. Lines
-at ``60·k`` Hz (:func:`mains_lines`) and ``k × HR`` (:func:`hr_lines`), HR being the mean
-rate of a stored beat train over the core window (:func:`mean_hr_hz`) - never estimated
-from the signal.
+at ``60·k`` Hz (:func:`mains_lines`) and ``k × HR`` for ``k <= 20`` (:func:`hr_lines`), HR
+being ``1 / median(RR)`` of a STORED beat train over ``±10 s`` around the core, valid
+intervals only (:func:`heart_rate`) - never estimated from the signal.
 
 **Zoom.** :func:`zoom_window`: exactly ``ZOOM_S`` (100 ms) around the core's peak time
 when the queue row carries one (``peak_s``), else around the core centre.
@@ -42,6 +42,7 @@ from typing import Any, Final
 import numpy as np
 import numpy.typing as npt
 from gems_blanking_v2.derive.derivations import build_derivations
+from gems_blanking_v2.physio.rpeaks import RR_PLAUSIBLE_RANGE_S
 from gems_blanking_v2.types import Recording
 from scipy.signal import spectrogram
 
@@ -49,7 +50,10 @@ __all__ = [
     "CORE_MARGIN_S",
     "FLAT_HALF_RANGE_UV",
     "F_MAX_HZ",
+    "HR_K_MAX",
+    "HR_WINDOW_S",
     "MAINS_HZ",
+    "MIN_VALID_RR",
     "PEAK_SIGNAL",
     "PSD_RESOLUTION_HZ",
     "REF_OFFSETS_S",
@@ -66,9 +70,10 @@ __all__ = [
     "clipped_segments",
     "compute_spectrum",
     "core_window",
+    "heart_rate",
     "hr_lines",
     "mains_lines",
-    "mean_hr_hz",
+    "no_reference_reason",
     "others_in_recording",
     "place_reference",
     "scale_of",
@@ -84,8 +89,12 @@ CORE_MARGIN_S: Final = 1.0
 """Seconds either side of the core that set the vertical scale and the spectrum window."""
 SCALE_PERCENTILE: Final = 99.5
 """Percentile of ``|x - median|`` over the core window that sets the scale."""
-SCALE_HEADROOM: Final = 1.0
-"""Multiplier on that percentile: the limits are ``median +/- SCALE_HEADROOM * S``."""
+SCALE_HEADROOM: Final = 1.5
+"""Multiplier on that percentile: the limits are ``median +/- SCALE_HEADROOM * S``.
+
+Andrea, 2026-10-08: 1.5. Measured on 200 (core, channel) pairs of three real
+recordings, the core's own peak clipped in 39.5% of pairs at 1.0, 2.0% at 1.5, 0 at 2.0.
+"""
 FLAT_HALF_RANGE_UV: Final = 1.0
 """Half-range given to a channel that is flat (S = 0) over the core window, µV."""
 
@@ -94,6 +103,13 @@ PSD_RESOLUTION_HZ: Final = 3.0
 MAINS_HZ: Final = 60.0
 F_MAX_HZ: Final = 3000.0
 """Highest frequency shown by default and marked with 60·k / k×HR lines."""
+HR_WINDOW_S: Final = 10.0
+"""Seconds either side of the core whose stored beats give the heart rate."""
+HR_K_MAX: Final = 20
+"""k×HR lines are drawn for ``k = 1 .. 20`` only (about 120-160 Hz at rat heart rates):
+higher harmonics crowd the axis and a 1% rate error moves the 500th by 30 Hz."""
+MIN_VALID_RR: Final = 2
+"""Fewest valid RR intervals the heart rate is taken from."""
 REF_OFFSETS_S: Final[tuple[float, ...]] = tuple(5.0 + 0.5 * k for k in range(11))
 """Gaps tried between the core and the reference window: 5.0, 5.5, ..., 10.0 s."""
 
@@ -331,8 +347,10 @@ def place_reference(start_s: float, stop_s: float, length_s: float,
     2. inside the region, overlapping other cores (the panel says so);
     3. outside the region, overlapping no other core (the panel says so).
 
-    ``None`` when no candidate fits the recording at all (the panel says so).
-    ``others`` are the OTHER cores of the recording, ``[start, stop)`` seconds.
+    ``None`` when no candidate fits the recording at all (the panel says why:
+    :func:`no_reference_reason`). ``others`` are the OTHER QUEUE cores of the recording,
+    ``[start, stop)`` seconds: only cores in this queue are avoided - candidates that were
+    not queued, and earlier labels, are not known to the screen.
     """
     r0, r1 = float(region[0]), float(region[1])
     cores = [(float(a), float(b)) for a, b in others]
@@ -354,40 +372,78 @@ def place_reference(start_s: float, stop_s: float, length_s: float,
     return None
 
 
+def no_reference_reason(start_s: float, stop_s: float, length_s: float,
+                        duration_s: float) -> str:
+    """Why :func:`place_reference` found nothing: how much room each side of the core has."""
+    need = REF_OFFSETS_S[0] + length_s
+    after, before = duration_s - stop_s, start_s
+    return (f"no reference window: it needs {need:.1f} s clear on one side of the core "
+            f"(5 s gap + {length_s:.1f} s), and the recording has {after:.1f} s after it and "
+            f"{before:.1f} s before it")
+
+
 def mains_lines(f_max: float = F_MAX_HZ) -> F64:
     """``60·k`` Hz for ``k = 1 .. floor(f_max / 60)`` (50 lines up to 3000 Hz)."""
     return MAINS_HZ * np.arange(1, math.floor(f_max / MAINS_HZ + 1e-9) + 1, dtype=np.float64)
 
 
-def hr_lines(hr_hz: float, f_max: float = F_MAX_HZ) -> F64:
-    """``k × HR`` Hz for ``k = 1 .. floor(f_max / HR)``."""
+def hr_lines(hr_hz: float, f_max: float = F_MAX_HZ, k_max: int = HR_K_MAX) -> F64:
+    """``k × HR`` Hz for ``k = 1 .. min(k_max, floor(f_max / HR))``."""
     if not (math.isfinite(hr_hz) and hr_hz > 0):
         return np.zeros(0)
-    return hr_hz * np.arange(1, math.floor(f_max / hr_hz + 1e-9) + 1, dtype=np.float64)
+    k = min(int(k_max), math.floor(f_max / hr_hz + 1e-9))
+    return hr_hz * np.arange(1, k + 1, dtype=np.float64)
 
 
 @dataclass(frozen=True)
 class HeartRate:
-    """The mean heart rate over a window, or why there is none."""
+    """The heart rate around a core, or why there is none."""
 
     hz: float | None
-    n_beats: int
+    n_rr: int
+    """How many valid RR intervals it came from."""
+    n_refused: int
+    """RR intervals in the window refused (gap-tagged, across a blank span, implausible)."""
     reason: str | None
 
 
-def mean_hr_hz(beats_s: npt.ArrayLike, t0: float, t1: float) -> HeartRate:
-    """Mean rate of the stored beats in ``[t0, t1)``: ``(n - 1) / (last - first)``.
+def heart_rate(beats_s: npt.ArrayLike, t0: float, t1: float, *,
+               gap_after: npt.ArrayLike | None = None,
+               blank_spans: npt.ArrayLike | None = None) -> HeartRate:
+    """``1 / median(RR)`` over the valid consecutive-beat intervals inside ``[t0, t1)``.
 
-    That is ``1 / mean(RR)`` over the consecutive beats inside the window. Needs at
-    least two beats; nothing is estimated from the signal.
+    The window is the core ±:data:`HR_WINDOW_S` (the caller passes it). An interval
+    between consecutive stored beats ``b[i], b[i+1]`` (both inside the window) is
+    REFUSED when the beat file tags it as a gap (``gap_after[i]``, in sorted beat
+    order), when a blank span ``[a, b)`` overlaps it (a rejected stretch whose beats
+    were removed), or when it lies outside ``gems_blanking_v2.physio.rpeaks.
+    RR_PLAUSIBLE_RANGE_S`` (80-500 ms: 750 down to 120 bpm, the range task 05's global
+    RR is taken over). The median, not the mean, so a missed beat that is not tagged
+    cannot pull the rate down. Fewer than :data:`MIN_VALID_RR` valid intervals: no rate,
+    and the reason says so.
     """
-    b = np.sort(np.asarray(beats_s, dtype=np.float64).ravel())
-    inside = b[(b >= t0) & (b < t1)]
-    if inside.size < 2:
-        return HeartRate(None, int(inside.size),
-                         f"{inside.size} stored beat(s) in the core window - k×HR not shown")
-    return HeartRate(float((inside.size - 1) / (inside[-1] - inside[0])), int(inside.size),
-                     None)
+    raw = np.asarray(beats_s, dtype=np.float64).ravel()
+    order = np.argsort(raw, kind="stable")
+    b = raw[order]
+    gaps = (np.zeros(b.size, dtype=bool) if gap_after is None
+            else np.asarray(gap_after, dtype=bool).ravel()[order])
+    keep = (b >= t0) & (b < t1)
+    idx = np.flatnonzero(keep[:-1] & keep[1:])
+    lo, hi = RR_PLAUSIBLE_RANGE_S
+    rr = b[idx + 1] - b[idx]
+    ok = (rr >= lo) & (rr <= hi) & ~gaps[idx]
+    if blank_spans is not None:
+        spans = np.asarray(blank_spans, dtype=np.float64).reshape(-1, 2)
+        for s0, s1 in spans:
+            ok &= ~((b[idx] < s1) & (s0 < b[idx + 1]))
+    valid = rr[ok]
+    refused = int(rr.size - valid.size)
+    if valid.size < MIN_VALID_RR:
+        return HeartRate(None, int(valid.size), refused,
+                         f"{valid.size} valid RR interval(s) within ±{HR_WINDOW_S:.0f} s of "
+                         f"the core ({refused} refused: gap, blank span or outside "
+                         f"{lo * 1000:.0f}-{hi * 1000:.0f} ms) - k×HR not shown")
+    return HeartRate(float(1.0 / np.median(valid)), int(valid.size), refused, None)
 
 
 # ---------------------------------------------------------------------------
@@ -487,7 +543,8 @@ def compute_spectrum(rec: Recording, row: dict[str, Any], rows: Sequence[dict[st
                             n / fs, others_in_recording(rows, row))
     ref: Psd | None = None
     if ref_w is None:
-        notes.append("no reference window: none 5-10 s from the core fits in the recording")
+        notes.append(no_reference_reason(float(row["start_s"]), float(row["stop_s"]),
+                                         length_s, n / fs))
     else:
         if ref_w.note:
             notes.append(ref_w.note)
@@ -495,7 +552,10 @@ def compute_spectrum(rec: Recording, row: dict[str, Any], rows: Sequence[dict[st
         r1 = min(n, r0 + (i1 - i0))
         y = signal_window(rec, r0, r1, name)
         ref = None if y is None else welch_psd(y, fs, nperseg)
-        if ref is None:
-            notes.append("no NaN-free Welch segment in the reference window")
+        if y is None:
+            notes.append(f"reference window found, but {name} could not be built there")
+        elif ref is None:
+            notes.append("reference window found, but it has no NaN-free Welch segment "
+                         "(masked data)")
     return SpectrumResult(str(row["core_key"]), name, (i0 / fs, i1 / fs), nperseg, core, ref,
                           ref_w, tuple(notes))

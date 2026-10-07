@@ -114,7 +114,7 @@ _APP: list[Any] = []
 
 @pytest.fixture
 def make_hum_window(tmp_path: Path) -> Iterator[Callable[..., Any]]:
-    """``make(rows, recordings, beats_fn=None)``: an offscreen window, synchronous panels.
+    """``make(rows, recordings, beats_fn=None, async_panels=False)``: an offscreen window.
 
     ``recordings`` maps a recording id to its :class:`Recording`; the queue is written
     to ``tmp_path`` and judgements go to a store under ``tmp_path``.
@@ -130,7 +130,7 @@ def make_hum_window(tmp_path: Path) -> Iterator[Callable[..., Any]]:
     made: list[Any] = []
 
     def make(rows: Sequence[dict[str, Any]], recordings: dict[str, Recording],
-             beats_fn: Callable[..., Any] | None = None) -> Any:
+             beats_fn: Callable[..., Any] | None = None, *, async_panels: bool = False) -> Any:
         from ui.windows.adjudication_window import AdjudicationWindow
 
         root = tmp_path / f"w{len(made)}"
@@ -141,7 +141,8 @@ def make_hum_window(tmp_path: Path) -> Iterator[Callable[..., Any]]:
                                       journal_dir=root / "journal", queue_file=path.name,
                                       queue_sha256="0" * 64, app_sha=None)
         w = AdjudicationWindow(session, load_fn=lambda r: recordings[str(r["recording"])],
-                               async_traces=False, async_panels=False, beats_fn=beats_fn)
+                               async_traces=False, async_panels=async_panels,
+                               beats_fn=beats_fn)
         made.append(w)
         return w
 
