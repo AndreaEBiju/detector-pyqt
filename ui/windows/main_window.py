@@ -331,6 +331,11 @@ class MainWindow(QMainWindow):
         self._action_blind_audit = QAction("Blind recall audit…", self)
         self._action_blind_audit.triggered.connect(self._open_blind_audit)
         tools_menu.addAction(self._action_blind_audit)
+        # Candidate adjudication (task 16 Change 1): judge queued candidate cores
+        # one keystroke each (1 motion, 2 physiology, 3 unsure, 4 line noise).
+        self._action_adjudicate = QAction("Candidate adjudication…", self)
+        self._action_adjudicate.triggered.connect(self._open_adjudication)
+        tools_menu.addAction(self._action_adjudicate)
         # Held-out evaluation: runs the current model against every
         # manifest entry tagged held_out=True (which are excluded from
         # training), reports per-sample model-vs-human agreement. The
@@ -440,6 +445,26 @@ class MainWindow(QMainWindow):
         self._audit_window = AuditWindow(store, parent=None)
         self._audit_window.resize(1500, 900)
         self._audit_window.show()
+
+    def _open_adjudication(self) -> None:
+        """Pick a queue file and open candidate adjudication on the GEMS store."""
+        from gems_blanking_v2.io.store import GemsStore, find_gems_root
+
+        from ui.windows.adjudication_window import open_queue
+
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Adjudication queue", "", "Parquet queue (*.parquet)")
+        if not path:
+            return
+        try:
+            store = GemsStore(find_gems_root())
+            self._adjudication_window = open_queue(Path(path), store)
+        except Exception as exc:  # noqa: BLE001 - shown to the user, not swallowed
+            QMessageBox.warning(self, "Candidate adjudication",
+                                f"Could not open the queue: {exc}")
+            return
+        self._adjudication_window.resize(1600, 950)
+        self._adjudication_window.show()
 
     def _open_training_window(self) -> None:
         from ui.windows.training_window import TrainingWindow
