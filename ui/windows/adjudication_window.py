@@ -40,8 +40,16 @@ thread. Arriving at it is then instant. Rules:
 * arriving before it finishes shows "loading" and waits for THAT load (keys disabled),
   never starting a second one, and the GUI thread never blocks on it;
 * a prefetch that failed falls back to a normal load, with the error shown;
-* moving to any other recording discards the prefetch (a load already running cannot be
-  interrupted; its result is dropped when it finishes).
+* moving to any other recording discards the prefetch. A load already running cannot be
+  interrupted: it runs to the end and its result is dropped. Until then it still holds
+  memory, and h5py serialises file access process-wide, so a jump made during a prefetch
+  can take up to the prefetch's remaining time (~8-30 s) on top of its own load;
+* showing any core cancels a wait for a prefetch (e.g. undo back to the previous
+  recording while the next one loads), so its finishing never re-renders what is on
+  screen or wipes a pending widen;
+* closing the window during a prefetch cancels it if it has not started. If it has, the
+  window closes at once, but the Python process exits only when that load finishes
+  (``ThreadPoolExecutor`` threads are joined at exit), up to ~30 s.
 
 Judgements go to the store as per-user write-once shards (``ui.adjudicate.judgements``);
 the queue schema is in ``ui.adjudicate.queue``.
@@ -427,6 +435,10 @@ class AdjudicationWindow(QMainWindow):
         The judging keys and buttons are live only once the core is fully on screen; a
         load that fails leaves them disabled (Space still skips past it).
         """
+        # Whatever is shown now supersedes any wait for a prefetch: its finishing must not
+        # come back here and re-render (wiping a widen drawn meanwhile).
+        self._waiting_for = None
+        self._pf_timer.stop()
         self._shown_key = None
         self._widen = None  # a widen belongs to the core it was drawn on
         self._draw_widen()
@@ -464,8 +476,8 @@ class AdjudicationWindow(QMainWindow):
         rid = str(row["recording"])
         if rid == self._rec_id and self.viewer is not None:
             return True
-        self._waiting_for = None
         recording = None
+        pf_failed: str | None = None
         if rid == self._pf_rid and self._pf_future is not None:
             if not self._pf_future.done():
                 self._waiting_for = rid
@@ -479,7 +491,7 @@ class AdjudicationWindow(QMainWindow):
                 self.prefetch_log.append(f"hit {rid}")
             except Exception as exc:  # noqa: BLE001 - shown; a normal load follows
                 self.prefetch_log.append(f"fail {rid}")
-                self.last_error = str(exc)
+                self.last_error = pf_failed = str(exc)
                 self.status.setText(f"Prefetch of {rid} failed ({exc}); loading it now ...")
         else:
             self._discard_prefetch()
@@ -508,7 +520,8 @@ class AdjudicationWindow(QMainWindow):
         others = np.array([[r["start_s"], r["stop_s"]] for r in self.session.rows
                            if str(r["recording"]) == rid], dtype=np.float64).reshape(-1, 2)
         self.viewer.set_model_intervals(seconds_to_samples(others, float(recording.fs)))
-        self.status.setText(f"Loaded {rid}.")
+        self.status.setText(f"Loaded {rid}." if pf_failed is None
+                            else f"Loaded {rid} (prefetch failed: {pf_failed}).")
         return True
 
     # -- prefetch ---------------------------------------------------------------

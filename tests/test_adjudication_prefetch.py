@@ -47,6 +47,25 @@ def store(tmp_path: Path) -> GemsStore:
     return GemsStore.initialise(tmp_path / "gems")
 
 
+_OPEN: list[Any] = []  # windows and loaders this test made, for the teardown
+
+
+@pytest.fixture(autouse=True)
+def _teardown(qapp):
+    """Open every gate (no thread left waiting) and close every window a test made."""
+    yield
+    while _OPEN:
+        obj = _OPEN.pop()
+        if isinstance(obj, GatedLoader):
+            for g in obj.gates.values():
+                g.set()
+        else:
+            obj.session.close = list  # nothing to write; no message box at teardown
+            obj.close()
+            obj.deleteLater()
+    qapp.processEvents()
+
+
 class GatedLoader:
     """Fake loader: each call waits for its recording's gate; records thread and order."""
 
@@ -58,6 +77,7 @@ class GatedLoader:
         self.fail_first = set(fail_first)
         self.gui = threading.get_ident()
         self.lock = threading.Lock()
+        _OPEN.append(self)
 
     def __call__(self, row: dict[str, Any]) -> Recording:
         rid = str(row["recording"])
@@ -91,6 +111,7 @@ def _window(store: GemsStore, tmp_path: Path, loader: GatedLoader):
                                   queue_file=path.name, queue_sha256="0" * 64, app_sha=None)
     loader.gates[A].set()  # the first recording loads normally (the GUI thread waits)
     w = AdjudicationWindow(session, load_fn=loader, async_traces=False, prefetch=True)
+    _OPEN.append(w)
     return w
 
 
@@ -120,6 +141,7 @@ def test_the_next_recording_is_prefetched_off_the_gui_thread_and_used(qapp, stor
     assert w._rec_id == J and w._shown_key == w.session.current()["core_key"]
     assert loader.loads_of(J) == [False]  # loaded once, and not on the GUI thread
     assert loader.loads_of(A) == [True]
+    assert w.viewer.recording._y is w._recording.data  # served as loaded: no second copy
     assert f"hit {J}" in w.prefetch_log
     assert w.prefetch_log[-1] == f"start {OLD}"  # and the next one is on its way
 
@@ -151,6 +173,7 @@ def test_a_failed_prefetch_falls_back_to_a_normal_load_with_the_error_shown(qapp
     assert f"fail {J}" in w.prefetch_log and "Drive hiccup" in (w.last_error or "")
     assert w._rec_id == J and w._shown_key is not None
     assert loader.loads_of(J) == [False, True]  # the prefetch, then a normal load
+    assert w.status.text() == f"Loaded {J} (prefetch failed: Drive hiccup reading {J})."
 
 
 def test_jumping_elsewhere_discards_the_prefetch(qapp, store, tmp_path) -> None:
@@ -206,6 +229,7 @@ def test_prefetch_is_off_unless_asked(qapp, store, tmp_path) -> None:
     session = AdjudicationSession(load_queue(path), store, USER, journal_dir=tmp_path / "j",
                                   queue_file=path.name, queue_sha256="0" * 64, app_sha=None)
     w = AdjudicationWindow(session, load_fn=loader, async_traces=False)
+    _OPEN.append(w)
     assert w.prefetch_log == [] and w._pool is None
 
 
@@ -217,9 +241,35 @@ def test_the_previous_recording_is_freed_on_moving_on(qapp, store, tmp_path) -> 
     loader = GatedLoader(open_now={J, OLD})
     w = _window(store, tmp_path, loader)
     first = weakref.ref(w._recording.data)
+    shown = weakref.ref(w.viewer.recording._y)
     _until(qapp, lambda: _future_done(w))
     for _ in range(3):
         w.press("2")  # -> J
     assert w._rec_id == J
     gc.collect()
-    assert first() is None
+    assert first() is None and shown() is None
+
+
+def test_undo_while_waiting_keeps_what_is_on_screen(qapp, store, tmp_path) -> None:
+    """Undo back to A while J still loads, widen on A: J arriving must not re-render A."""
+    loader = GatedLoader()
+    w = _window(store, tmp_path, loader)
+    for _ in range(3):
+        w.press("2")  # the third moves to J, whose prefetch is still running
+    assert w._waiting_for == J
+    w.undo()  # back to A's third core
+    assert w._rec_id == A and w._shown_key == w.session.current()["core_key"]
+    row = w.session.current()
+    lo = max(float(row["region_start_s"]), float(row["start_s"]) - 0.05)
+    hi = min(float(row["region_stop_s"]), float(row["stop_s"]) + 0.05)
+    assert w.widen(lo, hi) is not None
+    loader.gates[J].set()
+    _until(qapp, lambda: _future_done(w))
+    end = time.monotonic() + 0.5  # several timer periods
+    while time.monotonic() < end:
+        qapp.processEvents()
+        time.sleep(0.01)
+    assert w._widen is not None and w._rec_id == A
+    assert w.session.judgement_of(row) is None
+    w.press("1")  # the widen goes with motion; J (prefetched) is then a hit
+    assert w._rec_id == J and f"hit {J}" in w.prefetch_log
